@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from constants import DEFAULT_BLOCK
-from block_states import BlockState
+from Core.block.states import BlockState
 
 @dataclass
 class BlockField:
