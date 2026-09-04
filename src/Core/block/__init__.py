@@ -1,6 +1,10 @@
 from .connectivity import (
     BlockPos,
+    BUILTIN_DEPENDENCY_SPECS,
+    ConnectivityCell,
     ConnectivityDomainId,
+    ConnectivityView,
+    DependencySpec,
     NeighborContext,
     NeighborResolver,
 )
@@ -34,7 +38,11 @@ __all__ = [
     "BlockPos",
     "BlockRegistry",
     "BlockState",
+    "BUILTIN_DEPENDENCY_SPECS",
+    "ConnectivityCell",
     "ConnectivityDomainId",
+    "ConnectivityView",
+    "DependencySpec",
     "ConnectivityOptions",
     "ConnectionAction",
     "ConnectionDecision",
