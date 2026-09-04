@@ -1,46 +1,49 @@
-from states import BlockState
+from .states import BlockState
 
-from Core.constants import RAIL_ROTATION, CARDINAL_DIRECTIONS, ROTATABLE_PROPERTIES
+from ..constants import RAIL_ROTATION, CARDINAL_DIRECTIONS
+from .info import BlockInfo, RotationRule
 
 def rotate_block_state(
-    block: BlockState,
+    state: BlockState,
+    info: BlockInfo,
     quarter_turns: int,
 ) -> BlockState:
+
     quarter_turns %= 4
 
     if quarter_turns == 0:
-        return block
+        return state
 
-    properties = block.properties
+    rules = info.rotation
 
-    has_rotatable_property = (
-        any(
-            key in properties
-            for key in ROTATABLE_PROPERTIES
-        )
-        or any(
-            direction in properties
-            for direction in CARDINAL_DIRECTIONS
-        )
-        or properties.get("shape") in RAIL_ROTATION
-    )
+    if rules == RotationRule.NONE:
+        return state
 
-    if not has_rotatable_property:
-        return block
+    properties = dict(state.properties)
 
-    properties = dict(properties)
+    if rules & RotationRule.AXIS:
+        _rotate_axis(properties, quarter_turns)
 
-    _rotate_axis(properties, quarter_turns)
-    _rotate_facing(properties, quarter_turns)
-    _rotate_cardinals(properties, quarter_turns)
-    _rotate_sign(properties, quarter_turns)
-    _rotate_rail_shape(properties, quarter_turns)
-    _rotate_orientation(properties, quarter_turns)
+    if rules & RotationRule.FACING:
+        _rotate_facing(properties, quarter_turns)
+
+    if rules & RotationRule.CARDINAL:
+        _rotate_cardinals(properties, quarter_turns)
+
+    if rules & RotationRule.ROTATION_16:
+        _rotate_sign(properties, quarter_turns)
+
+    if rules & RotationRule.RAIL_SHAPE:
+        _rotate_rail_shape(properties, quarter_turns)
+
+    if rules & RotationRule.ORIENTATION:
+        _rotate_orientation(properties, quarter_turns)
 
     return BlockState.create(
-        block.name,
+        state.name,
         properties,
     )
+
 
 def _rotate_direction(
     direction: str,
@@ -50,10 +53,7 @@ def _rotate_direction(
         return direction
 
     index = CARDINAL_DIRECTIONS.index(direction)
-
-    return CARDINAL_DIRECTIONS[
-        (index + quarter_turns) % 4
-    ]
+    return CARDINAL_DIRECTIONS[(index + quarter_turns) % 4]
 
 
 def _rotate_axis(
@@ -96,6 +96,9 @@ def _rotate_cardinals(
         for direction in CARDINAL_DIRECTIONS
         if direction in properties
     }
+
+    for direction in original:
+        del properties[direction]
 
     for direction, value in original.items():
         new_direction = _rotate_direction(

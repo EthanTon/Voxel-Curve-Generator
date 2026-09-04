@@ -1,4 +1,4 @@
-from states import BlockState
+from .states import BlockState
 
 
 BlockId = int
@@ -11,11 +11,11 @@ class BlockPalette:
         self._frozen = False
 
     def add(self, state: BlockState) -> BlockId:
-        if self._frozen:
-            raise RuntimeError("Palette is frozen")
-
         if state in self._ids:
             return self._ids[state]
+
+        if self._frozen:
+            raise RuntimeError("Palette is frozen")
 
         block_id = len(self._states)
 

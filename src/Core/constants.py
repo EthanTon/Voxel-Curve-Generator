@@ -1,4 +1,4 @@
-from modes import PlacementMode, TerrainMaskMode
+from .modes import PlacementMode, TerrainMaskMode
 
 DEFAULT_BLOCK = "minecraft:air"
 DEFAULT_PLACEMENT_MODE = PlacementMode.OVERWRITE
