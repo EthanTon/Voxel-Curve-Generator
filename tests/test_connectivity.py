@@ -1,6 +1,6 @@
 import unittest
 
-from src.Core.block.connectivity import NeighborResolver
+from src.Core.block.connectivity import DependencySpec, NeighborResolver
 from src.Core.block.connectivity_options import (
     ConnectionAction,
     ConnectionOverride,
@@ -197,6 +197,38 @@ class ConnectivityTests(unittest.TestCase):
         state = self.registry.get_state(blocks[(0, 0, 0)])
         self.assertEqual(state.get("east"), "false")
         self.assertIn((0, 0, 0), changed)
+
+    def test_custom_handler_can_declare_a_wider_dependency_radius(self) -> None:
+        source_id = self.registry.register(
+            BlockState.create("custom:wide_reader", {"active": "false"})
+        )
+        marker_id = self.registry.register(BlockState.create("custom:marker"))
+        blocks = {(0, 0, 0): source_id}
+
+        def resolve_wide(context):
+            marker_position = (context.position[0] + 2, 0, 0)
+            marker = context.blocks.get(marker_position)
+            same_domain = context.domains.get(marker_position, 0) == context.domain
+            return BlockState.create(
+                context.state.name,
+                {"active": str(marker is not None and same_domain).lower()},
+            )
+
+        self.resolver.register_handler(
+            NeighborRule.NONE,
+            resolve_wide,
+            DependencySpec(radius=(2, 0, 0), stream_halo=2),
+        )
+        self.resolver.resolve_all(blocks)
+        blocks[(2, 0, 0)] = marker_id
+
+        changed = self.resolver.resolve_dirty(blocks, ((2, 0, 0),))
+
+        self.assertIn((0, 0, 0), changed)
+        self.assertEqual(
+            self.registry.get_state(blocks[(0, 0, 0)]).get("active"),
+            "true",
+        )
 
     def test_wall_post_and_fence_gate_in_wall_are_resolved(self) -> None:
         wall_id = self.registry.register(

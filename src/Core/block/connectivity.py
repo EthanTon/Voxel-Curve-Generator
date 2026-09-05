@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, MutableMapping
+from typing import Callable, Iterable, Iterator, Mapping, MutableMapping, Protocol
 
 from .connectivity_options import (
     ConnectionAction,
@@ -71,12 +71,178 @@ BlockConnectionPredicate = Callable[
 
 
 @dataclass(frozen=True, slots=True)
+class DependencySpec:
+    # Radius is extra invalidation beyond the six direct neighbors.
+    radius: BlockPos = (0, 0, 0)
+    horizontal_range: int = 0
+    stream_halo: int | None = 1
+
+    def affected_positions(self, position: BlockPos) -> set[BlockPos]:
+        positions: set[BlockPos] = set()
+        if any(self.radius):
+            for delta_x in range(-self.radius[0], self.radius[0] + 1):
+                for delta_y in range(-self.radius[1], self.radius[1] + 1):
+                    for delta_z in range(-self.radius[2], self.radius[2] + 1):
+                        positions.add(
+                            (
+                                position[0] + delta_x,
+                                position[1] + delta_y,
+                                position[2] + delta_z,
+                            )
+                        )
+        for direction in HORIZONTAL_DIRECTIONS:
+            offset = DIRECTION_OFFSETS[direction]
+            for distance in range(1, self.horizontal_range + 1):
+                positions.add(
+                    (
+                        position[0] + offset[0] * distance,
+                        position[1],
+                        position[2] + offset[2] * distance,
+                    )
+                )
+        return positions
+
+
+DEFAULT_DEPENDENCY_SPEC = DependencySpec()
+BUILTIN_DEPENDENCY_SPECS: dict[NeighborRule, DependencySpec] = {
+    NeighborRule.REDSTONE: DependencySpec(radius=(1, 1, 1)),
+    NeighborRule.MOSS_CARPET: DependencySpec(radius=(1, 1, 1)),
+    NeighborRule.RAIL: DependencySpec(radius=(2, 2, 2), stream_halo=2),
+    NeighborRule.TRIPWIRE: DependencySpec(horizontal_range=42, stream_halo=42),
+    NeighborRule.TRIPWIRE_HOOK: DependencySpec(horizontal_range=42, stream_halo=42),
+    NeighborRule.LEAVES: DependencySpec(stream_halo=7),
+    NeighborRule.SHELF: DependencySpec(stream_halo=None),
+    NeighborRule.POINTED_DRIPSTONE: DependencySpec(stream_halo=None),
+    NeighborRule.CHEST: DependencySpec(stream_halo=None),
+    NeighborRule.SCAFFOLDING: DependencySpec(stream_halo=None),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectivityCell:
+    block_id: BlockId
+    domain: ConnectivityDomainId = 0
+    source_token: object | None = None
+    placement_id: int | None = None
+    sequence_index: int | None = None
+
+
+class ConnectivityView(Protocol):
+    # Minimal mutable world interface required by neighbor resolution.
+
+    def source_at(self, position: BlockPos) -> ConnectivityCell | None: ...
+
+    def effective_at(self, position: BlockPos) -> ConnectivityCell | None: ...
+
+    def write_resolution(
+        self,
+        position: BlockPos,
+        source_token: object | None,
+        block_id: BlockId | None,
+    ) -> None: ...
+
+    def clear_resolution(self, position: BlockPos) -> None: ...
+
+    def iter_source_positions(self) -> Iterator[BlockPos]: ...
+
+
+class _MappingConnectivityView:
+    # This adapter preserves the original dictionary-based public API.
+    def __init__(
+        self,
+        blocks: Mapping[BlockPos, BlockId],
+        domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
+    ) -> None:
+        self.blocks = blocks
+        self.domains = domains or {}
+
+    def source_at(self, position: BlockPos) -> ConnectivityCell | None:
+        block_id = self.blocks.get(position)
+        if block_id is None:
+            return None
+        return ConnectivityCell(
+            block_id=block_id,
+            domain=self.domains.get(position, 0),
+            source_token=(position, block_id),
+        )
+
+    def effective_at(self, position: BlockPos) -> ConnectivityCell | None:
+        return self.source_at(position)
+
+    def write_resolution(
+        self,
+        position: BlockPos,
+        source_token: object | None,
+        block_id: BlockId | None,
+    ) -> None:
+        if not isinstance(self.blocks, MutableMapping):
+            raise TypeError("Resolution requires a mutable block mapping")
+        if block_id is None:
+            self.blocks.pop(position, None)
+        else:
+            self.blocks[position] = block_id
+
+    def clear_resolution(self, position: BlockPos) -> None:
+        return None
+
+    def iter_source_positions(self) -> Iterator[BlockPos]:
+        return iter(self.blocks)
+
+
+class _EffectiveBlockMapping(Mapping[BlockPos, BlockId]):
+    # Lazy compatibility mapping for custom handlers written for the old API.
+    def __init__(self, view: ConnectivityView) -> None:
+        self.view = view
+
+    def __getitem__(self, position: BlockPos) -> BlockId:
+        cell = self.view.effective_at(position)
+        if cell is None:
+            raise KeyError(position)
+        return cell.block_id
+
+    def __iter__(self) -> Iterator[BlockPos]:
+        return (
+            position
+            for position in self.view.iter_source_positions()
+            if self.view.effective_at(position) is not None
+        )
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+class _EffectiveDomainMapping(Mapping[BlockPos, ConnectivityDomainId]):
+    # Domain values are derived from effective cells instead of a second dictionary.
+    def __init__(self, view: ConnectivityView) -> None:
+        self.view = view
+
+    def __getitem__(self, position: BlockPos) -> ConnectivityDomainId:
+        cell = self.view.effective_at(position)
+        if cell is None:
+            raise KeyError(position)
+        return cell.domain
+
+    def __iter__(self) -> Iterator[BlockPos]:
+        return (
+            position
+            for position in self.view.iter_source_positions()
+            if self.view.effective_at(position) is not None
+        )
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+@dataclass(frozen=True, slots=True)
 class NeighborBlock:
     position: BlockPos
     block_id: BlockId
     state: BlockState
     info: BlockInfo
     domain: ConnectivityDomainId
+    source_token: object | None = None
+    placement_id: int | None = None
+    sequence_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -88,26 +254,45 @@ class NeighborContext:
     block_id: BlockId
     state: BlockState
     info: BlockInfo
-    blocks: Mapping[BlockPos, BlockId]
-    domains: Mapping[BlockPos, ConnectivityDomainId]
+    source: ConnectivityCell
+    view: ConnectivityView
 
     @property
     def domain(self) -> ConnectivityDomainId:
-        return self.domains.get(self.position, 0)
+        return self.source.domain
+
+    @property
+    def placement_id(self) -> int | None:
+        return self.source.placement_id
+
+    @property
+    def sequence_index(self) -> int | None:
+        return self.source.sequence_index
+
+    @property
+    def blocks(self) -> Mapping[BlockPos, BlockId]:
+        return _EffectiveBlockMapping(self.view)
+
+    @property
+    def domains(self) -> Mapping[BlockPos, ConnectivityDomainId]:
+        return _EffectiveDomainMapping(self.view)
 
     def neighbor(self, direction: Direction) -> NeighborBlock | None:
         offset = DIRECTION_OFFSETS[direction]
         position = _add_position(self.position, offset)
-        block_id = self.blocks.get(position)
-        if block_id is None:
+        cell = self.view.effective_at(position)
+        if cell is None:
             return None
 
         return NeighborBlock(
             position=position,
-            block_id=block_id,
-            state=self.resolver.registry.get_state(block_id),
-            info=self.resolver.registry.get_info(block_id),
-            domain=self.domains.get(position, 0),
+            block_id=cell.block_id,
+            state=self.resolver.registry.get_state(cell.block_id),
+            info=self.resolver.registry.get_info(cell.block_id),
+            domain=cell.domain,
+            source_token=cell.source_token,
+            placement_id=cell.placement_id,
+            sequence_index=cell.sequence_index,
         )
 
     def connects(
@@ -204,6 +389,7 @@ class NeighborResolver:
         self.domains_can_connect = domains_can_connect or _same_domain
         self.blocks_can_connect = blocks_can_connect
         self.options = options
+        self._dependency_specs = dict(BUILTIN_DEPENDENCY_SPECS)
         self._handlers: dict[NeighborRule, NeighborHandler] = {
             NeighborRule.NONE: _unchanged,
             NeighborRule.FENCE: _resolve_fence,
@@ -241,29 +427,66 @@ class NeighborResolver:
         self,
         rule: NeighborRule,
         handler: NeighborHandler,
+        dependency_spec: DependencySpec | None = None,
     ) -> None:
         self._handlers[rule] = handler
+        if dependency_spec is not None:
+            self._dependency_specs[rule] = dependency_spec
+
+    def dependency_spec(self, rule: NeighborRule) -> DependencySpec:
+        return self._dependency_specs.get(rule, DEFAULT_DEPENDENCY_SPEC)
+
+    @property
+    def policy_token(self) -> tuple[object, ...]:
+        # The world uses this token to invalidate cached states after policy changes.
+        return (
+            id(self.domains_can_connect),
+            id(self.blocks_can_connect),
+            repr(None if self.options is None else self.options.overrides),
+            tuple(
+                sorted(
+                    (rule.value, id(handler))
+                    for rule, handler in self._handlers.items()
+                )
+            ),
+            tuple(
+                sorted(
+                    (rule.value, spec)
+                    for rule, spec in self._dependency_specs.items()
+                )
+            ),
+        )
+
+    def dependency_positions(
+        self,
+        position: BlockPos,
+        rules: Iterable[NeighborRule],
+    ) -> set[BlockPos]:
+        affected: set[BlockPos] = set()
+        for rule in rules:
+            affected.update(self.dependency_spec(rule).affected_positions(position))
+        return affected
 
     def resolve_state(
         self,
         position: BlockPos,
-        blocks: Mapping[BlockPos, BlockId],
+        blocks: Mapping[BlockPos, BlockId] | ConnectivityView,
         domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
     ) -> BlockState | None:
-
-        block_id = blocks.get(position)
-        if block_id is None:
+        view = _as_connectivity_view(blocks, domains)
+        source = view.source_at(position)
+        if source is None:
             return None
 
-        info = self.registry.get_info(block_id)
+        info = self.registry.get_info(source.block_id)
         context = NeighborContext(
             resolver=self,
             position=position,
-            block_id=block_id,
-            state=self.registry.get_state(block_id),
+            block_id=source.block_id,
+            state=self.registry.get_state(source.block_id),
             info=info,
-            blocks=blocks,
-            domains=domains or {},
+            source=source,
+            view=view,
         )
         state = self._handlers[info.neighbor_rule](context)
         if state is None:
@@ -280,64 +503,79 @@ class NeighborResolver:
     def resolve_id(
         self,
         position: BlockPos,
-        blocks: Mapping[BlockPos, BlockId],
+        blocks: Mapping[BlockPos, BlockId] | ConnectivityView,
         domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
     ) -> BlockId | None:
-        source_id = blocks.get(position)
-        if source_id is None:
+        view = _as_connectivity_view(blocks, domains)
+        source = view.source_at(position)
+        if source is None:
             return None
 
-        state = self.resolve_state(position, blocks, domains)
+        state = self.resolve_state(position, view)
         if state is None:
             return None
-        if state == self.registry.get_state(source_id):
-            return source_id
-        return self.registry.get_or_add_variant(source_id, state)
+        if state == self.registry.get_state(source.block_id):
+            return source.block_id
+        return self.registry.get_or_add_variant(source.block_id, state)
 
     def resolve_dirty(
         self,
-        blocks: MutableMapping[BlockPos, BlockId],
-        dirty: Iterable[BlockPos],
+        blocks: MutableMapping[BlockPos, BlockId] | ConnectivityView,
+        dirty: Iterable[BlockPos | object],
         domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
     ) -> set[BlockPos]:
-
+        view = _as_connectivity_view(blocks, domains)
         initial: set[BlockPos] = set()
-        for position in dirty:
+        for item in dirty:
+            position, changed_rules = _dirty_position_and_rules(item, self.registry)
             initial.add(position)
             initial.update(neighboring_positions(position))
             nearby_rules = {
-                self.registry.get_info(blocks[nearby]).neighbor_rule
+                self.registry.get_info(cell.block_id).neighbor_rule
                 for nearby in (position, *neighboring_positions(position))
-                if nearby in blocks
+                if (cell := view.source_at(nearby)) is not None
             }
-            initial.update(_dependency_positions(position, nearby_rules))
+            nearby_rules.update(changed_rules)
+            initial.update(self.dependency_positions(position, nearby_rules))
 
-        queue = deque(position for position in initial if position in blocks)
+        queue = deque(
+            position
+            for position in sorted(initial)
+            if view.source_at(position) is not None
+        )
         queued = set(queue)
         changed: set[BlockPos] = set()
 
         while queue:
             position = queue.popleft()
             queued.discard(position)
-            old_id = blocks.get(position)
-            if old_id is None:
+            source = view.source_at(position)
+            if source is None:
                 continue
-            old_rule = self.registry.get_info(old_id).neighbor_rule
+            old_effective = view.effective_at(position)
+            old_rule = self.registry.get_info(source.block_id).neighbor_rule
 
-            new_id = self.resolve_id(position, blocks, domains)
-            if new_id == old_id:
+            new_id = self.resolve_id(position, view)
+            view.write_resolution(position, source.source_token, new_id)
+            new_effective = view.effective_at(position)
+            old_id = None if old_effective is None else old_effective.block_id
+            effective_id = None if new_effective is None else new_effective.block_id
+            if effective_id == old_id:
                 continue
-
-            if new_id is None:
-                blocks.pop(position, None)
-            else:
-                blocks[position] = new_id
             changed.add(position)
 
             affected = set(neighboring_positions(position))
-            affected.update(_dependency_positions(position, {old_rule}))
-            for neighbor_position in affected:
-                if neighbor_position in blocks and neighbor_position not in queued:
+            new_rule = (
+                old_rule
+                if new_effective is None
+                else self.registry.get_info(new_effective.block_id).neighbor_rule
+            )
+            affected.update(self.dependency_positions(position, {old_rule, new_rule}))
+            for neighbor_position in sorted(affected):
+                if (
+                    view.source_at(neighbor_position) is not None
+                    and neighbor_position not in queued
+                ):
                     queue.append(neighbor_position)
                     queued.add(neighbor_position)
 
@@ -345,10 +583,44 @@ class NeighborResolver:
 
     def resolve_all(
         self,
-        blocks: MutableMapping[BlockPos, BlockId],
+        blocks: MutableMapping[BlockPos, BlockId] | ConnectivityView,
         domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
     ) -> set[BlockPos]:
-        return self.resolve_dirty(blocks, tuple(blocks), domains)
+        view = _as_connectivity_view(blocks, domains)
+        return self.resolve_dirty(view, view.iter_source_positions())
+
+
+def _as_connectivity_view(
+    blocks: Mapping[BlockPos, BlockId] | ConnectivityView,
+    domains: Mapping[BlockPos, ConnectivityDomainId] | None = None,
+) -> ConnectivityView:
+    if all(
+        hasattr(blocks, name)
+        for name in (
+            "source_at",
+            "effective_at",
+            "write_resolution",
+            "clear_resolution",
+            "iter_source_positions",
+        )
+    ):
+        return blocks  # type: ignore[return-value]
+    return _MappingConnectivityView(blocks, domains)
+
+
+def _dirty_position_and_rules(
+    item: BlockPos | object,
+    registry: BlockRegistry,
+) -> tuple[BlockPos, set[NeighborRule]]:
+    if isinstance(item, tuple) and len(item) == 3:
+        return item, set()
+    position = getattr(item, "position")
+    rules: set[NeighborRule] = set()
+    for name in ("before", "after"):
+        cell = getattr(item, name, None)
+        if cell is not None:
+            rules.add(registry.get_info(cell.block_id).neighbor_rule)
+    return position, rules
 
 
 def neighboring_positions(position: BlockPos) -> tuple[BlockPos, ...]:
@@ -356,36 +628,6 @@ def neighboring_positions(position: BlockPos) -> tuple[BlockPos, ...]:
         _add_position(position, DIRECTION_OFFSETS[direction])
         for direction in ALL_DIRECTIONS
     )
-
-
-def _dependency_positions(
-    position: BlockPos, rules: set[NeighborRule]
-) -> set[BlockPos]:
-    positions: set[BlockPos] = set()
-    if NeighborRule.RAIL in rules:
-        for delta_y in range(-2, 3):
-            for delta_x in range(-2, 3):
-                for delta_z in range(-2, 3):
-                    if abs(delta_x) + abs(delta_z) <= 2:
-                        positions.add(
-                            (
-                                position[0] + delta_x,
-                                position[1] + delta_y,
-                                position[2] + delta_z,
-                            )
-                        )
-    if rules & {NeighborRule.TRIPWIRE, NeighborRule.TRIPWIRE_HOOK}:
-        for direction in HORIZONTAL_DIRECTIONS:
-            offset = DIRECTION_OFFSETS[direction]
-            for distance in range(1, 43):
-                positions.add(
-                    (
-                        position[0] + offset[0] * distance,
-                        position[1],
-                        position[2] + offset[2] * distance,
-                    )
-                )
-    return positions
 
 
 def _same_domain(left: ConnectivityDomainId, right: ConnectivityDomainId) -> bool:
@@ -774,15 +1016,18 @@ def _rail_pair_allowed(
 
 
 def _block_at(context: NeighborContext, position: BlockPos) -> NeighborBlock | None:
-    block_id = context.blocks.get(position)
-    if block_id is None:
+    cell = context.view.effective_at(position)
+    if cell is None:
         return None
     return NeighborBlock(
         position=position,
-        block_id=block_id,
-        state=context.resolver.registry.get_state(block_id),
-        info=context.resolver.registry.get_info(block_id),
-        domain=context.domains.get(position, 0),
+        block_id=cell.block_id,
+        state=context.resolver.registry.get_state(cell.block_id),
+        info=context.resolver.registry.get_info(cell.block_id),
+        domain=cell.domain,
+        source_token=cell.source_token,
+        placement_id=cell.placement_id,
+        sequence_index=cell.sequence_index,
     )
 
 
