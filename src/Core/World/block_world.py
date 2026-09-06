@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..Field.block_field import BlockBounds, BlockField, BlockPos
+from ..Field.block_field import BlockBounds, BlockField
 from ..block.connectivity import ConnectivityCell
 from ..block.palette import BlockId
 from ..block.registry import BlockRegistry
@@ -16,45 +16,48 @@ from ..constants import (
     DEFAULT_TERRAIN_MASK_MODE,
 )
 from ..modes import PlacementMode, TerrainMaskMode
+from ..coordinates import BlockPos, ChunkPos
 
 
 if TYPE_CHECKING:
     from ..block.connectivity import NeighborResolver
 
 
-ChunkPos = tuple[int, int, int]
 PlacementId = int
 TerrainMask = Callable[[BlockPos, TerrainMaskMode], bool]
 
 
 @dataclass(frozen=True, slots=True)
 class BlockTransform:
-    origin: BlockPos = (0, 0, 0)
+    origin: BlockPos = BlockPos(0, 0, 0)
     quarter_turns: int = 0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "origin", BlockPos.coerce(self.origin))
         object.__setattr__(self, "quarter_turns", self.quarter_turns % 4)
 
     def apply(self, position: BlockPos) -> BlockPos:
+        position = BlockPos.coerce(position)
         x, y, z = position
         for _ in range(self.quarter_turns):
             x, z = -z, x
-        return x + self.origin[0], y + self.origin[1], z + self.origin[2]
+        return BlockPos(x + self.origin.x, y + self.origin.y, z + self.origin.z)
 
     def inverse(self, position: BlockPos) -> BlockPos:
-        x = position[0] - self.origin[0]
-        y = position[1] - self.origin[1]
-        z = position[2] - self.origin[2]
+        position = BlockPos.coerce(position)
+        x = position.x - self.origin.x
+        y = position.y - self.origin.y
+        z = position.z - self.origin.z
         for _ in range((-self.quarter_turns) % 4):
             x, z = -z, x
-        return x, y, z
+        return BlockPos(x, y, z)
 
     def apply_bounds(self, bounds: BlockBounds) -> BlockBounds:
         corners = (
-            self.apply((x, y, z))
-            for x in (bounds.minimum[0], bounds.maximum[0])
-            for y in (bounds.minimum[1], bounds.maximum[1])
-            for z in (bounds.minimum[2], bounds.maximum[2])
+            self.apply(BlockPos(x, y, z))
+            for x in (bounds.minimum.x, bounds.maximum.x)
+            for y in (bounds.minimum.y, bounds.maximum.y)
+            for z in (bounds.minimum.z, bounds.maximum.z)
         )
         first = next(corners)
         minimum = list(first)
@@ -63,7 +66,7 @@ class BlockTransform:
             for axis, value in enumerate(position):
                 minimum[axis] = min(minimum[axis], value)
                 maximum[axis] = max(maximum[axis], value)
-        return BlockBounds(tuple(minimum), tuple(maximum))
+        return BlockBounds(BlockPos(*minimum), BlockPos(*maximum))
 
 
 @dataclass(slots=True)
@@ -158,7 +161,7 @@ class BlockWorld:
     def add_field(
         self,
         field: BlockField,
-        offset: BlockPos = (0, 0, 0),
+        offset: BlockPos = BlockPos(0, 0, 0),
         placement_mode: PlacementMode = DEFAULT_PLACEMENT_MODE,
         terrain_mask_mode: TerrainMaskMode = DEFAULT_TERRAIN_MASK_MODE,
         replace: str = DEFAULT_BLOCK,
@@ -170,7 +173,8 @@ class BlockWorld:
     ) -> PlacementId:
         if placement_mode == PlacementMode.TERRAIN_MASK and self.terrain_mask is None:
             raise ValueError("TERRAIN_MASK placement requires a terrain_mask callback")
-        if transform is not None and (offset != (0, 0, 0) or quarter_turns):
+        offset = BlockPos.coerce(offset)
+        if transform is not None and (offset != BlockPos(0, 0, 0) or quarter_turns):
             raise ValueError("Use either transform or offset/quarter_turns")
         field.freeze()
         placement_id = self._next_placement_id
@@ -245,6 +249,7 @@ class BlockWorld:
         return self._record_source_changes(before, positions)
 
     def source_at(self, position: BlockPos) -> ConnectivityCell | None:
+        position = BlockPos.coerce(position)
         cell = self._composed_cell(position)
         if cell is None or self._is_air(cell.block_id):
             return None
@@ -278,6 +283,7 @@ class BlockWorld:
         return self.has_block(position)
 
     def effective_at(self, position: BlockPos) -> ConnectivityCell | None:
+        position = BlockPos.coerce(position)
         source = self.source_at(position)
         chunk = self._chunk_for(position)
         entries = self._overlay.get(chunk)
@@ -307,6 +313,7 @@ class BlockWorld:
         source_token: object | None,
         block_id: BlockId | None,
     ) -> None:
+        position = BlockPos.coerce(position)
         source = self.source_at(position)
         if source is None or source.source_token != source_token:
             self.clear_resolution(position)
@@ -322,6 +329,7 @@ class BlockWorld:
         )
 
     def clear_resolution(self, position: BlockPos) -> None:
+        position = BlockPos.coerce(position)
         chunk = self._chunk_for(position)
         entries = self._overlay.get(chunk)
         if entries is None:
@@ -544,7 +552,12 @@ class BlockWorld:
                 del self._chunks[chunk]
 
     def _chunk_for(self, position: BlockPos) -> ChunkPos:
-        return tuple(value // self.chunk_size for value in position)
+        position = BlockPos.coerce(position)
+        return ChunkPos(
+            position.x // self.chunk_size,
+            position.y // self.chunk_size,
+            position.z // self.chunk_size,
+        )
 
     def _is_air(self, block_id: BlockId) -> bool:
         return self.registry.get_state(block_id).name in (
