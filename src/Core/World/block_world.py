@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..Field.block_field import BlockBounds, BlockField
 from ..block.connectivity import ConnectivityCell
@@ -27,34 +27,59 @@ PlacementId = int
 TerrainMask = Callable[[BlockPos, TerrainMaskMode], bool]
 
 
+@runtime_checkable
+class YOffset(Protocol):
+    def __call__(self, x: int, z: int) -> int: ...
+
+    @property
+    def span(self) -> tuple[int, int]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class BlockTransform:
     origin: BlockPos = BlockPos(0, 0, 0)
     quarter_turns: int = 0
+    y_offset: YOffset | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "origin", BlockPos.coerce(self.origin))
         object.__setattr__(self, "quarter_turns", self.quarter_turns % 4)
 
-    def apply(self, position: BlockPos) -> BlockPos:
+    def _place(self, position: BlockPos) -> BlockPos:
+        # Rotation and translation only: the rigid part of the transform.
         position = BlockPos.coerce(position)
         x, y, z = position
         for _ in range(self.quarter_turns):
             x, z = -z, x
         return BlockPos(x + self.origin.x, y + self.origin.y, z + self.origin.z)
 
+    def apply(self, position: BlockPos) -> BlockPos:
+        placed = self._place(position)
+        if self.y_offset is None:
+            return placed
+        # Outermost step: the offset is evaluated in world coordinates.
+        return BlockPos(
+            placed.x,
+            placed.y + self.y_offset(placed.x, placed.z),
+            placed.z,
+        )
+
     def inverse(self, position: BlockPos) -> BlockPos:
         position = BlockPos.coerce(position)
-        x = position.x - self.origin.x
-        y = position.y - self.origin.y
-        z = position.z - self.origin.z
+        x, y, z = position
+        if self.y_offset is not None:
+            # Undone first, while x and z are still world coordinates.
+            y -= self.y_offset(x, z)
+        x -= self.origin.x
+        y -= self.origin.y
+        z -= self.origin.z
         for _ in range((-self.quarter_turns) % 4):
             x, z = -z, x
         return BlockPos(x, y, z)
 
     def apply_bounds(self, bounds: BlockBounds) -> BlockBounds:
         corners = (
-            self.apply(BlockPos(x, y, z))
+            self._place(BlockPos(x, y, z))
             for x in (bounds.minimum.x, bounds.maximum.x)
             for y in (bounds.minimum.y, bounds.maximum.y)
             for z in (bounds.minimum.z, bounds.maximum.z)
@@ -66,6 +91,10 @@ class BlockTransform:
             for axis, value in enumerate(position):
                 minimum[axis] = min(minimum[axis], value)
                 maximum[axis] = max(maximum[axis], value)
+        if self.y_offset is not None:
+            low, high = self.y_offset.span
+            minimum[1] += low
+            maximum[1] += high
         return BlockBounds(BlockPos(*minimum), BlockPos(*maximum))
 
 
@@ -195,7 +224,7 @@ class BlockWorld:
         before = {position: self.source_at(position) for position in positions}
         self.instances.append(placement)
         self._placements[placement_id] = placement
-        self._index_placement(placement)
+        self._index_placement(placement, positions)
         self._record_source_changes(before, positions)
         return placement_id
 
@@ -203,7 +232,7 @@ class BlockWorld:
         placement = self._placements[placement_id]
         positions = tuple(self._placement_positions(placement))
         before = {position: self.source_at(position) for position in positions}
-        self._unindex_placement(placement)
+        self._unindex_placement(placement, positions)
         self.instances.remove(placement)
         del self._placements[placement_id]
         return self._record_source_changes(before, positions)
@@ -225,13 +254,13 @@ class BlockWorld:
         )
         old_positions = set(self._placement_positions(placement))
         before = {position: self.source_at(position) for position in old_positions}
-        self._unindex_placement(placement)
+        self._unindex_placement(placement, old_positions)
         placement.transform = new_transform
         placement.revision += 1
         new_positions = set(self._placement_positions(placement))
         for position in new_positions - old_positions:
             before[position] = self.source_at(position)
-        self._index_placement(placement)
+        self._index_placement(placement, new_positions)
         return self._record_source_changes(before, old_positions | new_positions)
 
     def set_placement_domain(
@@ -530,19 +559,27 @@ class BlockWorld:
         for local_position, _ in placement.field.iter_block_ids():
             yield placement.transform.apply(local_position)
 
-    def _index_placement(self, placement: BlockPlacement) -> None:
-        chunks = {
-            self._chunk_for(position)
-            for position in self._placement_positions(placement)
-        }
+    def _index_placement(
+        self,
+        placement: BlockPlacement,
+        positions: Iterable[BlockPos] | None = None,
+    ) -> None:
+        # Callers that already walked the footprint pass it in: re-walking would
+        # evaluate the transform's y_offset a second time for every cell.
+        if positions is None:
+            positions = self._placement_positions(placement)
+        chunks = {self._chunk_for(position) for position in positions}
         for chunk in chunks:
             self._chunks.setdefault(chunk, set()).add(placement.placement_id)
 
-    def _unindex_placement(self, placement: BlockPlacement) -> None:
-        chunks = {
-            self._chunk_for(position)
-            for position in self._placement_positions(placement)
-        }
+    def _unindex_placement(
+        self,
+        placement: BlockPlacement,
+        positions: Iterable[BlockPos] | None = None,
+    ) -> None:
+        if positions is None:
+            positions = self._placement_positions(placement)
+        chunks = {self._chunk_for(position) for position in positions}
         for chunk in chunks:
             placements = self._chunks.get(chunk)
             if placements is None:

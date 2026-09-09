@@ -13,3 +13,9 @@ class TerrainMaskMode(Enum):
     BELOW = 2
     SURFACE = 3
     FOLLOW_SURFACE = 4
+
+
+class ElevationMode(Enum):
+    DEFORMABLE = 1
+    RIGID = 2
+    INTERPOLATED = 3

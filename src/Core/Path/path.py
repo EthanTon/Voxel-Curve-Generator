@@ -1,13 +1,38 @@
 from collections.abc import Sequence
 from dataclasses import astuple, dataclass
-from math import dist
+from math import dist, hypot
 
-from ..coordinates import BlockPos, Vec3
+from ..coordinates import BlockPos, Vec2, Vec3
 
 @dataclass(frozen=True, slots=True)
 class PathPoint:
     position: BlockPos
     gradient: Vec3
+
+    @property
+    def heading(self) -> Vec2:
+        # Horizontal projection of the gradient: the direction of travel in
+        # plan view, and the normal of the boundary plane at this point.
+        return Vec2(self.gradient.x, self.gradient.z)
+
+    @property
+    def heading_magnitude(self) -> float:
+        return hypot(self.gradient.x, self.gradient.z)
+
+    @property
+    def grade(self) -> float:
+        # Rise over horizontal run. Undefined where the gradient is vertical.
+        run = self.heading_magnitude
+        if run == 0.0:
+            raise ValueError(
+                f"PathPoint at {self.position} has a purely vertical gradient; "
+                "grade is undefined"
+            )
+        return self.gradient.y / run
+
+    @property
+    def is_vertical(self) -> bool:
+        return self.heading_magnitude == 0.0
 
 class Path:
     def __init__(
