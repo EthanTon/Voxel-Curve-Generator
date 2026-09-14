@@ -4,6 +4,7 @@ from ..Field.block_field import BlockField
 from ..modes import PlacementMode
 from ..coordinates import BlockPos
 from ..block.states import BlockState
+from ..Domain import Domain
 
 
 class Feature(Protocol):
@@ -24,12 +25,11 @@ class Feature:
         self,
         blocks: BlockField,
         placement_mode: PlacementMode,
-        domain_id: int,
+        domain: Domain,
         offset: BlockPos | None = None,
     ) -> None:
         self.blocks = blocks
-        self.placement_mode = placement_mode
-        self.domain_id = domain_id
+        self.domain = Domain
         self.offset = BlockPos(0, 0, 0) if offset is None else offset
 
 class PointFeature(Feature):
