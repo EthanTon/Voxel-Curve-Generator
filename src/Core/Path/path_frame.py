@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
-
 from ..coordinates import Vec2
 from .path import PathPoint
 
@@ -31,14 +29,9 @@ class OrthogonalBoundary:
     ) -> OrthogonalBoundary:
         # Build a boundary from a (possibly unnormalised) horizontal tangent.
         tangent = Vec2.coerce(tangent)
-        length = hypot(tangent.x, tangent.z)
-        if length == 0.0:
+        if tangent.length == 0.0:
             raise ValueError("Cannot build a boundary from a zero tangent")
-        return cls(
-            path_index=path_index,
-            origin=origin,
-            normal=Vec2(tangent.x / length, tangent.z / length),
-        )
+        return cls(path_index=path_index, origin=origin, normal=tangent.unit())
 
     @classmethod
     def from_path_point(cls, path_index: int, point: PathPoint) -> OrthogonalBoundary:

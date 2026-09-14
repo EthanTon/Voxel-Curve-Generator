@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from dataclasses import astuple, dataclass
-from math import dist, hypot
+from math import dist
 
 from ..coordinates import BlockPos, Vec2, Vec3
 
@@ -13,11 +13,11 @@ class PathPoint:
     def heading(self) -> Vec2:
         # Horizontal projection of the gradient: the direction of travel in
         # plan view, and the normal of the boundary plane at this point.
-        return Vec2(self.gradient.x, self.gradient.z)
+        return self.gradient.horizontal
 
     @property
     def heading_magnitude(self) -> float:
-        return hypot(self.gradient.x, self.gradient.z)
+        return self.heading.length
 
     @property
     def grade(self) -> float:

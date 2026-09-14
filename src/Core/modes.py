@@ -19,3 +19,10 @@ class ElevationMode(Enum):
     DEFORMABLE = 1
     RIGID = 2
     INTERPOLATED = 3
+
+class StepMode(Enum):
+    # Manhattan / face-connected
+    MANHATTAN = "manhattan"
+    
+    # Chebyshev / diagonal allowed
+    CHEBYSHEV = "chebyshev"
