@@ -14,9 +14,9 @@ from .info import BlockInfo, NeighborRule, SolidFace
 from .palette import BlockId
 from .registry import BlockRegistry
 from .states import BlockState
+from ..coordinates import BlockPos
 
 
-BlockPos = tuple[int, int, int]
 ConnectivityDomainId = int
 Direction = str
 
@@ -32,12 +32,12 @@ ALL_DIRECTIONS: tuple[Direction, ...] = (
     *HORIZONTAL_DIRECTIONS,
 )
 DIRECTION_OFFSETS: dict[Direction, BlockPos] = {
-    "down": (0, -1, 0),
-    "up": (0, 1, 0),
-    "north": (0, 0, -1),
-    "east": (1, 0, 0),
-    "south": (0, 0, 1),
-    "west": (-1, 0, 0),
+    "down": BlockPos(0, -1, 0),
+    "up": BlockPos(0, 1, 0),
+    "north": BlockPos(0, 0, -1),
+    "east": BlockPos(1, 0, 0),
+    "south": BlockPos(0, 0, 1),
+    "west": BlockPos(-1, 0, 0),
 }
 OPPOSITE_DIRECTION: dict[Direction, Direction] = {
     "down": "up",
@@ -73,31 +73,35 @@ BlockConnectionPredicate = Callable[
 @dataclass(frozen=True, slots=True)
 class DependencySpec:
     # Radius is extra invalidation beyond the six direct neighbors.
-    radius: BlockPos = (0, 0, 0)
+    radius: BlockPos = BlockPos(0, 0, 0)
     horizontal_range: int = 0
     stream_halo: int | None = 1
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "radius", BlockPos.coerce(self.radius))
+
     def affected_positions(self, position: BlockPos) -> set[BlockPos]:
+        position = BlockPos.coerce(position)
         positions: set[BlockPos] = set()
         if any(self.radius):
-            for delta_x in range(-self.radius[0], self.radius[0] + 1):
-                for delta_y in range(-self.radius[1], self.radius[1] + 1):
-                    for delta_z in range(-self.radius[2], self.radius[2] + 1):
+            for delta_x in range(-self.radius.x, self.radius.x + 1):
+                for delta_y in range(-self.radius.y, self.radius.y + 1):
+                    for delta_z in range(-self.radius.z, self.radius.z + 1):
                         positions.add(
-                            (
-                                position[0] + delta_x,
-                                position[1] + delta_y,
-                                position[2] + delta_z,
+                            BlockPos(
+                                position.x + delta_x,
+                                position.y + delta_y,
+                                position.z + delta_z,
                             )
                         )
         for direction in HORIZONTAL_DIRECTIONS:
             offset = DIRECTION_OFFSETS[direction]
             for distance in range(1, self.horizontal_range + 1):
                 positions.add(
-                    (
-                        position[0] + offset[0] * distance,
-                        position[1],
-                        position[2] + offset[2] * distance,
+                    BlockPos(
+                        position.x + offset.x * distance,
+                        position.y,
+                        position.z + offset.z * distance,
                     )
                 )
         return positions
@@ -105,9 +109,9 @@ class DependencySpec:
 
 DEFAULT_DEPENDENCY_SPEC = DependencySpec()
 BUILTIN_DEPENDENCY_SPECS: dict[NeighborRule, DependencySpec] = {
-    NeighborRule.REDSTONE: DependencySpec(radius=(1, 1, 1)),
-    NeighborRule.MOSS_CARPET: DependencySpec(radius=(1, 1, 1)),
-    NeighborRule.RAIL: DependencySpec(radius=(2, 2, 2), stream_halo=2),
+    NeighborRule.REDSTONE: DependencySpec(radius=BlockPos(1, 1, 1)),
+    NeighborRule.MOSS_CARPET: DependencySpec(radius=BlockPos(1, 1, 1)),
+    NeighborRule.RAIL: DependencySpec(radius=BlockPos(2, 2, 2), stream_halo=2),
     NeighborRule.TRIPWIRE: DependencySpec(horizontal_range=42, stream_halo=42),
     NeighborRule.TRIPWIRE_HOOK: DependencySpec(horizontal_range=42, stream_halo=42),
     NeighborRule.LEAVES: DependencySpec(stream_halo=7),
@@ -186,7 +190,7 @@ class _MappingConnectivityView:
         return None
 
     def iter_source_positions(self) -> Iterator[BlockPos]:
-        return iter(self.blocks)
+        return (BlockPos.coerce(position) for position in self.blocks)
 
 
 class _EffectiveBlockMapping(Mapping[BlockPos, BlockId]):
@@ -440,8 +444,8 @@ class NeighborResolver:
     def policy_token(self) -> tuple[object, ...]:
         # The world uses this token to invalidate cached states after policy changes.
         return (
-            id(self.domains_can_connect),
-            id(self.blocks_can_connect),
+            _predicate_token(self.domains_can_connect),
+            _predicate_token(self.blocks_can_connect),
             repr(None if self.options is None else self.options.overrides),
             tuple(
                 sorted(
@@ -612,8 +616,8 @@ def _dirty_position_and_rules(
     item: BlockPos | object,
     registry: BlockRegistry,
 ) -> tuple[BlockPos, set[NeighborRule]]:
-    if isinstance(item, tuple) and len(item) == 3:
-        return item, set()
+    if isinstance(item, (BlockPos, tuple)) and len(item) == 3:
+        return BlockPos.coerce(item), set()
     position = getattr(item, "position")
     rules: set[NeighborRule] = set()
     for name in ("before", "after"):
@@ -634,12 +638,14 @@ def _same_domain(left: ConnectivityDomainId, right: ConnectivityDomainId) -> boo
     return left == right
 
 
+def _predicate_token(predicate: object) -> object:
+    # Predicates may describe their rules by value; identity is the fallback.
+    token = getattr(predicate, "policy_token", None)
+    return id(predicate) if token is None else token
+
+
 def _add_position(left: BlockPos, right: BlockPos) -> BlockPos:
-    return (
-        left[0] + right[0],
-        left[1] + right[1],
-        left[2] + right[2],
-    )
+    return BlockPos.coerce(left) + BlockPos.coerce(right)
 
 
 def _with_properties(state: BlockState, updates: Mapping[str, str]) -> BlockState:
