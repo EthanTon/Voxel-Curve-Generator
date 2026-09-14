@@ -16,7 +16,7 @@ class OrthogonalBoundary:
     def __post_init__(self) -> None:
         object.__setattr__(self, "origin", Vec2.coerce(self.origin))
         normal = Vec2.coerce(self.normal)
-        if normal.x == 0.0 and normal.z == 0.0:
+        if normal.length == 0.0:
             raise ValueError("OrthogonalBoundary normal must be non-zero")
         object.__setattr__(self, "normal", normal)
 
@@ -52,17 +52,14 @@ class OrthogonalBoundary:
 
     def side(self, x: float, z: float) -> float:
         # Signed placement of a column relative to the plane.
-        origin = self.origin
-        normal = self.normal
-        return (x - origin.x) * normal.x + (z - origin.z) * normal.z
+        return Vec2(x - self.origin.x, z - self.origin.z).dot(self.normal)
 
     def after(self, x: float, z: float) -> bool:
         # Half-open convention: the plane itself belongs to the frame after it.
         return self.side(x, z) >= 0.0
 
     def is_parallel_to(self, other: OrthogonalBoundary, tolerance: float = 1e-9) -> bool:
-        cross = self.normal.x * other.normal.z - self.normal.z * other.normal.x
-        return abs(cross) <= tolerance
+        return abs(self.normal.cross(other.normal)) <= tolerance
 
 
 @dataclass(frozen=True, slots=True)

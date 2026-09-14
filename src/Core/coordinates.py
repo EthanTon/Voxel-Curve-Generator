@@ -30,9 +30,9 @@ class Coordinate(Protocol):
     def coerce(cls, value: Sequence[int | float]) -> Coordinate: ...
 
 
-# Implementations the coordinate types share. Each type binds them as its own
-# methods, so a type can replace any one of them. They read the type's
-# `_components`, the names of its fields in order.
+# Implementations the coordinate types share, bound by coordinate_methods. A
+# type replaces any one of them by defining that method itself. They read the
+# type's `_components`, the names of its fields in order.
 
 
 def _is_coordinate(value: object) -> bool:
@@ -138,6 +138,35 @@ def _lt(self, other: object) -> bool:
     return len(self) < len(other_values)
 
 
+_COORDINATE_METHODS = {
+    "__iter__": _iter,
+    "__len__": _len,
+    "__getitem__": _getitem,
+    "__contains__": _contains,
+    "__reversed__": _reversed,
+    "index": _index,
+    "count": _count,
+    "as_tuple": _as_tuple,
+    "coerce": classmethod(_coerce),
+    "__eq__": _eq,
+    "__hash__": _hash,
+    "__lt__": _lt,
+}
+
+
+def coordinate_methods(cls: type) -> type:
+    # Give a class with `_components` the shared coordinate methods it does not
+    # define itself, and register it as a Sequence. Apply it above
+    # @dataclass(eq=False): slotted dataclasses are rebuilt as new classes, so
+    # the binding and registration must happen to the final class. A class
+    # that defines __eq__ must also define __hash__, as Python requires.
+    for name, method in _COORDINATE_METHODS.items():
+        if name not in cls.__dict__:
+            setattr(cls, name, method)
+    Sequence.register(cls)
+    return cls
+
+
 @runtime_checkable
 class Vector(Protocol):
     """The vector math every float coordinate type provides."""
@@ -154,8 +183,8 @@ class Vector(Protocol):
     def is_close(self, other: Sequence[float], tolerance: float = 1e-9) -> bool: ...
 
 
-# Component-wise implementations the vector types share. Each type calls them
-# from its own methods, so a type can replace any one of them.
+# Implementations the vector types share, bound by vector_methods. A type
+# replaces any one of them by defining that method itself.
 
 
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
@@ -173,79 +202,78 @@ def _unit_components(vector: Sequence[float]) -> tuple[float, ...]:
     return tuple(value / length for value in vector)
 
 
+def _vector_dot(self, other: Sequence[float]) -> float:
+    return _dot(self, type(self).coerce(other))
+
+
+def _vector_length(self) -> float:
+    return sqrt(_dot(self, self))
+
+
+def _vector_unit(self):
+    return type(self)(*_unit_components(self))
+
+
+def _vector_distance_to(self, other: Sequence[float]) -> float:
+    return _distance(self, type(self).coerce(other))
+
+
+def _vector_is_close(self, other: Sequence[float], tolerance: float = 1e-9) -> bool:
+    return self.distance_to(other) <= tolerance
+
+
+_VECTOR_METHODS = {
+    "dot": _vector_dot,
+    "length": property(_vector_length),
+    "unit": _vector_unit,
+    "distance_to": _vector_distance_to,
+    "is_close": _vector_is_close,
+}
+
+
+def vector_methods(cls: type) -> type:
+    # Give a coordinate class the shared vector methods it does not define
+    # itself. Apply it above @dataclass, like coordinate_methods.
+    for name, method in _VECTOR_METHODS.items():
+        if name not in cls.__dict__:
+            setattr(cls, name, method)
+    return cls
+
+
+def quarter_turn(x: float, z: float, turns: int = 1) -> tuple[float, float]:
+    # Rotate a column clockwise, seen from above, by quarter turns. This is the
+    # one definition of a clockwise quarter turn: north (0, -1) becomes east
+    # (1, 0).
+    for _ in range(turns % 4):
+        x, z = -z, x
+    return x, z
+
+
+@vector_methods
+@coordinate_methods
 @dataclass(frozen=True, slots=True, eq=False)
 class Vec2:
     _components = ("x", "z")
 
-    __iter__ = _iter
-    __len__ = _len
-    __getitem__ = _getitem
-    __contains__ = _contains
-    __reversed__ = _reversed
-    index = _index
-    count = _count
-    as_tuple = _as_tuple
-    coerce = classmethod(_coerce)
-    __eq__ = _eq
-    __hash__ = _hash
-    __lt__ = _lt
-
     x: float
     z: float
 
-    def dot(self, other: Vec2 | Sequence[float]) -> float:
-        return _dot(self, Vec2.coerce(other))
-
-    @property
-    def length(self) -> float:
-        return sqrt(_dot(self, self))
-
-    def unit(self) -> Vec2:
-        return Vec2(*_unit_components(self))
-
-    def distance_to(self, other: Vec2 | Sequence[float]) -> float:
-        return _distance(self, Vec2.coerce(other))
-
-    def is_close(self, other: Vec2 | Sequence[float], tolerance: float = 1e-9) -> bool:
-        return self.distance_to(other) <= tolerance
+    def cross(self, other: Vec2 | Sequence[float]) -> float:
+        # Signed area of the parallelogram the two vectors span: zero when they
+        # are parallel.
+        other = Vec2.coerce(other)
+        return self.x * other.z - self.z * other.x
 
 
+@vector_methods
+@coordinate_methods
 @dataclass(frozen=True, slots=True, eq=False)
 class Vec3:
     _components = ("x", "y", "z")
 
-    __iter__ = _iter
-    __len__ = _len
-    __getitem__ = _getitem
-    __contains__ = _contains
-    __reversed__ = _reversed
-    index = _index
-    count = _count
-    as_tuple = _as_tuple
-    coerce = classmethod(_coerce)
-    __eq__ = _eq
-    __hash__ = _hash
-    __lt__ = _lt
-
     x: float
     y: float
     z: float
-
-    def dot(self, other: Vec3 | Sequence[float]) -> float:
-        return _dot(self, Vec3.coerce(other))
-
-    @property
-    def length(self) -> float:
-        return sqrt(_dot(self, self))
-
-    def unit(self) -> Vec3:
-        return Vec3(*_unit_components(self))
-
-    def distance_to(self, other: Vec3 | Sequence[float]) -> float:
-        return _distance(self, Vec3.coerce(other))
-
-    def is_close(self, other: Vec3 | Sequence[float], tolerance: float = 1e-9) -> bool:
-        return self.distance_to(other) <= tolerance
 
     @property
     def horizontal(self) -> Vec2:
@@ -253,22 +281,10 @@ class Vec3:
         return Vec2(self.x, self.z)
 
 
+@coordinate_methods
 @dataclass(frozen=True, slots=True, eq=False)
 class BlockPos:
     _components = ("x", "y", "z")
-
-    __iter__ = _iter
-    __len__ = _len
-    __getitem__ = _getitem
-    __contains__ = _contains
-    __reversed__ = _reversed
-    index = _index
-    count = _count
-    as_tuple = _as_tuple
-    coerce = classmethod(_coerce)
-    __eq__ = _eq
-    __hash__ = _hash
-    __lt__ = _lt
 
     x: int
     y: int
@@ -283,50 +299,20 @@ class BlockPos:
         return BlockPos(self.x - other.x, self.y - other.y, self.z - other.z)
 
 
+@coordinate_methods
 @dataclass(frozen=True, slots=True, eq=False)
 class ChunkPos:
     _components = ("x", "y", "z")
-
-    __iter__ = _iter
-    __len__ = _len
-    __getitem__ = _getitem
-    __contains__ = _contains
-    __reversed__ = _reversed
-    index = _index
-    count = _count
-    as_tuple = _as_tuple
-    coerce = classmethod(_coerce)
-    __eq__ = _eq
-    __hash__ = _hash
-    __lt__ = _lt
 
     x: int
     y: int
     z: int
 
 
+@coordinate_methods
 @dataclass(frozen=True, slots=True, eq=False)
 class ColumnPos:
     _components = ("x", "z")
 
-    __iter__ = _iter
-    __len__ = _len
-    __getitem__ = _getitem
-    __contains__ = _contains
-    __reversed__ = _reversed
-    index = _index
-    count = _count
-    as_tuple = _as_tuple
-    coerce = classmethod(_coerce)
-    __eq__ = _eq
-    __hash__ = _hash
-    __lt__ = _lt
-
     x: int
     z: int
-
-
-# Coordinates stay virtual sequences without inheriting from Sequence.
-for _type in (Vec2, Vec3, BlockPos, ChunkPos, ColumnPos):
-    Sequence.register(_type)
-del _type

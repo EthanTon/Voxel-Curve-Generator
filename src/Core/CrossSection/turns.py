@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from math import sqrt
 
-from ..coordinates import Vec2, Vec3
+from ..coordinates import Vec2, Vec3, quarter_turn
 
 # Degrees clockwise from the path's initial heading, in steps of 45. Every
 # cross section starts at a turn of 0, where it is used as authored: local x is
@@ -27,19 +26,18 @@ _QUARTER_LAYOUTS: dict[Turn, tuple[int, int, int, int]] = {
     270: (0, -1, -1, 0),
 }
 
+# Forward at each quarter: local forward (0, -1) turned clockwise.
 _FORWARD: dict[Turn, tuple[int, int]] = {
-    0: (0, -1),
-    90: (1, 0),
-    180: (0, 1),
-    270: (-1, 0),
+    quarter: quarter_turn(0, -1, quarter // 90) for quarter in (0, 90, 180, 270)
 }
 
-_DIAGONAL = sqrt(0.5)
+# The unit heading halfway between each pair of neighboring quarters.
 _DIAGONALS: dict[Turn, Vec2] = {
-    45: Vec2(_DIAGONAL, -_DIAGONAL),
-    135: Vec2(_DIAGONAL, _DIAGONAL),
-    225: Vec2(-_DIAGONAL, _DIAGONAL),
-    315: Vec2(-_DIAGONAL, -_DIAGONAL),
+    quarter + 45: Vec2(
+        _FORWARD[quarter][0] + _FORWARD[(quarter + 90) % 360][0],
+        _FORWARD[quarter][1] + _FORWARD[(quarter + 90) % 360][1],
+    ).unit()
+    for quarter in _FORWARD
 }
 
 
@@ -79,7 +77,7 @@ def turn_of(
     initial = Vec3.coerce(initial_gradient).horizontal.unit()
     # Express the heading in the section's frame, where the initial heading is
     # forward (0, -1) and its right is (1, 0).
-    right = Vec2(-initial.z, initial.x)
+    right = Vec2(*quarter_turn(initial.x, initial.z))
     relative = Vec2(heading.dot(right), -heading.dot(initial))
     for turn, diagonal in _DIAGONALS.items():
         if relative.is_close(diagonal, tolerance):

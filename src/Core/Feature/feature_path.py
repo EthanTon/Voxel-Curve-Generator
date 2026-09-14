@@ -26,12 +26,16 @@ class FeaturePathPoint:
 FeaturePathRule = Callable[["FeaturePath", FeaturePathPoint], bool]
 
 
+def _has_position(points: Iterable[FeaturePathPoint], point: FeaturePathPoint) -> bool:
+    return any(kept.position == point.position for kept in points)
+
+
 def not_in_previous_delivery(path: FeaturePath, point: FeaturePathPoint) -> bool:
-    return all(kept.position != point.position for kept in path.previous_delivery)
+    return not _has_position(path.previous_delivery, point)
 
 
 def not_in_current_delivery(path: FeaturePath, point: FeaturePathPoint) -> bool:
-    return all(kept.position != point.position for kept in path.current_delivery)
+    return not _has_position(path.current_delivery, point)
 
 
 DEFAULT_RULES: tuple[FeaturePathRule, ...] = (

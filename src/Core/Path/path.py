@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass
 from math import dist
 
 from ..coordinates import BlockPos, Vec2, Vec3
@@ -64,6 +64,6 @@ class Path:
             prev = self.path_points[i - 1].position
             curr = self.path_points[i].position
             
-            distance += dist(astuple(prev), astuple(curr))
+            distance += dist(prev, curr)
 
         return distance

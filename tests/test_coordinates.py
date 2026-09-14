@@ -5,7 +5,20 @@ from src.Core.World.block_world import BlockTransform
 from src.Core.block.states import BlockState
 from collections.abc import Sequence
 
-from src.Core.coordinates import BlockPos, ChunkPos, ColumnPos, Coordinate, Vec2, Vec3, Vector
+from dataclasses import dataclass
+
+from src.Core.coordinates import (
+    BlockPos,
+    ChunkPos,
+    ColumnPos,
+    Coordinate,
+    Vec2,
+    Vec3,
+    Vector,
+    coordinate_methods,
+    quarter_turn,
+    vector_methods,
+)
 
 
 class CoordinateTests(unittest.TestCase):
@@ -77,8 +90,64 @@ class VectorTests(unittest.TestCase):
             self.assertIsInstance(vector, Vector)
         self.assertNotIsInstance(BlockPos(1, 0, 0), Vector)
 
+    def test_cross_is_zero_for_parallel_vectors(self) -> None:
+        self.assertEqual(Vec2(2.0, 1.0).cross((4.0, 2.0)), 0.0)
+        self.assertEqual(Vec2(1.0, 0.0).cross((0.0, 1.0)), 1.0)
+
     def test_horizontal_drops_the_height(self) -> None:
         self.assertEqual(Vec3(1.0, 9.0, -2.0).horizontal, Vec2(1.0, -2.0))
+
+
+class QuarterTurnTests(unittest.TestCase):
+    def test_turns_run_clockwise_from_north(self) -> None:
+        self.assertEqual(
+            [quarter_turn(0, -1, turns) for turns in range(4)],
+            [(0, -1), (1, 0), (0, 1), (-1, 0)],
+        )
+
+    def test_negative_turns_undo_positive_ones(self) -> None:
+        self.assertEqual(quarter_turn(*quarter_turn(3, -5, 1), -1), (3, -5))
+
+
+class SharedMethodTests(unittest.TestCase):
+    def test_new_types_get_the_shared_methods(self) -> None:
+        @vector_methods
+        @coordinate_methods
+        @dataclass(frozen=True, slots=True, eq=False)
+        class Vec4:
+            _components = ("w", "x", "y", "z")
+
+            w: float
+            x: float
+            y: float
+            z: float
+
+        vector = Vec4(0.0, 3.0, 0.0, 4.0)
+        self.assertIsInstance(vector, Coordinate)
+        self.assertIsInstance(vector, Vector)
+        self.assertIsInstance(vector, Sequence)
+        self.assertEqual(vector.length, 5.0)
+        self.assertEqual(Vec4.coerce((1.0, 2.0, 3.0, 4.0)).z, 4.0)
+
+    def test_a_type_can_replace_one_shared_method(self) -> None:
+        @vector_methods
+        @coordinate_methods
+        @dataclass(frozen=True, slots=True, eq=False)
+        class Manhattan:
+            _components = ("x", "z")
+
+            x: float
+            z: float
+
+            def distance_to(self, other):
+                other = Manhattan.coerce(other)
+                return abs(self.x - other.x) + abs(self.z - other.z)
+
+        point = Manhattan(0.0, 0.0)
+        self.assertEqual(point.distance_to((3.0, 4.0)), 7.0)
+        # Methods built on it pick up the replacement.
+        self.assertTrue(point.is_close((3.0, 4.0), tolerance=7.0))
+        self.assertEqual(point.dot((3.0, 4.0)), 0.0)
 
 
 if __name__ == "__main__":

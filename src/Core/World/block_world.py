@@ -16,7 +16,7 @@ from ..constants import (
     DEFAULT_TERRAIN_MASK_MODE,
 )
 from ..modes import PlacementMode, TerrainMaskMode
-from ..coordinates import BlockPos, ChunkPos
+from ..coordinates import BlockPos, ChunkPos, quarter_turn
 
 
 if TYPE_CHECKING:
@@ -52,8 +52,7 @@ class BlockTransform:
         # Rotation and translation only: the rigid part of the transform.
         position = BlockPos.coerce(position)
         x, y, z = position
-        for _ in range(self.quarter_turns):
-            x, z = -z, x
+        x, z = quarter_turn(x, z, self.quarter_turns)
         return BlockPos(x + self.origin.x, y + self.origin.y, z + self.origin.z)
 
     def apply(self, position: BlockPos) -> BlockPos:
@@ -76,8 +75,7 @@ class BlockTransform:
         x -= self.origin.x
         y -= self.origin.y
         z -= self.origin.z
-        for _ in range((-self.quarter_turns) % 4):
-            x, z = -z, x
+        x, z = quarter_turn(x, z, -self.quarter_turns)
         return BlockPos(x, y, z)
 
     def apply_bounds(self, bounds: BlockBounds) -> BlockBounds:
