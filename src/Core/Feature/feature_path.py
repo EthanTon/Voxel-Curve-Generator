@@ -1,35 +1,33 @@
 from dataclasses import dataclass
 from math import dist
 
-from ..coordinates import BlockPos
+from abc import ABC, abstractmethod
+
+from typing import Protocol
+
+from ..coordinates import BlockPos, Vec3
 
 @dataclass(frozen=True, slots=True)
 class FeaturePathPoint:
     stamp_index: int
     point_index: int
     position: BlockPos
-    distance: float
+    gradient: Vec3
+    
+    def __eq__(self, point: FeaturePathPoint = None) -> bool:
+        if point is not None and point is FeaturePathPoint:
+            if self.position == point.position and self.gradient == point.gradient:
+                return True
+        return False
 
 
-class FeaturePath:
-    def __init__(self, name):
-        self.name = name
-        self._points = []
-
-    @property
-    def points(self):
-        return tuple(self._points)
-
-    def append(self, positions: list[BlockPos]):
-        positions = tuple(BlockPos.coerce(position) for position in positions)
-        
-        if not positions:
-            raise ValueError("Position must include at least one point")
-        
-        for position in positions:
-            if self._points:
-                if self._points[-1].position != position:
-                    self._points.append(
-                        Feat
-                    )
-        
+class FeaturePath(Protocol):
+    _path: list[FeaturePathPoint]
+    
+    # Append function that adds point to path
+    def add(point: FeaturePathPoint) -> FeaturePathPoint:
+        ...
+    
+    # Rule used to determine whether to add a point to the path
+    def _rule(point: FeaturePathPoint) -> bool:
+        ...
