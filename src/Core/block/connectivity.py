@@ -444,8 +444,8 @@ class NeighborResolver:
     def policy_token(self) -> tuple[object, ...]:
         # The world uses this token to invalidate cached states after policy changes.
         return (
-            id(self.domains_can_connect),
-            id(self.blocks_can_connect),
+            _predicate_token(self.domains_can_connect),
+            _predicate_token(self.blocks_can_connect),
             repr(None if self.options is None else self.options.overrides),
             tuple(
                 sorted(
@@ -636,6 +636,12 @@ def neighboring_positions(position: BlockPos) -> tuple[BlockPos, ...]:
 
 def _same_domain(left: ConnectivityDomainId, right: ConnectivityDomainId) -> bool:
     return left == right
+
+
+def _predicate_token(predicate: object) -> object:
+    # Predicates may describe their rules by value; identity is the fallback.
+    token = getattr(predicate, "policy_token", None)
+    return id(predicate) if token is None else token
 
 
 def _add_position(left: BlockPos, right: BlockPos) -> BlockPos:

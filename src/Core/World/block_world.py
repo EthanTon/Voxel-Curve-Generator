@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..Field.block_field import BlockBounds, BlockField
-from ..block.connectivity import ConnectivityCell
+from ..block.connectivity import ConnectivityCell, ConnectivityDomainId
 from ..block.palette import BlockId
 from ..block.registry import BlockRegistry
 from ..block.rotation import rotate_block_state
@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 PlacementId = int
 TerrainMask = Callable[[BlockPos, TerrainMaskMode], bool]
+# Called with (placing domain, existing domain) before a placement replaces a
+# non-air block. Returning False keeps the existing block.
+PlacementPolicy = Callable[[ConnectivityDomainId, ConnectivityDomainId], bool]
 
 
 @runtime_checkable
@@ -155,6 +158,7 @@ class BlockWorld:
         base_blocks: Mapping[BlockPos, BlockId] | None = None,
         base_domain: int = 0,
         terrain_mask: TerrainMask | None = None,
+        placement_policy: PlacementPolicy | None = None,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -163,6 +167,7 @@ class BlockWorld:
         self.base_blocks = base_blocks if base_blocks is not None else {}
         self.base_domain = base_domain
         self.terrain_mask = terrain_mask
+        self.placement_policy = placement_policy
         self.instances: list[BlockPlacement] = []
         self._placements: dict[PlacementId, BlockPlacement] = {}
         self._chunks: dict[ChunkPos, set[PlacementId]] = {}
@@ -276,6 +281,20 @@ class BlockWorld:
         placement.connectivity_domain = connectivity_domain
         placement.revision += 1
         return self._record_source_changes(before, positions)
+
+    def set_base_domain(self, domain: ConnectivityDomainId) -> None:
+        if domain == self.base_domain:
+            return
+        self.base_domain = domain
+        self.invalidate_connectivity_policy()
+
+    def set_placement_policy(self, policy: PlacementPolicy | None) -> None:
+        # Composition is not cached, but dirty tracking and the resolved
+        # overlay are, so a policy with different rules invalidates both.
+        previous = self.placement_policy
+        self.placement_policy = policy
+        if _policy_token(previous) != _policy_token(policy):
+            self.invalidate_connectivity_policy()
 
     def source_at(self, position: BlockPos) -> ConnectivityCell | None:
         position = BlockPos.coerce(position)
@@ -481,6 +500,13 @@ class BlockWorld:
         position: BlockPos,
         current: ConnectivityCell | None,
     ) -> bool:
+        if (
+            self.placement_policy is not None
+            and current is not None
+            and not self._is_air(current.block_id)
+            and not self.placement_policy(placement.connectivity_domain, current.domain)
+        ):
+            return False
         mode = placement.placement_mode
         if mode == PlacementMode.OVERWRITE:
             return True
@@ -602,3 +628,8 @@ class BlockWorld:
             "minecraft:cave_air",
             "minecraft:void_air",
         )
+
+
+def _policy_token(policy: object) -> object:
+    token = getattr(policy, "policy_token", None)
+    return id(policy) if token is None else token

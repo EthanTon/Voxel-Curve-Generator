@@ -4,6 +4,7 @@ from .block_world import (
     BlockWorld,
     CellChange,
     PlacementId,
+    PlacementPolicy,
     ResolutionDelta,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "BlockWorld",
     "CellChange",
     "PlacementId",
+    "PlacementPolicy",
     "ResolutionDelta",
 ]
