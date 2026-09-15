@@ -2,13 +2,13 @@ import unittest
 
 from src.Core.Field.block_field import BlockBounds
 from src.Core.Path.elevation import ElevationStep, MultiElevationStep
-from src.Core.Path.path_frame import OrthogonalBoundary
+from src.Core.Path.boundary import Boundary
 from src.Core.World.block_world import BlockTransform, YOffset
 from src.Core.coordinates import BlockPos
 
 
 def boundary(index=0, origin=(0.0, 0.0), tangent=(0.0, 1.0)):
-    return OrthogonalBoundary.from_tangent(index, origin, tangent)
+    return Boundary.from_direction(origin, tangent, path_index=index)
 
 
 GRID = [

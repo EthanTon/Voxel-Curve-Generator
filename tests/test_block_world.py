@@ -1,7 +1,8 @@
 import unittest
 
 from src.Core.Field.block_field import BlockField
-from src.Core.World.block_world import BlockTransform, BlockWorld
+from src.Core.Path.boundary import Boundary, PathBounds
+from src.Core.World.block_world import BlockTransform, BlockWorld, ColumnMask
 from src.Core.block.connectivity import NeighborResolver
 from src.Core.block.connectivity_options import ConnectionOverride, ConnectivityOptions
 from src.Core.block.info import BlockInfo, NeighborRule, RotationRule, SolidFace
@@ -317,6 +318,65 @@ class BlockWorldTests(unittest.TestCase):
         self.assertEqual(self.registry.get_state(first.block_id).name, "minecraft:stone")
         self.assertEqual(world.palette_translation_size, 1)
         self.assertEqual(len(field), 1)
+
+
+class ClippedPlacementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = BlockRegistry()
+        self.stone = self.registry.register(BlockState.create("minecraft:stone"))
+        self.dirt = self.registry.register(BlockState.create("minecraft:dirt"))
+        # Bounds of a path along +z from z=2 to z=8, as Generation would build them.
+        self.bounds = PathBounds(
+            Boundary.from_direction((0.0, 2.0), (0.0, 1.0)),
+            Boundary.from_direction((0.0, 8.0), (0.0, 1.0)),
+        )
+
+    def slab(self, block_id: int) -> BlockField:
+        # A 5-wide strip covering the whole padded path, as a stamped feature would.
+        field = BlockField(self.registry.palette)
+        for x in range(-2, 3):
+            for z in range(12):
+                field.set_block_id((x, 0, z), block_id)
+        return field
+
+    def test_bounds_satisfy_the_mask_protocol(self) -> None:
+        self.assertIsInstance(self.bounds, ColumnMask)
+
+    def test_cells_outside_the_bounds_are_not_added(self) -> None:
+        world = BlockWorld(self.registry)
+        world.add_field(self.slab(self.stone), clip=self.bounds)
+
+        for x in range(-2, 3):
+            for z in range(12):
+                expected = self.bounds.contains(x, z)
+                self.assertEqual(world.source_at((x, 0, z)) is not None, expected, (x, z))
+        self.assertEqual(
+            {p.z for p in world.iter_source_positions()}, set(range(2, 8))
+        )
+
+    def test_dropped_cells_never_become_dirty(self) -> None:
+        world = BlockWorld(self.registry)
+        world.add_field(self.slab(self.stone), clip=self.bounds)
+        changed = {change.position for change in world.drain_dirty_changes()}
+        self.assertTrue(all(self.bounds.contains(p.x, p.z) for p in changed))
+        self.assertEqual(len(changed), 5 * 6)
+
+    def test_dropped_cells_do_not_hide_lower_placements(self) -> None:
+        world = BlockWorld(self.registry)
+        world.add_field(self.slab(self.dirt))
+        world.add_field(self.slab(self.stone), clip=self.bounds)
+        self.assertEqual(world.source_at((0, 0, 0)).block_id, self.dirt)
+        self.assertEqual(world.source_at((0, 0, 5)).block_id, self.stone)
+        self.assertEqual(world.source_at((0, 0, 11)).block_id, self.dirt)
+
+    def test_clip_is_in_world_columns_and_survives_a_move(self) -> None:
+        world = BlockWorld(self.registry)
+        placement = world.add_field(self.slab(self.stone), clip=self.bounds)
+        world.move_placement(placement, (0, 0, 4))
+        # the strip now spans world z 4-15, but the path still ends at z=8
+        self.assertEqual(
+            {p.z for p in world.iter_source_positions()}, set(range(4, 8))
+        )
 
 
 if __name__ == "__main__":

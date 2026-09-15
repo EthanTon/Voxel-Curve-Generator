@@ -38,6 +38,13 @@ class YOffset(Protocol):
     def span(self) -> tuple[int, int]: ...
 
 
+@runtime_checkable
+class ColumnMask(Protocol):
+    # World columns a placement may occupy. Cells outside are dropped: never
+    # indexed, never composed, so they are not added to the world at all.
+    def contains(self, x: float, z: float) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class BlockTransform:
     origin: BlockPos = BlockPos(0, 0, 0)
@@ -111,10 +118,14 @@ class BlockPlacement:
     sequence_index: int | None
     order: int
     revision: int = 0
+    clip: ColumnMask | None = None
 
     @property
     def offset(self) -> BlockPos:
         return self.transform.origin
+
+    def occupies(self, position: BlockPos) -> bool:
+        return self.clip is None or self.clip.contains(position.x, position.z)
 
     @property
     def bounds(self) -> BlockBounds | None:
@@ -202,6 +213,7 @@ class BlockWorld:
         transform: BlockTransform | None = None,
         connectivity_domain: int = 0,
         sequence_index: int | None = None,
+        clip: ColumnMask | None = None,
     ) -> PlacementId:
         if placement_mode == PlacementMode.TERRAIN_MASK and self.terrain_mask is None:
             raise ValueError("TERRAIN_MASK placement requires a terrain_mask callback")
@@ -222,6 +234,7 @@ class BlockWorld:
             connectivity_domain=connectivity_domain,
             sequence_index=sequence_index,
             order=self._next_order,
+            clip=clip,
         )
         positions = tuple(self._placement_positions(placement))
         before = {position: self.source_at(position) for position in positions}
@@ -470,6 +483,8 @@ class BlockWorld:
             for placement_id in self._chunks.get(self._chunk_for(position), ())
         )
         for placement in sorted(candidates, key=lambda item: item.order):
+            if not placement.occupies(position):
+                continue
             local_position = placement.transform.inverse(position)
             local_id = placement.field.get_block_id(local_position)
             if local_id is None:
@@ -581,7 +596,9 @@ class BlockWorld:
 
     def _placement_positions(self, placement: BlockPlacement) -> Iterator[BlockPos]:
         for local_position, _ in placement.field.iter_block_ids():
-            yield placement.transform.apply(local_position)
+            position = placement.transform.apply(local_position)
+            if placement.occupies(position):
+                yield position
 
     def _index_placement(
         self,
