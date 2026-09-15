@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .path_frame import OrthogonalBoundary
+from .boundary import OrthogonalBoundary
 
 
 @dataclass(frozen=True, slots=True)

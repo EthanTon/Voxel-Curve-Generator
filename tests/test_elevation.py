@@ -1,7 +1,7 @@
 import unittest
 
 from src.Core.Path.elevation import ElevationStep, MultiElevationStep
-from src.Core.Path.path_frame import OrthogonalBoundary
+from src.Core.Path.boundary import OrthogonalBoundary
 
 
 def boundary(index=0, origin=(0.0, 0.0), tangent=(0.0, 1.0)):

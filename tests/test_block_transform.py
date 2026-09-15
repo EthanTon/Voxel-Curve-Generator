@@ -2,7 +2,7 @@ import unittest
 
 from src.Core.Field.block_field import BlockBounds
 from src.Core.Path.elevation import ElevationStep, MultiElevationStep
-from src.Core.Path.path_frame import OrthogonalBoundary
+from src.Core.Path.boundary import OrthogonalBoundary
 from src.Core.World.block_world import BlockTransform, YOffset
 from src.Core.coordinates import BlockPos
 
