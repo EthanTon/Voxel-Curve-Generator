@@ -6,14 +6,13 @@ from src.Core.CrossSection.cross_section import (
     PointField,
     orient_annotation,
 )
-from src.Core.CrossSection.delivery import deliver, deliver_offset
 from src.Core.CrossSection.steps import (
     STEP_RULES,
     column_pushes,
     lead,
     manhattan_step,
 )
-from src.Core.CrossSection.turns import turn_of
+from src.Core.CrossSection.turns import heading
 from src.Core.Domain import Domain
 from src.Core.Feature.feature import (
     ContinuousFeature,
@@ -24,7 +23,6 @@ from src.Core.Feature.feature import (
 )
 from src.Core.Feature.feature_path import DEFAULT_RULES, FeaturePath
 from src.Core.Field.block_field import BlockField
-from src.Core.Path.path import Path, PathPoint
 from src.Core.coordinates import BlockPos, Vec3
 from src.Core.modes import ElevationMode, PlacementMode, StepMode
 
@@ -50,10 +48,6 @@ def row(step_mode=StepMode.CHEBYSHEV):
     )
 
 
-def point(x=0, y=0, z=0, gradient=(0.0, 0.0, -1.0)):
-    return PathPoint(BlockPos(x, y, z), Vec3(*gradient))
-
-
 def layout(section, turn):
     return [
         (o.annotation.name, o.offsets[0].x, o.offsets[0].z)
@@ -74,64 +68,30 @@ class PointFieldTests(unittest.TestCase):
             PointField((annotation((1, 0, 0)), annotation((-1, 0, 0))))
 
 
-class TurnTests(unittest.TestCase):
-    NORTH = Vec3(0.0, 0.0, -1.0)
-    EAST = Vec3(1.0, 0.0, 0.0)
-
-    def test_the_initial_gradient_is_turn_zero(self) -> None:
-        self.assertEqual(turn_of(self.NORTH, self.NORTH), 0)
-        self.assertEqual(turn_of(self.EAST, self.EAST), 0)
-
-    def test_turns_run_clockwise_from_the_initial_gradient(self) -> None:
-        self.assertEqual(turn_of((1.0, 0.0, -1.0), self.NORTH), 45)
-        self.assertEqual(turn_of((1.0, 0.0, 0.0), self.NORTH), 90)
-        self.assertEqual(turn_of((1.0, 0.0, 1.0), self.NORTH), 135)
-        self.assertEqual(turn_of((0.0, 0.0, 1.0), self.NORTH), 180)
-        self.assertEqual(turn_of((-1.0, 0.0, 1.0), self.NORTH), 225)
-        self.assertEqual(turn_of((-1.0, 0.0, 0.0), self.NORTH), 270)
-        self.assertEqual(turn_of((-1.0, 0.0, -1.0), self.NORTH), 315)
-        # Starting east, heading south is a quarter turn clockwise.
-        self.assertEqual(turn_of((0.0, 0.0, 1.0), self.EAST), 90)
-        self.assertEqual(turn_of((1.0, 0.0, 1.0), self.EAST), 45)
-
-    def test_magnitude_and_grade_do_not_matter(self) -> None:
-        self.assertEqual(turn_of((3.0, 7.0, -3.0), (0.0, -2.0, -5.0)), 45)
-
-    def test_diagonals_need_a_heading_very_close_to_45(self) -> None:
-        self.assertEqual(turn_of((1.0, 0.0, -1.01), self.NORTH), 45)
-        self.assertEqual(turn_of((1.0, 0.0, -1.2), self.NORTH), 0)
-        self.assertEqual(turn_of((1.0, 0.0, -0.8), self.NORTH), 90)
-        self.assertEqual(turn_of((-1.0, 0.0, 0.8), self.NORTH), 270)
-
-    def test_tolerance_can_be_widened(self) -> None:
-        self.assertEqual(turn_of((1.0, 0.0, -1.2), self.NORTH, tolerance=0.2), 45)
-
-    def test_vertical_gradients_are_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            turn_of((0.0, 1.0, 0.0), self.NORTH)
-        with self.assertRaises(ValueError):
-            turn_of(self.NORTH, (0.0, -1.0, 0.0))
-
-
 class QuarterLayoutTests(unittest.TestCase):
-    def test_zero_uses_the_section_as_authored(self) -> None:
-        self.assertEqual(layout(row(), 0), line(NAMES, (-3, 0), (1, 0)))
+    # Turns are world directions clockwise from west: 0 west, 90 north,
+    # 180 east, 270 south. Local x always lands to the right of travel.
 
-    def test_ninety_rotates_then_mirrors(self) -> None:
-        # a (left) at the top, f (right) at the bottom.
-        self.assertEqual(layout(row(), 90), line(NAMES, (0, -3), (0, 1)))
+    def test_zero_travels_west_as_authored(self) -> None:
+        # a (left of travel) to the south, f (right) to the north.
+        self.assertEqual(layout(row(), 0), line(NAMES, (0, 3), (0, -1)))
 
-    def test_one_eighty(self) -> None:
-        self.assertEqual(layout(row(), 180), line(NAMES, (3, 0), (-1, 0)))
+    def test_ninety_travels_north(self) -> None:
+        self.assertEqual(layout(row(), 90), line(NAMES, (-3, 0), (1, 0)))
 
-    def test_two_seventy(self) -> None:
-        self.assertEqual(layout(row(), 270), line(NAMES, (0, 3), (0, -1)))
+    def test_one_eighty_travels_east(self) -> None:
+        self.assertEqual(layout(row(), 180), line(NAMES, (0, -3), (0, 1)))
 
-    def test_mirroring_flips_depth_on_odd_quarters(self) -> None:
+    def test_two_seventy_travels_south(self) -> None:
+        self.assertEqual(layout(row(), 270), line(NAMES, (3, 0), (-1, 0)))
+
+    def test_depth_follows_travel_at_even_quarters_and_mirrors_at_odd(self) -> None:
+        # One right of the origin and one ahead of it, as authored.
         section = CrossSection(PointField((annotation((1, 0, -1)),)))
-        self.assertEqual(layout(section, 90), [("a", -1, 1)])
-        self.assertEqual(layout(section, 180), [("a", -1, 1)])
-        self.assertEqual(layout(section, 270), [("a", 1, -1)])
+        self.assertEqual(layout(section, 0), [("a", -1, -1)])    # north, and ahead (west)
+        self.assertEqual(layout(section, 90), [("a", 1, 1)])     # east, and behind (south)
+        self.assertEqual(layout(section, 180), [("a", 1, 1)])    # south, and ahead (east)
+        self.assertEqual(layout(section, 270), [("a", -1, -1)])  # west, and behind (north)
 
     def test_positions_are_relative_to_the_origin(self) -> None:
         section = CrossSection(PointField((annotation((2, 1, 0)),)), origin=(2, 1, 0))
@@ -160,29 +120,29 @@ class QuarterLayoutTests(unittest.TestCase):
 
 class DiagonalLayoutTests(unittest.TestCase):
     def test_forty_five_joins_zero_and_ninety(self) -> None:
-        # The 0 layout moves forward (north) 3 and the 90 layout, joined at
-        # f, backtracks 3; they meet at the north-east corner.
+        # The west layout moves forward 3 and the north layout, joined at f,
+        # backtracks 3; they meet at the north-west corner.
         self.assertEqual(
             layout(row(), 45),
-            line(NAMES, (-3, -3), (1, 0)) + line(NAMES, (3, -3), (0, 1)),
+            line(NAMES, (-3, 3), (0, -1)) + line(NAMES, (-3, -3), (1, 0)),
         )
 
     def test_one_thirty_five_joins_ninety_and_one_eighty(self) -> None:
         self.assertEqual(
             layout(row(), 135),
-            line(NAMES, (3, -3), (0, 1)) + line(NAMES, (3, 3), (-1, 0)),
+            line(NAMES, (-3, -3), (1, 0)) + line(NAMES, (3, -3), (0, 1)),
         )
 
     def test_two_twenty_five_joins_one_eighty_and_two_seventy(self) -> None:
         self.assertEqual(
             layout(row(), 225),
-            line(NAMES, (3, 3), (-1, 0)) + line(NAMES, (-3, 3), (0, -1)),
+            line(NAMES, (3, -3), (0, 1)) + line(NAMES, (3, 3), (-1, 0)),
         )
 
     def test_three_fifteen_joins_two_seventy_and_zero(self) -> None:
         self.assertEqual(
             layout(row(), 315),
-            line(NAMES, (-3, 3), (0, -1)) + line(NAMES, (-3, -3), (1, 0)),
+            line(NAMES, (3, 3), (-1, 0)) + line(NAMES, (-3, 3), (0, -1)),
         )
 
     def test_half_the_long_length_rounds_down(self) -> None:
@@ -190,8 +150,8 @@ class DiagonalLayoutTests(unittest.TestCase):
             PointField(annotation((x, 0, 0), name=str(x)) for x in range(-3, 5))
         )
         self.assertEqual(section.long_length, 8)
-        offsets = section.orient(45)
-        # 0 layout moves forward 4; 90 layout starts one below it.
+        offsets = section.orient(135)
+        # The north layout moves forward 4; the east layout starts one below it.
         self.assertEqual({o.offsets[0].z for o in offsets[:8]}, {-4})
         self.assertEqual(offsets[8].offsets[0], BlockPos(4, 0, -3))
 
@@ -201,8 +161,8 @@ class DiagonalLayoutTests(unittest.TestCase):
         section = CrossSection(PointField((annotation((0, 0, 0)),)))
         self.assertEqual(layout(section, 45), [("a", 0, 0), ("a", 0, 0)])
         feature_path = FeaturePath()
-        for delivery in deliver(point(), section.orient(45)):
-            for position in delivery.positions:
+        for offset in section.orient(45):
+            for position in offset.offsets:
                 feature_path.add(position, GRADIENT, 0, 64)
         self.assertEqual(len(feature_path), 1)
 
@@ -210,10 +170,49 @@ class DiagonalLayoutTests(unittest.TestCase):
         self.assertEqual(CrossSection().orient(45), ())
 
 
+class HeadingTests(unittest.TestCase):
+    def test_quarters_run_clockwise_from_west(self) -> None:
+        self.assertEqual(heading(0), (-1, 0))
+        self.assertEqual(heading(90), (0, -1))
+        self.assertEqual(heading(180), (1, 0))
+        self.assertEqual(heading(270), (0, 1))
+
+    def test_diagonals_head_between_their_quarters(self) -> None:
+        north_west = heading(45)
+        self.assertAlmostEqual(north_west.x, -(2 ** -0.5))
+        self.assertAlmostEqual(north_west.z, -(2 ** -0.5))
+        self.assertEqual(heading(-45), heading(315))
+
+    def test_turns_off_the_45_grid_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            heading(30)
+
+
+class ReachTests(unittest.TestCase):
+    def test_a_straight_row_at_a_quarter_sits_on_the_point(self) -> None:
+        self.assertEqual(row().reach(0), 0.0)
+        self.assertEqual(row().reach(90), 0.0)
+
+    def test_diagonals_reach_by_their_shifted_corners(self) -> None:
+        # the 45 layout's far corner sits at (-3, -3), three diagonal steps ahead
+        self.assertAlmostEqual(row().reach(45), 3 * 2 ** 0.5)
+
+    def test_manhattan_leads_reach_along_travel(self) -> None:
+        section = ManhattanLeadTests().section("de")
+        self.assertEqual(section.reach(0), 2.0)
+
+    def test_without_a_turn_it_is_the_worst_turn(self) -> None:
+        section = row()
+        self.assertEqual(section.reach(), max(section.reach(t) for t in range(0, 360, 45)))
+
+    def test_empty_sections_reach_nothing(self) -> None:
+        self.assertEqual(CrossSection().reach(), 0.0)
+
+
 class StepRuleTests(unittest.TestCase):
     def test_orient_annotation_takes_its_lead_and_steps_explicitly(self) -> None:
         offset = orient_annotation(
-            annotation((2, 0, 0)), BlockPos(0, 0, 0), 0, lead=-1, steps=manhattan_step(2)
+            annotation((2, 0, 0)), BlockPos(0, 0, 0), 90, lead=-1, steps=manhattan_step(2)
         )
         self.assertEqual(offset.offsets, (BlockPos(2, 0, 1), BlockPos(2, 0, 2)))
 
@@ -236,7 +235,7 @@ class StepRuleTests(unittest.TestCase):
             ),
             step_rules=rules,
         )
-        offsets = {o.annotation.name: o.offsets for o in section.orient(0)}
+        offsets = {o.annotation.name: o.offsets for o in section.orient(90)}
         self.assertEqual([o.z for o in offsets["inner"]], [0, -1, -2])
         # The last step, two blocks, moves the point beyond it.
         self.assertEqual(offsets["outer"], (BlockPos(-1, 0, -2),))
@@ -255,7 +254,7 @@ class ManhattanLeadTests(unittest.TestCase):
             )
         )
 
-    def depths(self, section, turn=0):
+    def depths(self, section, turn=90):
         return {
             o.annotation.name: (o.offsets[0].x, o.offsets[0].z)
             for o in section.orient(turn)
@@ -290,63 +289,17 @@ class ManhattanLeadTests(unittest.TestCase):
         self.assertEqual(self.depths(section)["out"], (2, 1))
 
     def test_moves_follow_the_quarter_layout(self) -> None:
-        # At 90, forward is east, so the right side moves west.
-        depths = self.depths(self.section("d"), turn=90)
+        # At 180, forward is east, so the right side moves west.
+        depths = self.depths(self.section("d"), turn=180)
         self.assertEqual(depths["e"], (-1, 2))
         self.assertEqual(depths["d"], (0, 1))
 
     def test_moved_manhattan_points_still_step_from_where_they_moved(self) -> None:
-        offsets = {o.annotation.name: o for o in self.section("de").orient(0)}
-        delivery = deliver_offset(point(), offsets["e"])
-        self.assertEqual([tuple(p) for p in delivery.positions], [(2, 0, 1), (2, 0, 2)])
-
-
-class DeliverTests(unittest.TestCase):
-    def deliver(self, position, turn=0, at=point()):
-        section = CrossSection(PointField((annotation(position, StepMode.MANHATTAN),)))
-        (offset,) = section.orient(turn)
-        return [tuple(p) for p in deliver_offset(at, offset).positions]
-
-    def test_positions_keep_the_local_height(self) -> None:
-        offset = orient_annotation(annotation((-1, 2, 0)), BlockPos(0, 0, 0), 0, lead=0)
-        delivery = deliver_offset(point(10, 64, 5), offset)
-        self.assertEqual([tuple(p) for p in delivery.positions], [(9, 2, 5)])
-
-    def test_manhattan_left_steps_forward(self) -> None:
-        self.assertEqual(self.deliver((-1, 0, 0)), [(-1, 0, 0), (-1, 0, -1)])
-
-    def test_manhattan_right_steps_backward(self) -> None:
-        self.assertEqual(self.deliver((1, 0, 0)), [(1, 0, 0), (1, 0, 1)])
-
-    def test_manhattan_on_the_origin_steps_forward(self) -> None:
-        self.assertEqual(self.deliver((0, 0, 0)), [(0, 0, 0), (0, 0, -1)])
-
-    def test_forward_follows_the_quarter_layout(self) -> None:
-        # At 90 the left point sits north of the path and forward is east.
-        self.assertEqual(self.deliver((-1, 0, 0), turn=90), [(0, 0, -1), (1, 0, -1)])
-
-    def test_deliver_covers_the_whole_section(self) -> None:
-        deliveries = deliver(point(5, 0, 5), row().orient(0))
-        self.assertEqual([d.annotation.name for d in deliveries], list(NAMES))
+        offsets = {o.annotation.name: o for o in self.section("de").orient(90)}
+        self.assertEqual([tuple(p) for p in offsets["e"].offsets], [(2, 0, 1), (2, 0, 2)])
 
 
 class FeaturePathTests(unittest.TestCase):
-    def test_deliveries_along_a_path_extend_the_feature_path(self) -> None:
-        path = Path([(0, 0, 0), (0, 0, -1), (0, 0, -2)], [(0.0, 0.0, -1.0)] * 3)
-        section = CrossSection(PointField((annotation((-1, 0, 0), StepMode.MANHATTAN),)))
-        feature_path = FeaturePath()
-        for path_index, path_point in enumerate(path.path_points):
-            oriented = section.orient(
-                turn_of(path_point.gradient, path.path_points[0].gradient)
-            )
-            for delivery in deliver(path_point, oriented):
-                for position in delivery.positions:
-                    feature_path.add(position, path_point.gradient, path_index, 64)
-
-        self.assertEqual([p.position.z for p in feature_path], [0, -1, -2, -3])
-        self.assertEqual([p.path_index for p in feature_path], [0, 0, 1, 2])
-        self.assertEqual([p.point_index for p in feature_path], [0, 1, 2, 3])
-
     def add(self, feature_path, path_index, *positions):
         return [
             feature_path.add(position, GRADIENT, path_index, 64) is not None

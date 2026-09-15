@@ -2,11 +2,6 @@ import unittest
 
 from src.Core.CrossSection.cross_section import CrossSection
 from src.Core.CrossSection.schedule import SectionSchedule, SectionSpan
-from src.Core.Path.path import Path
-
-
-def straight_path(length):
-    return Path([(i, 0, 0) for i in range(length)], [(1.0, 0.0, 0.0)] * length)
 
 
 class SectionSpanTests(unittest.TestCase):
@@ -57,23 +52,10 @@ class SectionScheduleTests(unittest.TestCase):
         schedule = SectionSchedule([SectionSpan(2, 4, self.road)], path_length=5)
         self.assertIsNone(schedule.at(0))
 
-    def test_walk_skips_gaps_and_yields_path_points(self) -> None:
-        path = straight_path(10)
-        schedule = SectionSchedule(
-            [SectionSpan(6, 9, self.bridge), SectionSpan(0, 3, self.road)],
-            path_length=10,
-        )
-        walked = list(schedule.walk(path))
-        self.assertEqual([index for index, _, _ in walked], [0, 1, 2, 3, 6, 7, 8, 9])
-        for index, point, section in walked:
-            self.assertIs(point, path.path_points[index])
-            self.assertIs(section, self.road if index <= 3 else self.bridge)
-
     def test_an_empty_schedule_delivers_nothing(self) -> None:
         schedule = SectionSchedule([], path_length=5)
         self.assertEqual(schedule.spans, ())
         self.assertIsNone(schedule.at(0))
-        self.assertEqual(list(schedule.walk(straight_path(5))), [])
 
     def test_adjacent_spans_are_allowed(self) -> None:
         schedule = SectionSchedule(
