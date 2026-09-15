@@ -1,11 +1,11 @@
 import unittest
 
-from src.Core.Path.boundary import OrthogonalBoundary
+from src.Core.Path.boundary import Boundary
 from src.Core.Path.path_frame import PathFrame
 
 
 def boundary(index=0, origin=(0.0, 0.0), tangent=(0.0, 1.0)):
-    return OrthogonalBoundary.from_tangent(index, origin, tangent)
+    return Boundary.from_direction(origin, tangent, path_index=index)
 
 
 class PathFrameTests(unittest.TestCase):

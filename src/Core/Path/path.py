@@ -12,7 +12,7 @@ class PathPoint:
     @property
     def heading(self) -> Vec2:
         # Horizontal projection of the gradient: the direction of travel in
-        # plan view, and the normal of the boundary plane at this point.
+        # plan view.
         return Vec2(self.gradient.x, self.gradient.z)
 
     @property
@@ -39,8 +39,8 @@ class Path:
     #
     # The first `lead_in` and last `lead_out` points lie before and after the
     # path proper. They take part in anything computed along the path --
-    # geometry, elevation -- so the orthogonal boundaries at the path's ends
-    # are held as cleanly as any boundary in the middle. They are not part of
+    # geometry, elevation -- so the boundaries at the path's ends are held as
+    # cleanly as any boundary in the middle. They are not part of
     # the path: whatever they produce past those boundaries is dropped.
     def __init__(
         self,

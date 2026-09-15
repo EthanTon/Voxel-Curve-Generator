@@ -1,8 +1,7 @@
 import unittest
 
 from src.Core.Field.block_field import BlockField
-from src.Core.Path.boundary import PathBounds
-from src.Core.Path.path import Path
+from src.Core.Path.boundary import Boundary, PathBounds
 from src.Core.World.block_world import BlockTransform, BlockWorld, ColumnMask
 from src.Core.block.connectivity import NeighborResolver
 from src.Core.block.connectivity_options import ConnectionOverride, ConnectivityOptions
@@ -326,14 +325,11 @@ class ClippedPlacementTests(unittest.TestCase):
         self.registry = BlockRegistry()
         self.stone = self.registry.register(BlockState.create("minecraft:stone"))
         self.dirt = self.registry.register(BlockState.create("minecraft:dirt"))
-        # Path proper along +z from z=2 to z=8; z 0-1 and 9-11 are padding.
-        self.path = Path(
-            [(0, 0, z) for z in range(12)],
-            [(0.0, 0.0, 1.0)] * 12,
-            lead_in=2,
-            lead_out=3,
+        # Bounds of a path along +z from z=2 to z=8, as Generation would build them.
+        self.bounds = PathBounds(
+            Boundary.from_direction((0.0, 2.0), (0.0, 1.0)),
+            Boundary.from_direction((0.0, 8.0), (0.0, 1.0)),
         )
-        self.bounds = PathBounds.from_path(self.path)
 
     def slab(self, block_id: int) -> BlockField:
         # A 5-wide strip covering the whole padded path, as a stamped feature would.

@@ -2,29 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .boundary import OrthogonalBoundary
+from .boundary import Boundary, spans_nothing
 
 
 @dataclass(frozen=True, slots=True)
 class PathFrame:
     # A run of path points held at a single integer elevation.
     #
-    # Both ends are orthogonal boundaries, and every boundary behaves the same
-    # way whether it sits between two elevations or at either end of the path:
-    # a column belongs to this frame when it is at-or-after `start_boundary`
-    # and strictly before `end_boundary`. Adjacent frames share the boundary
-    # between them, so they neither overlap nor leave a gap; the first frame
-    # starts at the path's start boundary and the last ends at its end boundary.
+    # Both ends are boundaries, and every boundary behaves the same way whether
+    # it sits between two elevations or at either end of the path: a column
+    # belongs to this frame when it is at-or-after `start_boundary` and
+    # strictly before `end_boundary`. Adjacent frames share the boundary
+    # between them, so they neither overlap nor leave a gap.
     #
     # A frame knows only its own boundaries and level. The elevation on the
-    # far side of either boundary belongs to the neighbouring frame, not here.
+    # far side of either boundary belongs to the neighbouring frame, and how
+    # the boundaries relate to the path is checked in Generation.
 
     index: int
     path_start: int
     path_stop: int
 
-    start_boundary: OrthogonalBoundary
-    end_boundary: OrthogonalBoundary
+    start_boundary: Boundary
+    end_boundary: Boundary
 
     y_offset: int
 
@@ -40,10 +40,5 @@ class PathFrame:
 
     @property
     def is_degenerate(self) -> bool:
-        # A frame no column can ever occupy: the two planes coincide, or the
-        # end plane sits at-or-behind the start plane along the shared normal.
-        start = self.start_boundary
-        end = self.end_boundary
-        if not start.is_parallel_to(end):
-            return False
-        return end.side(start.origin.x, start.origin.z) >= 0.0
+        # A frame no column can ever occupy.
+        return spans_nothing(self.start_boundary, self.end_boundary)

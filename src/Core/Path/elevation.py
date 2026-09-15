@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .boundary import OrthogonalBoundary
+from .boundary import Boundary
 
 
 @dataclass(frozen=True, slots=True)
 class ElevationStep:
-    boundary: OrthogonalBoundary
+    boundary: Boundary
     y_before: int
     y_after: int
 
@@ -28,7 +28,7 @@ class ElevationStep:
 @dataclass(frozen=True, slots=True)
 class MultiElevationStep:
     y_first: int
-    steps: tuple[tuple[OrthogonalBoundary, int], ...]
+    steps: tuple[tuple[Boundary, int], ...]
 
     def __post_init__(self) -> None:
         if not self.steps:
