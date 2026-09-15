@@ -1,11 +1,19 @@
 import unittest
 
-from src.Core.Path.elevation import ElevationStep, MultiElevationStep
+from src.Core.Path.elevation import ConstantElevation, ElevationStep, MultiElevationStep
 from src.Core.Path.boundary import Boundary
 
 
 def boundary(index=0, origin=(0.0, 0.0), tangent=(0.0, 1.0)):
     return Boundary.from_direction(origin, tangent, path_index=index)
+
+
+class ConstantElevationTests(unittest.TestCase):
+    def test_one_level_everywhere(self) -> None:
+        flat = ConstantElevation(70)
+        self.assertEqual({flat(x, z) for x in range(-3, 4) for z in range(-3, 4)}, {70})
+        self.assertEqual(flat.span, (70, 70))
+        self.assertTrue(flat.is_constant)
 
 
 class ElevationStepTests(unittest.TestCase):

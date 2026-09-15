@@ -101,6 +101,6 @@ class Path:
             prev = points[i - 1].position
             curr = points[i].position
 
-            distance += dist(astuple(prev), astuple(curr))
+            distance += dist(prev, curr)
 
         return distance

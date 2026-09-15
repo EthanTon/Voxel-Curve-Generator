@@ -6,6 +6,23 @@ from .boundary import Boundary
 
 
 @dataclass(frozen=True, slots=True)
+class ConstantElevation:
+    # One level everywhere: the elevation of a path with no steps.
+    y: int
+
+    def __call__(self, x: int, z: int) -> int:
+        return self.y
+
+    @property
+    def span(self) -> tuple[int, int]:
+        return self.y, self.y
+
+    @property
+    def is_constant(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True, slots=True)
 class ElevationStep:
     boundary: Boundary
     y_before: int
