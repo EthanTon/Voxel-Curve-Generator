@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from .cross_section import CrossSection
-
-if TYPE_CHECKING:
-    from ..Path.path import Path, PathPoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,10 +56,3 @@ class SectionSchedule:
         if i >= 0 and self._spans[i].contains(path_index):
             return self._spans[i].section
         return None
-
-    def walk(self, path: Path) -> Iterator[tuple[int, PathPoint, CrossSection]]:
-        # Sequential access, for generation. Gaps are skipped entirely.
-        points = path.path_points
-        for span in self._spans:
-            for index in range(span.path_start, span.path_stop + 1):
-                yield index, points[index], span.section

@@ -1,43 +1,48 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from ..coordinates import Vec2, quarter_turn
 
-from ..coordinates import Vec2, Vec3, quarter_turn
-
-# Degrees clockwise from the path's initial heading, in steps of 45. Every
-# cross section starts at a turn of 0, where it is used as authored: local x is
-# lateral, and forward is local -z.
+# The world direction of travel, in degrees clockwise from west, in steps of
+# 45: 0 is west (-x), 90 north (-z), 180 east (+x) and 270 south (+z). Every
+# cross section is authored for a turn of 0: local x is lateral, positive to
+# the right of travel, and forward is local -z.
 Turn = int
 
-# How close a unit heading must be to a unit diagonal, as the distance between
-# them, to turn 45 degrees off a quarter. Anything further snaps to the
-# nearest quarter. 0.02 is a little over one degree.
-DIAGONAL_TOLERANCE = 0.02
+# Forward at each quarter: west (-1, 0) turned clockwise.
+_FORWARD: dict[Turn, tuple[int, int]] = {
+    quarter: quarter_turn(-1, 0, quarter // 90) for quarter in (0, 90, 180, 270)
+}
 
-# Each quarter turn rotates the previous layout 90 degrees clockwise about the
-# origin, then mirrors it across its long edge. The long edge starts on the x
-# axis and alternates with every turn. Rows are (xx, xz, zx, zz):
+
+def _quarter_layout(quarter: Turn) -> tuple[int, int, int, int]:
+    # Each quarter turn rotates the previous layout 90 degrees clockwise about
+    # the origin, then mirrors it across its long edge. Local x always lands to
+    # the right of travel; local depth follows travel at even quarters and is
+    # mirrored at odd ones.
+    fx, fz = _FORWARD[quarter]
+    rx, rz = quarter_turn(fx, fz)
+    depth = -1 if quarter // 90 % 2 == 0 else 1
+    return rx, depth * fx, rz, depth * fz
+
+
+# Rows are (xx, xz, zx, zz):
 #   world x = xx * x + xz * z
 #   world z = zx * x + zz * z
 _QUARTER_LAYOUTS: dict[Turn, tuple[int, int, int, int]] = {
-    0: (1, 0, 0, 1),
-    90: (0, 1, 1, 0),
-    180: (-1, 0, 0, -1),
-    270: (0, -1, -1, 0),
+    quarter: _quarter_layout(quarter) for quarter in _FORWARD
 }
 
-# Forward at each quarter: local forward (0, -1) turned clockwise.
-_FORWARD: dict[Turn, tuple[int, int]] = {
-    quarter: quarter_turn(0, -1, quarter // 90) for quarter in (0, 90, 180, 270)
-}
-
-# The unit heading halfway between each pair of neighboring quarters.
-_DIAGONALS: dict[Turn, Vec2] = {
-    quarter + 45: Vec2(
-        _FORWARD[quarter][0] + _FORWARD[(quarter + 90) % 360][0],
-        _FORWARD[quarter][1] + _FORWARD[(quarter + 90) % 360][1],
-    ).unit()
-    for quarter in _FORWARD
+# The unit heading of every turn, in world axes: a quarter's forward, or the
+# heading halfway between the quarters either side of a diagonal.
+_HEADINGS: dict[Turn, Vec2] = {
+    **{quarter: Vec2(*step) for quarter, step in _FORWARD.items()},
+    **{
+        quarter + 45: Vec2(
+            _FORWARD[quarter][0] + _FORWARD[(quarter + 90) % 360][0],
+            _FORWARD[quarter][1] + _FORWARD[(quarter + 90) % 360][1],
+        ).unit()
+        for quarter in _FORWARD
+    },
 }
 
 
@@ -67,19 +72,6 @@ def forward(quarter: Turn) -> tuple[int, int]:
     return _FORWARD[quarter]
 
 
-def turn_of(
-    gradient: Vec3 | Sequence[float],
-    initial_gradient: Vec3 | Sequence[float],
-    tolerance: float = DIAGONAL_TOLERANCE,
-) -> Turn:
-    # The turn from the initial gradient's heading to this gradient's heading.
-    heading = Vec3.coerce(gradient).horizontal.unit()
-    initial = Vec3.coerce(initial_gradient).horizontal.unit()
-    # Express the heading in the section's frame, where the initial heading is
-    # forward (0, -1) and its right is (1, 0).
-    right = Vec2(*quarter_turn(initial.x, initial.z))
-    relative = Vec2(heading.dot(right), -heading.dot(initial))
-    for turn, diagonal in _DIAGONALS.items():
-        if relative.is_close(diagonal, tolerance):
-            return turn
-    return max(_FORWARD, key=lambda turn: relative.dot(_FORWARD[turn]))
+def heading(turn: Turn) -> Vec2:
+    # The unit direction of travel, in world axes, that a turn lays out for.
+    return _HEADINGS[normalize(turn)]

@@ -8,7 +8,7 @@ from ..coordinates import BlockPos
 from ..modes import StepMode
 from .annotations import FeatureAnnotation
 from .steps import STEP_RULES, StepRule, column_pushes, lead
-from .turns import Turn, forward, is_quarter, neighbors, normalize, place
+from .turns import Turn, forward, heading, is_quarter, neighbors, normalize, place
 
 # Section-local axes, as authored: x is lateral (positive to the right of
 # travel), y is height above the path, and z is depth, with forward at -z.
@@ -157,6 +157,20 @@ class CrossSection:
     def long_length(self) -> int:
         # Chebyshev length of the section in plan: its widest horizontal extent.
         return self._current().profile.long_length
+
+    def reach(self, turn: Turn | None = None) -> float:
+        # How far along travel any oriented position sits from the path point,
+        # ahead or behind, at `turn` or at the worst of every turn. Generation
+        # sizes the lead a section is pasted with from this.
+        turns = range(0, 360, 45) if turn is None else (turn,)
+        furthest = 0.0
+        for each in turns:
+            direction = heading(each)
+            for offset in self.orient(each):
+                for position in offset.offsets:
+                    along = position.x * direction.x + position.z * direction.z
+                    furthest = max(furthest, float(abs(along)))
+        return furthest
 
     def orient(self, turn: Turn) -> OrientedSection:
         turn = normalize(turn)
