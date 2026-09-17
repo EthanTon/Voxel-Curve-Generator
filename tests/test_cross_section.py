@@ -161,9 +161,9 @@ class DiagonalLayoutTests(unittest.TestCase):
         section = CrossSection(PointField((annotation((0, 0, 0)),)))
         self.assertEqual(layout(section, 45), [("a", 0, 0), ("a", 0, 0)])
         feature_path = FeaturePath()
-        for offset in section.orient(45):
-            for position in offset.offsets:
-                feature_path.add(position, GRADIENT, 0, 64)
+        for delivery in deliver(point(), section.orient(45)):
+            for position in delivery.positions:
+                feature_path.add(position, GRADIENT, 45, 0, 64)
         self.assertEqual(len(feature_path), 1)
 
     def test_empty_sections_orient_to_nothing(self) -> None:
@@ -300,9 +300,24 @@ class ManhattanLeadTests(unittest.TestCase):
 
 
 class FeaturePathTests(unittest.TestCase):
+    def test_deliveries_along_a_path_extend_the_feature_path(self) -> None:
+        path = Path([(0, 0, 0), (0, 0, -1), (0, 0, -2)], [(0.0, 0.0, -1.0)] * 3)
+        section = CrossSection(PointField((annotation((-1, 0, 0), StepMode.MANHATTAN),)))
+        feature_path = FeaturePath()
+        for path_index, path_point in enumerate(path.path_points):
+            turn = turn_of(path_point.gradient, path.path_points[0].gradient)
+            oriented = section.orient(turn)
+            for delivery in deliver(path_point, oriented):
+                for position in delivery.positions:
+                    feature_path.add(position, path_point.gradient, turn, path_index, 64)
+
+        self.assertEqual([p.position.z for p in feature_path], [0, -1, -2, -3])
+        self.assertEqual([p.path_index for p in feature_path], [0, 0, 1, 2])
+        self.assertEqual([p.point_index for p in feature_path], [0, 1, 2, 3])
+
     def add(self, feature_path, path_index, *positions):
         return [
-            feature_path.add(position, GRADIENT, path_index, 64) is not None
+            feature_path.add(position, GRADIENT, 0, path_index, 64) is not None
             for position in positions
         ]
 
