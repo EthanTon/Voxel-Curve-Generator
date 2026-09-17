@@ -203,7 +203,7 @@ class DiagonalLayoutTests(unittest.TestCase):
         feature_path = FeaturePath()
         for delivery in deliver(point(), section.orient(45)):
             for position in delivery.positions:
-                feature_path.add(position, GRADIENT, 0, 64)
+                feature_path.add(position, GRADIENT, 45, 0, 64)
         self.assertEqual(len(feature_path), 1)
 
     def test_empty_sections_orient_to_nothing(self) -> None:
@@ -336,12 +336,11 @@ class FeaturePathTests(unittest.TestCase):
         section = CrossSection(PointField((annotation((-1, 0, 0), StepMode.MANHATTAN),)))
         feature_path = FeaturePath()
         for path_index, path_point in enumerate(path.path_points):
-            oriented = section.orient(
-                turn_of(path_point.gradient, path.path_points[0].gradient)
-            )
+            turn = turn_of(path_point.gradient, path.path_points[0].gradient)
+            oriented = section.orient(turn)
             for delivery in deliver(path_point, oriented):
                 for position in delivery.positions:
-                    feature_path.add(position, path_point.gradient, path_index, 64)
+                    feature_path.add(position, path_point.gradient, turn, path_index, 64)
 
         self.assertEqual([p.position.z for p in feature_path], [0, -1, -2, -3])
         self.assertEqual([p.path_index for p in feature_path], [0, 0, 1, 2])
@@ -349,7 +348,7 @@ class FeaturePathTests(unittest.TestCase):
 
     def add(self, feature_path, path_index, *positions):
         return [
-            feature_path.add(position, GRADIENT, path_index, 64) is not None
+            feature_path.add(position, GRADIENT, 0, path_index, 64) is not None
             for position in positions
         ]
 
