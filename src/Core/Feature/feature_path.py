@@ -17,12 +17,7 @@ class FeaturePathPoint:
     position: BlockPos
     # Gradient of the path point, not of the feature path.
     gradient: Vec3
-    # The turn its section was laid out at, in degrees off the path's
-    # initial heading: positive clockwise, negative counter-clockwise, and
-    # kept as it was given, so which way the path came round to a heading
-    # survives here. Anything indexing a layout by it normalizes first.
-    # A builder is free to ignore it and snap the gradient itself, at
-    # whatever tolerance it wants.
+    # The turn its section was laid out at based on the path.
     turn: Turn
     # Elevation at this point's own column. Features that ignore per-block
     # elevation use it as the y offset for everything built from this point.
