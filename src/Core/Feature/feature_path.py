@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
+from ..CrossSection.turns import Turn
 from ..coordinates import BlockPos, Vec3
 
 
@@ -16,6 +17,13 @@ class FeaturePathPoint:
     position: BlockPos
     # Gradient of the path point, not of the feature path.
     gradient: Vec3
+    # The turn its section was laid out at, in degrees off the path's
+    # initial heading: positive clockwise, negative counter-clockwise, and
+    # kept as it was given, so which way the path came round to a heading
+    # survives here. Anything indexing a layout by it normalizes first.
+    # A builder is free to ignore it and snap the gradient itself, at
+    # whatever tolerance it wants.
+    turn: Turn
     # Elevation at this point's own column. Features that ignore per-block
     # elevation use it as the y offset for everything built from this point.
     y_offset: int
@@ -76,6 +84,7 @@ class FeaturePath:
         self,
         position: BlockPos | Sequence[int],
         gradient: Vec3 | Sequence[float],
+        turn: Turn,
         path_index: int,
         y_offset: int,
     ) -> FeaturePathPoint | None:
@@ -90,6 +99,7 @@ class FeaturePath:
             point_index=len(self._path),
             position=BlockPos.coerce(position),
             gradient=Vec3.coerce(gradient),
+            turn=turn,
             y_offset=y_offset,
         )
         if not all(rule(self, point) for rule in self.rules):
