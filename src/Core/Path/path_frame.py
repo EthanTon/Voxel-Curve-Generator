@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .boundary import Boundary, spans_nothing
@@ -42,3 +43,32 @@ class PathFrame:
     def is_degenerate(self) -> bool:
         # A frame no column can ever occupy.
         return spans_nothing(self.start_boundary, self.end_boundary)
+
+
+def frames_for_index(
+    frames: Sequence[PathFrame],
+    index: int,
+    lead_in: int = 0,
+    lead_out: int = 0,
+) -> tuple[PathFrame, ...]:
+    # The frames a path point is pasted into. A frame takes the points from
+    # its own path_start to its own path_stop, both ends included, so a point
+    # on a shared boundary goes to the frames either side of it.
+    #
+    # A lead widens what a frame takes, not what a point reaches: `lead_in`
+    # points before it and `lead_out` points after. That is what carries a
+    # section into the frame ahead while it is still being pasted in the one
+    # behind, and what lets the path's padding be pasted as far as the lead
+    # reaches and no further -- a point past every widened frame belongs to
+    # none, and is not pasted at all.
+    if not frames:
+        raise ValueError("No frames to place a path point in")
+    if lead_in < 0 or lead_out < 0:
+        raise ValueError(
+            f"Leads must be non-negative, got lead_in={lead_in}, lead_out={lead_out}"
+        )
+    return tuple(
+        frame
+        for frame in frames
+        if frame.path_start - lead_in <= index <= frame.path_stop + lead_out
+    )

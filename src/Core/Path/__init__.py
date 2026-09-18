@@ -1,7 +1,7 @@
 from .boundary import Boundary, PathBounds
 from .elevation import ConstantElevation, ElevationStep, MultiElevationStep
 from .path import Path, PathPoint
-from .path_frame import PathFrame
+from .path_frame import PathFrame, frames_for_index
 
 __all__ = [
     "Boundary",
@@ -12,4 +12,5 @@ __all__ = [
     "PathBounds",
     "PathFrame",
     "PathPoint",
+    "frames_for_index",
 ]
