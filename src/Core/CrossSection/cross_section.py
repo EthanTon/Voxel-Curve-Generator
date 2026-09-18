@@ -8,7 +8,17 @@ from ..coordinates import BlockPos
 from ..modes import StepMode
 from .annotations import FeatureAnnotation
 from .steps import STEP_RULES, StepRule, column_pushes, lead
-from .turns import Turn, forward, heading, is_quarter, neighbors, normalize, place
+from .turns import (
+    CLOCKWISE,
+    Rotation,
+    Turn,
+    forward,
+    heading,
+    is_quarter,
+    neighbors,
+    normalize,
+    place,
+)
 
 # Section-local axes, as authored: x is lateral (positive to the right of
 # travel), y is height above the path, and z is depth, with forward at -z.
@@ -122,11 +132,27 @@ def _profile(
     )
 
 
+def _mirrored(section: OrientedSection) -> OrientedSection:
+    # A counter-clockwise turn is its clockwise twin mirrored about the x axis,
+    # the heading the section was authored along. Travel mirrors with it, and a
+    # diagonal's two halves trade places, so the stagger leans the other way
+    # without the join having to know which way round the path is turning.
+    return tuple(
+        SectionOffset(
+            offset.annotation,
+            tuple(BlockPos(p.x, p.y, -p.z) for p in offset.offsets),
+        )
+        for offset in section
+    )
+
+
 class _OrientationCache:
+    # Layouts are keyed by turn and direction together: the same turn laid out
+    # the other way round is a different layout.
     __slots__ = ("layouts", "profile", "revision")
 
     def __init__(self) -> None:
-        self.layouts: dict[Turn, OrientedSection] = {}
+        self.layouts: dict[tuple[Turn, Rotation], OrientedSection] = {}
         self.profile: _Profile | None = None
         self.revision: int | None = None
 
@@ -161,7 +187,8 @@ class CrossSection:
     def reach(self, turn: Turn | None = None) -> float:
         # How far along travel any oriented position sits from the path point,
         # ahead or behind, at `turn` or at the worst of every turn. Generation
-        # sizes the lead a section is pasted with from this.
+        # sizes the lead a section is pasted with from this. Mirroring a layout
+        # mirrors travel with it, so a turn reaches the same either way round.
         turns = range(0, 360, 45) if turn is None else (turn,)
         furthest = 0.0
         for each in turns:
@@ -172,13 +199,26 @@ class CrossSection:
                     furthest = max(furthest, float(abs(along)))
         return furthest
 
-    def orient(self, turn: Turn) -> OrientedSection:
+    def orient(
+        self, turn: Turn, direction: Rotation = CLOCKWISE
+    ) -> OrientedSection:
+        # `turn` is how far round from the authored heading the section is laid
+        # out, and `direction` is which way round it was counted, so the same
+        # turn counted the other way travels the other way too. Every turn is
+        # counted, including the ones that travel the same either way round: a
+        # path carrying a direction through them lays them out mirrored.
         turn = normalize(turn)
+        key = (turn, direction)
         cache = self._current()
-        oriented = cache.layouts.get(turn)
+        oriented = cache.layouts.get(key)
         if oriented is None:
-            oriented = self._orient(turn, cache.profile)
-            cache.layouts[turn] = oriented
+            clockwise = self._orient(turn, cache.profile)
+            oriented = (
+                clockwise
+                if direction == CLOCKWISE
+                else _mirrored(clockwise)
+            )
+            cache.layouts[key] = oriented
         return oriented
 
     def _current(self) -> _OrientationCache:

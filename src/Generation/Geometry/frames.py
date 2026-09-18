@@ -1,123 +1,198 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from typing import NamedTuple
 
 from ...Core.CrossSection.schedule import SectionSchedule
-from ...Core.Path.boundary import Boundary
 from ...Core.Path.elevation import ConstantElevation, MultiElevationStep
 from ...Core.Path.path import Path
-from ...Core.Path.path_frame import PathFrame
+from ...Core.Path.path_frame import PathFrame, frames_for_index
 from .boundaries import (
     LateralReach,
     Orientation,
     boundary_at,
     orthogonal,
+    path_bounds,
     validate_frames,
 )
 
+__all__ = [
+    "ElevationBreak",
+    "build_frames",
+    "build_section_frames",
+    "check_padding",
+    "elevation_breaks",
+    "elevation_from_frames",
+    "frames_for_index",
+    "span_stations",
+]
 
-@dataclass(frozen=True, slots=True)
-class ElevationBreak:
-    # From `path_index` onward the path is held at `y`, until the next break.
+
+class ElevationBreak(NamedTuple):
+    # The path point a level changes at, and the level it changes to. The
+    # point belongs to the frame after the break, as every boundary's does.
+
     path_index: int
-    y: int
+    y_offset: int
+
+
+def check_padding(path: Path, lead_in: int = 0, lead_out: int = 0) -> None:
+    # A lead is pasted from padding, so there has to be padding to paste from.
+    if lead_in < 0 or lead_out < 0:
+        raise ValueError(
+            f"Leads must be non-negative, got lead_in={lead_in}, lead_out={lead_out}"
+        )
+    before = path.first_index
+    after = len(path.path_points) - 1 - path.last_index
+    if lead_in > before:
+        raise ValueError(
+            f"A lead of {lead_in} needs {lead_in} points of padding before the "
+            f"path, and there are {before}"
+        )
+    if lead_out > after:
+        raise ValueError(
+            f"A lead of {lead_out} needs {lead_out} points of padding after the "
+            f"path, and there are {after}"
+        )
 
 
 def elevation_breaks(path: Path) -> list[ElevationBreak]:
-    # A break wherever the path proper changes height. No frame can open at the
-    # last point, so a change there keeps the level before it.
-    points = path.path_points
-    y = points[path.first_index].position.y
+    # Where the path proper changes height. A change at its last point has no
+    # frame after it to belong to, so it is not a break.
+    points = path.bounded_points
     breaks = []
-    for index in range(path.first_index + 1, path.last_index):
-        point_y = points[index].position.y
-        if point_y != y:
-            breaks.append(ElevationBreak(index, point_y))
-            y = point_y
+    for offset, (before, after) in enumerate(zip(points, points[1:])):
+        index = path.first_index + offset + 1
+        if after.position.y != before.position.y and index != path.last_index:
+            breaks.append(ElevationBreak(index, after.position.y))
     return breaks
 
 
 def span_stations(schedule: SectionSchedule, path: Path) -> list[int]:
-    # Points on the path proper where the delivered section changes: where a
-    # span starts, or where one ends before a gap. Section frames need a
-    # boundary at each, so different sections meet on a seam.
-    first = path.first_index
-    last = path.last_index
+    # The points on the path proper where the section changes: where a span
+    # starts, and where the path runs on past one that has ended. The path's
+    # own ends are not changes, since nothing is pasted beyond them.
     stations = set()
     for span in schedule.spans:
         stations.add(span.path_start)
-        if schedule.at(span.path_stop + 1) is None:
-            stations.add(span.path_stop + 1)
-    return sorted(index for index in stations if first < index < last)
-
-
-def check_padding(path: Path, lead_in: int, lead_out: int) -> None:
-    # Pasting with a lead borrows points beyond each frame. The outer frames
-    # borrow them from the path's padding, so the padding must be that long.
-    if lead_in < 0 or lead_out < 0:
-        raise ValueError("lead_in and lead_out must be non-negative")
-    if path.lead_in < lead_in or path.lead_out < lead_out:
-        raise ValueError(
-            f"A lead of {lead_in} in and {lead_out} out needs at least that much "
-            f"padding; the path has {path.lead_in} in and {path.lead_out} out"
-        )
+        stations.add(span.path_stop + 1)
+    return sorted(
+        station
+        for station in stations
+        if path.first_index < station < path.last_index
+    )
 
 
 def build_frames(
     path: Path,
-    start_y: int,
-    breaks: Sequence[ElevationBreak] = (),
+    y_offset: int,
+    breaks: Iterable[ElevationBreak] = (),
     *,
     orientation: Orientation = orthogonal,
+    half_width: float | LateralReach | None = None,
     reach: LateralReach | None = None,
     lead_in: int = 0,
     lead_out: int = 0,
 ) -> list[PathFrame]:
-    # Frames tile the path proper. The first starts at its first point, the
-    # last ends at its last point, and every break closes one frame and opens
-    # the next on a single boundary object they share.
-    #
-    # Each frame is the clip for whatever is pasted in it, so anything thrown
-    # past its boundaries never exists in the world. `lead_in` and `lead_out`
-    # are the lead that will be pasted with (see `frames_for_index` in
-    # path_frame.py); they are only checked against the path's padding here.
-    if not path.bounded_points:
-        raise ValueError("Cannot frame a path with no points")
+    # One frame per level, split wherever the path proper changes height. The
+    # outer boundaries are the path's own bounds, and each break contributes
+    # the one boundary the frames either side of it share.
+    if len(path.bounded_points) < 2:
+        raise ValueError("A path needs at least two points to be framed")
     check_padding(path, lead_in, lead_out)
 
-    first = path.first_index
-    last = path.last_index
-
-    # (path index a frame starts at, its level)
-    starts: list[tuple[int, int]] = [(first, start_y)]
-    previous_index = first
-    for step in breaks:
-        if step.path_index <= previous_index:
+    bounds = path_bounds(path, orientation)
+    kept: list[ElevationBreak] = []
+    level = y_offset
+    previous: int | None = None
+    for each in breaks:
+        if not path.first_index < each.path_index < path.last_index:
             raise ValueError(
-                f"Elevation break at point {step.path_index} does not come after "
-                f"point {previous_index}"
+                f"Break at point {each.path_index} is not inside the path proper "
+                f"{path.first_index}-{path.last_index}"
             )
-        if step.path_index >= last:
+        if previous is not None and each.path_index <= previous:
             raise ValueError(
-                f"Elevation break at point {step.path_index} must come before the "
-                f"path's last point {last}"
+                f"Breaks must come in order along the path; {each.path_index} "
+                f"follows {previous}"
             )
-        previous_index = step.path_index
-        # A break that keeps the current level needs no boundary.
-        if step.y != starts[-1][1]:
-            starts.append((step.path_index, step.y))
+        previous = each.path_index
+        # A break back to the level already held changes nothing, so it adds no
+        # boundary -- but it is still a break, and the ones after it follow it.
+        if each.y_offset != level:
+            kept.append(each)
+            level = each.y_offset
 
-    stops = [index for index, _ in starts[1:]] + [last]
-    boundaries = {
-        index: boundary_at(path, index, orientation)
-        for index in {first, last, *stops}
-    }
-    frames = _frames_between(
-        boundaries,
-        [(start, stop, y) for (start, y), stop in zip(starts, stops)],
-    )
-    validate_frames(path, frames, reach)
+    indices = [path.first_index, *(each.path_index for each in kept), path.last_index]
+    levels = [y_offset, *(each.y_offset for each in kept)]
+    planes = [
+        bounds.start,
+        *(boundary_at(path, each.path_index, orientation) for each in kept),
+        bounds.end,
+    ]
+    frames = [
+        PathFrame(index, indices[index], indices[index + 1], *planes[index : index + 2], levels[index])
+        for index in range(len(levels))
+    ]
+    validate_frames(path, frames, _half_width(half_width, reach))
+    return frames
+
+
+def build_section_frames(
+    path: Path,
+    elevation_frames: Sequence[PathFrame],
+    stations: Iterable[int] | None = None,
+    *,
+    orientation: Orientation = orthogonal,
+    half_width: float | LateralReach | None = None,
+    reach: LateralReach | None = None,
+) -> list[PathFrame]:
+    # Frames split at every station as well as at every change of level, each
+    # at the level of the elevation frame it lies in. Stations default to every
+    # point of the path proper, which is the finest a path can be cut.
+    #
+    # A boundary an elevation frame already placed is used as it is, so the two
+    # runs of frames seam in the same places.
+    validate_frames(path, elevation_frames, _half_width(half_width, reach))
+    shared = {elevation_frames[0].path_start: elevation_frames[0].start_boundary}
+    for frame in elevation_frames:
+        shared[frame.path_stop] = frame.end_boundary
+
+    if stations is None:
+        stations = range(path.first_index + 1, path.last_index)
+    stations = list(stations)
+
+    previous = path.first_index
+    for station in stations:
+        if not previous < station < path.last_index:
+            raise ValueError(
+                f"Station {station} is not between {previous} and the path's "
+                f"last point {path.last_index}"
+            )
+        previous = station
+    missing = {frame.path_start for frame in elevation_frames[1:]} - set(stations)
+    if missing:
+        raise ValueError(
+            f"The path changes level at {sorted(missing)}, which must be "
+            "stations too, or a section frame would span two levels"
+        )
+
+    indices = [path.first_index, *stations, path.last_index]
+    planes = [
+        shared[index] if index in shared else boundary_at(path, index, orientation)
+        for index in indices
+    ]
+    frames = [
+        PathFrame(
+            index,
+            indices[index],
+            indices[index + 1],
+            *planes[index : index + 2],
+            _level_of(elevation_frames, indices[index], indices[index + 1]),
+        )
+        for index in range(len(indices) - 1)
+    ]
+    validate_frames(path, frames, _half_width(half_width, reach))
     return frames
 
 
@@ -140,87 +215,17 @@ def elevation_from_frames(
     )
 
 
-def build_section_frames(
-    path: Path,
-    elevation_frames: Sequence[PathFrame],
-    stations: Sequence[int] | None = None,
-    *,
-    orientation: Orientation = orthogonal,
-    reach: LateralReach | None = None,
-) -> list[PathFrame]:
-    # Frames with a boundary at every station, so consecutive sections meet on
-    # a boundary instead of overlapping. Stations default to every point on
-    # the path proper; the path's first and last points are always stations.
-    #
-    # Every elevation boundary must be a station. Each section frame then lies
-    # inside exactly one elevation frame and takes its level, so a single clip
-    # is enough. Boundaries at elevation breaks are the elevation frames' own
-    # objects; the rest are oriented with `orientation`.
-    validate_frames(path, elevation_frames)
-    first = path.first_index
-    last = path.last_index
-    if elevation_frames[0].path_start != first or elevation_frames[-1].path_stop != last:
-        raise ValueError("Elevation frames do not cover the path proper")
-
-    if stations is None:
-        stations = range(first, last + 1)
-    points = list(stations)
-    for before, after in zip(points, points[1:]):
-        if after <= before:
-            raise ValueError(f"Station {after} does not come after station {before}")
-    if points and (points[0] < first or points[-1] > last):
-        raise ValueError(
-            f"Stations must lie on the path proper, points {first}-{last}"
-        )
-    if not points or points[0] != first:
-        points.insert(0, first)
-    if points[-1] != last:
-        points.append(last)
-    if len(points) < 2:
-        raise ValueError("Cannot frame a path with a single point")
-
-    station_set = set(points)
-    missing = [
-        frame.path_start for frame in elevation_frames[1:]
-        if frame.path_start not in station_set
-    ]
-    if missing:
-        raise ValueError(f"Elevation breaks at points {missing} are not stations")
-
-    boundaries: dict[int, Boundary] = {}
-    for frame in elevation_frames:
-        boundaries[frame.path_start] = frame.start_boundary
-        boundaries[frame.path_stop] = frame.end_boundary
-    for station in points:
-        if station not in boundaries:
-            boundaries[station] = boundary_at(path, station, orientation)
-
-    spans = []
-    level = iter(elevation_frames)
-    current = next(level)
-    for start, stop in zip(points, points[1:]):
-        while start >= current.path_stop:
-            current = next(level)
-        spans.append((start, stop, current.y_offset))
-
-    frames = _frames_between(boundaries, spans)
-    validate_frames(path, frames, reach)
-    return frames
+def _half_width(
+    half_width: float | None,
+    reach: LateralReach | None,
+) -> float | LateralReach | None:
+    # A reach is kept as it is rather than flattened to its widest side: which
+    # side a section reaches on is what decides whether a bend is too tight.
+    return reach if half_width is None else half_width
 
 
-def _frames_between(
-    boundaries: dict[int, Boundary],
-    spans: Sequence[tuple[int, int, int]],
-) -> list[PathFrame]:
-    # Frames over consecutive (start, stop, level) spans, sharing boundaries.
-    return [
-        PathFrame(
-            index=position,
-            path_start=start,
-            path_stop=stop,
-            start_boundary=boundaries[start],
-            end_boundary=boundaries[stop],
-            y_offset=y,
-        )
-        for position, (start, stop, y) in enumerate(spans)
-    ]
+def _level_of(frames: Sequence[PathFrame], start: int, stop: int) -> int:
+    for frame in frames:
+        if frame.path_start <= start and stop <= frame.path_stop:
+            return frame.y_offset
+    raise ValueError(f"Points {start}-{stop} lie in no elevation frame")
