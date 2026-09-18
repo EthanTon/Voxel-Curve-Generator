@@ -68,17 +68,19 @@ class PathGeometryTests(unittest.TestCase):
         self.assertIs(geometry.section_frames[0].end_boundary, lower.end_boundary)
         self.assertIs(geometry.section_frames[1].start_boundary, upper.start_boundary)
 
-    def test_padding_sets_the_path_proper_and_its_bounds(self) -> None:
-        geometry = PathGeometry(
-            *heights(64, 64, 64, 64, 64, 64), padding_in=1, padding_out=2
-        )
-        self.assertEqual((geometry.path.first_index, geometry.path.last_index), (1, 3))
+    def test_padding_extends_the_path_past_the_points_given(self) -> None:
+        # The points given are the path proper; padding is added around them,
+        # so the bounds still fall on the first and last point authored.
+        geometry = PathGeometry(*heights(64, 64, 64, 64), padding=2)
+        self.assertEqual(len(geometry.path.path_points), 8)
+        self.assertEqual((geometry.path.first_index, geometry.path.last_index), (2, 5))
         [frame] = geometry.elevation_frames
-        self.assertEqual((frame.path_start, frame.path_stop), (1, 3))
-        self.assertEqual(geometry.bounds.start.path_index, 1)
-        self.assertEqual(geometry.bounds.end.path_index, 3)
+        self.assertEqual((frame.path_start, frame.path_stop), (2, 5))
+        self.assertEqual(geometry.bounds.start.path_index, 2)
+        self.assertEqual(geometry.bounds.end.path_index, 5)
         self.assertTrue(geometry.bounds.contains(0, 2))
-        self.assertFalse(geometry.bounds.contains(0, 3))
+        self.assertFalse(geometry.bounds.contains(0, 4))
+        self.assertFalse(geometry.bounds.contains(0, -1))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from ...Core.CrossSection.schedule import SectionSchedule, SectionSpan
 from ...Core.Path.path import Path
 from .boundaries import Orientation, orthogonal, path_bounds
+from .padding import padded_path
 from .frames import (
     build_frames,
     build_section_frames,
@@ -12,7 +13,7 @@ from .frames import (
     elevation_from_frames,
     span_stations,
 )
-from .reach import lateral_reach
+from .reach import lateral_reach, required_lead
 
 
 class PathGeometry:
@@ -22,23 +23,39 @@ class PathGeometry:
         gradients,
         section_spans: Iterable[SectionSpan] = (),
         *,
-        padding_in: int = 0,
-        padding_out: int = 0,
+        padding: int | None = None,
         orientation: Orientation = orthogonal,
     ):
-        # Path points provided
-        self.path = Path(
-            points=points,
-            gradients=gradients,
-            lead_in=padding_in,
-            lead_out=padding_out,
+        # The points describe the path proper. How far past them it has to be
+        # padded is not authored with them: it is what the sections pasted along
+        # it reach, which only generation knows. `padding` overrides that count.
+        spans = tuple(section_spans)
+        sections = tuple(span.section for span in spans)
+        authored = Path(points=points, gradients=gradients)
+
+        self.padding = (
+            required_lead(authored, sections) if padding is None else padding
         )
 
-        # Sections of the path provided
-        self.sections = SectionSchedule(section_spans, len(self.path.path_points))
+        # Path points provided, extended into the lead each end needs
+        self.path = padded_path(points, gradients, self.padding, orientation)
+
+        # Sections of the path provided. Spans are authored against the points
+        # as given, so they shift along with them.
+        self.sections = SectionSchedule(
+            (
+                SectionSpan(
+                    span.path_start + self.padding,
+                    span.path_stop + self.padding,
+                    span.section,
+                )
+                for span in spans
+            ),
+            len(self.path.path_points),
+        )
 
         # How far the sections extend either side of the path, at any turn
-        self.reach = lateral_reach(span.section for span in self.sections.spans)
+        self.reach = lateral_reach(sections)
 
         # One frame per level, split wherever the path proper changes height
         start_y = self.path.path_points[self.path.first_index].position.y
