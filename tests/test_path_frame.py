@@ -1,7 +1,7 @@
 import unittest
 
 from src.Core.Path.boundary import Boundary
-from src.Core.Path.path_frame import PathFrame
+from src.Core.Path.path_frame import PathFrame, frames_for_index
 
 
 def boundary(index=0, origin=(0.0, 0.0), tangent=(0.0, 1.0)):
@@ -63,6 +63,45 @@ class PathFrameTests(unittest.TestCase):
     def test_healthy_frame_is_not_degenerate(self) -> None:
         self.assertFalse(self.lower.is_degenerate)
         self.assertFalse(self.upper.is_degenerate)
+
+
+
+class FramesForIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Path proper 2-21, in frames 2-8, 8-15 and 15-21.
+        self.frames = [
+            PathFrame(0, 2, 8, boundary(2, (0.0, 2.0)), boundary(8, (0.0, 8.0)), 64),
+            PathFrame(1, 8, 15, boundary(8, (0.0, 8.0)), boundary(15, (0.0, 15.0)), 65),
+            PathFrame(2, 15, 21, boundary(15, (0.0, 15.0)), boundary(21, (0.0, 21.0)), 66),
+        ]
+
+    def positions(self, index: int, lead_in: int = 0, lead_out: int = 0) -> list[int]:
+        return [f.index for f in frames_for_index(self.frames, index, lead_in, lead_out)]
+
+    def test_without_a_lead_a_point_on_a_break_goes_to_both_frames(self) -> None:
+        self.assertEqual(self.positions(7), [0])
+        self.assertEqual(self.positions(8), [0, 1])
+        self.assertEqual(self.positions(9), [1])
+        self.assertEqual(self.positions(15), [1, 2])
+
+    def test_a_lead_reaches_into_the_neighbouring_frames(self) -> None:
+        # Frame 1 (8-15) with 2 in and 1 out takes points 6-16.
+        self.assertEqual(self.positions(6, lead_in=2, lead_out=1), [0, 1])
+        self.assertEqual(self.positions(5, lead_in=2, lead_out=1), [0])
+        self.assertEqual(self.positions(16, lead_in=2, lead_out=1), [1, 2])
+        self.assertEqual(self.positions(17, lead_in=2, lead_out=1), [2])
+
+    def test_padding_is_pasted_only_as_far_as_the_lead(self) -> None:
+        self.assertEqual(self.positions(1), [])
+        self.assertEqual(self.positions(1, lead_in=1), [0])
+        self.assertEqual(self.positions(0, lead_in=1), [])
+        self.assertEqual(self.positions(24, lead_out=3), [2])
+
+    def test_bad_input(self) -> None:
+        with self.assertRaises(ValueError):
+            frames_for_index([], 0)
+        with self.assertRaises(ValueError):
+            frames_for_index(self.frames, 0, lead_in=-1)
 
 
 if __name__ == "__main__":
