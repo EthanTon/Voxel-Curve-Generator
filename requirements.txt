@@ -1,0 +1,6 @@
+# amulet-nbt supplies the NBT tag layer behind src/Format/nbt.py. The adapter
+# accepts either import path, so either line works:
+#   amulet-nbt>=2.1,<3   imports as `amulet_nbt`  (needs a source build on 3.13)
+#   amulet-nbt>=5.0.0a1  imports as `amulet.nbt`  (prebuilt wheels on 3.13)
+amulet-nbt>=5.0.0a1
+numpy>=2.0
