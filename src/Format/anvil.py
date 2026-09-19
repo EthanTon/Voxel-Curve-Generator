@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import struct
+import zlib
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from ..Core.block.states import BlockState
+from . import nbt
+from .codec import bits_for, pack_longs, unpack_longs
+from .region import SECTION_SIZE, BlockRegion
+
+SECTOR = 4096
+REGION_CHUNKS = 32
+HEADER_SECTORS = 2
+CELLS_PER_SECTION = SECTION_SIZE**3
+# Anvil floors at 4 bits and, since 1.16, pads each long rather than letting
+# an entry span two.
+MIN_BITS = 4
+STRADDLE = False
+GZIP, ZLIB, RAW = 1, 2, 3
+DEFAULT_BIOME = "minecraft:plains"
+DEFAULT_STATUS = "minecraft:full"
+
+
+@dataclass(frozen=True, slots=True)
+class RegionPos:
+    # One .mca file: 32x32 chunk columns, unbounded in y.
+    x: int
+    z: int
+
+    @property
+    def file_name(self) -> str:
+        return f"r.{self.x}.{self.z}.mca"
+
+
+def region_of(chunk_x: int, chunk_z: int) -> RegionPos:
+    return RegionPos(chunk_x >> 5, chunk_z >> 5)
+
+
+def header_index(chunk_x: int, chunk_z: int) -> int:
+    return (chunk_x & 31) + (chunk_z & 31) * REGION_CHUNKS
+
+
+@dataclass(slots=True)
+class ChunkColumn:
+    # Sections sharing an (x, z), keyed by section y, which is a signed byte
+    # and routinely negative.
+    chunk_x: int
+    chunk_z: int
+    sections: dict[int, BlockRegion] = field(default_factory=dict)
+
+    @property
+    def position(self) -> RegionPos:
+        return region_of(self.chunk_x, self.chunk_z)
+
+    def iter_sections(self) -> Iterator[tuple[int, BlockRegion]]:
+        for section_y in sorted(self.sections):
+            yield section_y, self.sections[section_y]
+
+
+def chunk_columns(region: BlockRegion) -> dict[tuple[int, int], ChunkColumn]:
+    columns: dict[tuple[int, int], ChunkColumn] = {}
+    for chunk, section in region.iter_sections():
+        column = columns.setdefault((chunk.x, chunk.z), ChunkColumn(chunk.x, chunk.z))
+        column.sections[chunk.y] = section
+    return columns
+
+
+def encode_block_states(
+    states: Sequence[BlockState],
+    indices: Sequence[int],
+) -> nbt.CompoundTag:
+    palette = nbt.ListTag([nbt.block_state_tag(state) for state in states])
+    if len(states) == 1:
+        # A section of one state carries no data array.
+        return nbt.CompoundTag({"palette": palette})
+    bits = bits_for(len(states), minimum=MIN_BITS)
+    return nbt.CompoundTag(
+        {
+            "palette": palette,
+            "data": nbt.long_array(pack_longs(list(indices), bits, straddle=STRADDLE)),
+        }
+    )
+
+
+def decode_block_states(tag: nbt.CompoundTag) -> tuple[list[BlockState], list[int]]:
+    states = [nbt.block_state_from_tag(entry) for entry in tag["palette"]]
+    data = tag.get("data")
+    if data is None or len(states) == 1:
+        return states, [0] * CELLS_PER_SECTION
+    indices = unpack_longs(
+        data.np_array,
+        bits_for(len(states), minimum=MIN_BITS),
+        CELLS_PER_SECTION,
+        straddle=STRADDLE,
+    )
+    return states, indices
+
+
+def build_section(
+    section_y: int,
+    section: BlockRegion,
+    *,
+    biome: str = DEFAULT_BIOME,
+) -> nbt.CompoundTag:
+    states = [section.palette.get_state(index) for index in range(len(section.palette))]
+    return nbt.CompoundTag(
+        {
+            "Y": nbt.ByteTag(section_y),
+            "block_states": encode_block_states(states, list(section.iter_cells())),
+            "biomes": nbt.CompoundTag({"palette": nbt.ListTag([nbt.StringTag(biome)])}),
+        }
+    )
+
+
+def build_chunk(
+    column: ChunkColumn,
+    *,
+    data_version: int,
+    biome: str = DEFAULT_BIOME,
+    status: str = DEFAULT_STATUS,
+) -> nbt.CompoundTag:
+    # isLightOn=0 and empty Heightmaps make the game rebuild both, which is
+    # the only honest claim an exporter can make about either.
+    return nbt.CompoundTag(
+        {
+            "DataVersion": nbt.IntTag(data_version),
+            "xPos": nbt.IntTag(column.chunk_x),
+            "yPos": nbt.IntTag(min(column.sections, default=0)),
+            "zPos": nbt.IntTag(column.chunk_z),
+            "Status": nbt.StringTag(status),
+            "LastUpdate": nbt.LongTag(0),
+            "InhabitedTime": nbt.LongTag(0),
+            "sections": nbt.ListTag(
+                [
+                    build_section(section_y, section, biome=biome)
+                    for section_y, section in column.iter_sections()
+                ]
+            ),
+            "block_entities": nbt.ListTag([]),
+            "block_ticks": nbt.ListTag([]),
+            "fluid_ticks": nbt.ListTag([]),
+            "Heightmaps": nbt.CompoundTag({}),
+            "isLightOn": nbt.ByteTag(0),
+        }
+    )
+
+
+def overlay_chunk(
+    chunk: nbt.CompoundTag,
+    column: ChunkColumn,
+    *,
+    biome: str = DEFAULT_BIOME,
+) -> nbt.CompoundTag:
+    # Only cells the region occupies are replaced, so terrain the build does
+    # not touch survives. This is why occupancy is tracked apart from air.
+    existing = {section["Y"].py_int: section for section in chunk["sections"]}
+    for section_y, section in column.iter_sections():
+        current = existing.get(section_y)
+        if current is None:
+            existing[section_y] = build_section(section_y, section, biome=biome)
+            continue
+        states, indices = decode_block_states(current["block_states"])
+        lookup = {state: index for index, state in enumerate(states)}
+        for index, flag in enumerate(section.occupancy):
+            if not flag:
+                continue
+            state = section.palette.get_state(section.cells[index])
+            if state not in lookup:
+                lookup[state] = len(states)
+                states.append(state)
+            indices[index] = lookup[state]
+        current["block_states"] = encode_block_states(states, indices)
+    chunk["sections"] = nbt.ListTag([existing[key] for key in sorted(existing)])
+    chunk["yPos"] = nbt.IntTag(min(existing, default=0))
+    chunk["Heightmaps"] = nbt.CompoundTag({})
+    chunk["isLightOn"] = nbt.ByteTag(0)
+    return chunk
+
+
+class RegionFile:
+    # A .mca file as a mapping of chunk column to chunk NBT, with the sector
+    # bookkeeping handled on save.
+
+    __slots__ = ("position", "chunks", "timestamps")
+
+    def __init__(self, position: RegionPos) -> None:
+        self.position = position
+        self.chunks: dict[tuple[int, int], nbt.CompoundTag] = {}
+        self.timestamps: dict[tuple[int, int], int] = {}
+
+    @classmethod
+    def load(cls, path: Path | str, position: RegionPos | None = None) -> RegionFile:
+        path = Path(path)
+        if position is None:
+            _, region_x, region_z, _ = path.name.split(".")
+            position = RegionPos(int(region_x), int(region_z))
+        raw = path.read_bytes()
+        out = cls(position)
+        if len(raw) < HEADER_SECTORS * SECTOR:
+            return out
+        for index in range(REGION_CHUNKS * REGION_CHUNKS):
+            offset = int.from_bytes(raw[index * 4 : index * 4 + 3], "big")
+            sectors = raw[index * 4 + 3]
+            if offset == 0 or sectors == 0:
+                continue
+            start = offset * SECTOR
+            length = int.from_bytes(raw[start : start + 4], "big")
+            payload = _decompress(raw[start + 5 : start + 4 + length], raw[start + 4])
+            key = (
+                position.x * REGION_CHUNKS + index % REGION_CHUNKS,
+                position.z * REGION_CHUNKS + index // REGION_CHUNKS,
+            )
+            out.chunks[key] = nbt.loads(payload).compound
+            out.timestamps[key] = int.from_bytes(
+                raw[SECTOR + index * 4 : SECTOR + index * 4 + 4], "big"
+            )
+        return out
+
+    def save(self, path: Path | str, *, timestamp: int = 0) -> Path:
+        locations = bytearray(SECTOR)
+        timestamps = bytearray(SECTOR)
+        body = bytearray()
+        cursor = HEADER_SECTORS
+        for key, chunk in sorted(self.chunks.items()):
+            payload = zlib.compress(nbt.dumps(chunk, "", compressed=False))
+            framed = struct.pack(">I", len(payload) + 1) + bytes([ZLIB]) + payload
+            sectors = (len(framed) + SECTOR - 1) // SECTOR
+            if sectors > 255:
+                raise ValueError(f"chunk {key} needs {sectors} sectors; .mcc is not supported")
+            body += framed.ljust(sectors * SECTOR, b"\x00")
+            index = header_index(*key)
+            locations[index * 4 : index * 4 + 3] = cursor.to_bytes(3, "big")
+            locations[index * 4 + 3] = sectors
+            stamp = self.timestamps.get(key, timestamp)
+            timestamps[index * 4 : index * 4 + 4] = stamp.to_bytes(4, "big")
+            cursor += sectors
+        path = Path(path)
+        path.write_bytes(bytes(locations) + bytes(timestamps) + bytes(body))
+        return path
+
+
+def write_region_files(
+    region: BlockRegion,
+    directory: Path | str,
+    *,
+    data_version: int,
+    merge: bool = True,
+    biome: str = DEFAULT_BIOME,
+    status: str = DEFAULT_STATUS,
+) -> list[Path]:
+    # merge overlays onto .mca files already present. Without it every cell
+    # the region does not occupy becomes air.
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    grouped: dict[RegionPos, list[ChunkColumn]] = {}
+    for column in chunk_columns(region).values():
+        grouped.setdefault(column.position, []).append(column)
+
+    written = []
+    for position in sorted(grouped, key=lambda entry: (entry.x, entry.z)):
+        path = directory / position.file_name
+        region_file = (
+            RegionFile.load(path, position)
+            if merge and path.exists()
+            else RegionFile(position)
+        )
+        for column in grouped[position]:
+            key = (column.chunk_x, column.chunk_z)
+            existing = region_file.chunks.get(key)
+            region_file.chunks[key] = (
+                build_chunk(column, data_version=data_version, biome=biome, status=status)
+                if existing is None
+                else overlay_chunk(existing, column, biome=biome)
+            )
+        written.append(region_file.save(path))
+    return written
+
+
+def _decompress(payload: bytes, compression: int) -> bytes:
+    if compression == ZLIB:
+        return zlib.decompress(payload)
+    if compression == GZIP:
+        return zlib.decompress(payload, 16 + zlib.MAX_WBITS)
+    if compression == RAW:
+        return payload
+    raise ValueError(f"unknown chunk compression {compression}")
