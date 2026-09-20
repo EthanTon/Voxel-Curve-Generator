@@ -242,6 +242,43 @@ class RegionFile:
         return path
 
 
+def read_region_index(
+    path: Path | str,
+    position: RegionPos | None = None,
+) -> dict[tuple[int, int], tuple[int, int]]:
+    # Which chunks a .mca holds, from its 4 KiB location table alone. Nothing
+    # is decompressed, so presence costs one short read rather than the file.
+    path = Path(path)
+    if position is None:
+        _, region_x, region_z, _ = path.name.split(".")
+        position = RegionPos(int(region_x), int(region_z))
+    with path.open("rb") as source:
+        header = source.read(SECTOR)
+    if len(header) < SECTOR:
+        return {}
+    found: dict[tuple[int, int], tuple[int, int]] = {}
+    for index in range(REGION_CHUNKS * REGION_CHUNKS):
+        offset = int.from_bytes(header[index * 4 : index * 4 + 3], "big")
+        sectors = header[index * 4 + 3]
+        if offset == 0 or sectors == 0:
+            continue
+        found[
+            (
+                position.x * REGION_CHUNKS + index % REGION_CHUNKS,
+                position.z * REGION_CHUNKS + index // REGION_CHUNKS,
+            )
+        ] = (offset, sectors)
+    return found
+
+
+def read_region_chunk(path: Path | str, offset: int, sectors: int) -> nbt.CompoundTag:
+    with Path(path).open("rb") as source:
+        source.seek(offset * SECTOR)
+        framed = source.read(sectors * SECTOR)
+    length = int.from_bytes(framed[:4], "big")
+    return nbt.loads(_decompress(framed[5 : 4 + length], framed[4])).compound
+
+
 def write_region_files(
     region: BlockRegion,
     directory: Path | str,

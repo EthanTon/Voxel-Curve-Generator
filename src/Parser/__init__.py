@@ -24,6 +24,7 @@ from .spec import (
     StructureSpec,
     WireSpec,
 )
+from ..Terraform.plan import load as load_terraform
 from .values import require
 
 __all__ = [
@@ -67,9 +68,21 @@ def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
         ),
         wires=tuple(read_wire(each, base) for each in data.get("wire", ())),
         lanes=tuple(read_lane(each, base) for each in data.get("lane", ())),
+        terraform=read_terraform(data, base),
     )
     check_references(spec)
     return spec
+
+
+def read_terraform(data: Mapping, base: Path):
+    named = data.get("terraform")
+    if named is None:
+        return None
+    if isinstance(named, str):
+        return load_terraform(base / named)
+    raise ValueError(
+        "terraforming is written in a file of its own: terraform = \"terraform.toml\""
+    )
 
 
 def check_references(spec: BuildSpec) -> None:
@@ -88,6 +101,16 @@ def check_references(spec: BuildSpec) -> None:
         spec.domain(fitting.domain)
         for name in fitting.sections:
             spec.section(name)
+    if spec.terraform is not None:
+        spec.domain(spec.terraform.domain)
+        known = {each.name for each in (*spec.structures, *spec.lanes)}
+        for follows in spec.terraform.follows:
+            if follows.fitting not in known:
+                listed = ", ".join(sorted(known)) or "none"
+                raise ValueError(
+                    f"terraforming follows {follows.fitting!r}, which is not a "
+                    f"structure or lane. Known fittings: {listed}"
+                )
     for wire in spec.wires:
         for name in wire.between:
             if spec.wire(name).between:
