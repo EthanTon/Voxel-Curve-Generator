@@ -18,6 +18,17 @@ CHUNK = 16
 ABSENT = -32768
 
 
+def region_directory(source: Path) -> Path:
+    held = source / "region"
+    found = held if held.is_dir() else source
+    if not any(found.glob("r.*.mca")):
+        raise ValueError(
+            f"the terraform world names {source}, which holds no region files. "
+            "Point it at a save folder or at its region directory"
+        )
+    return found
+
+
 @runtime_checkable
 class Terrain(Protocol):
     def generated(self, chunk_x: int, chunk_z: int) -> bool: ...
@@ -107,11 +118,13 @@ def read_solid(terrain: Terrain, grid: Grid) -> frozenset[BlockPos]:
 def load_terrain(source: Path | str | None) -> Terrain:
     if source is None:
         return EmptyTerrain()
-    source = Path(source)
+    source = Path(source).resolve()
+    if not source.exists():
+        raise ValueError(f"the terraform world names {source}, which is not there")
     if source.is_dir():
         from .region import RegionTerrain
 
-        return RegionTerrain(source)
+        return RegionTerrain(region_directory(source))
     from ..Format.schematics import load_schematic
     from ..Core.block.palette import BlockPalette
     from ..Format.region import AIR

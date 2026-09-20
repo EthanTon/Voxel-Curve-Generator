@@ -28,7 +28,7 @@ from src.Terraform.distance import nearest
 from src.Terraform.layers import Level, Mound, shape
 from src.Terraform.plan import Keepout, load as read_plan
 from src.Terraform.surroundings import measure
-from src.Terraform.terrain import ABSENT, EmptyTerrain, read_surface
+from src.Terraform.terrain import ABSENT, EmptyTerrain, load_terrain, read_surface
 
 
 STONE = BlockState.create("minecraft:stone")
@@ -584,3 +584,36 @@ def test_an_anchor_takes_its_pad_level_from_the_lowest_block():
     anchor = Alignment.of(piers((5,), 61, 70))
     assert anchor.footing[(5, 0)] == 61
     assert anchor.crest[(5, 0)] == 70
+
+
+def test_a_world_that_is_not_there_says_so(tmp_path):
+    with pytest.raises(ValueError, match="not there"):
+        load_terrain(tmp_path / "saves" / "region")
+
+
+def test_a_world_directory_without_regions_says_so(tmp_path):
+    (tmp_path / "saves").mkdir()
+    with pytest.raises(ValueError, match="no region files"):
+        load_terrain(tmp_path / "saves")
+
+
+def test_a_save_folder_descends_into_its_region_directory(tmp_path):
+    region = tmp_path / "saves" / "region"
+    region.mkdir(parents=True)
+    (region / "r.0.0.mca").write_bytes(b"")
+    loaded = load_terrain(tmp_path / "saves")
+    assert loaded.directory == region
+
+
+def test_an_omitted_world_terraforms_nothing():
+    assert isinstance(load_terrain(None), EmptyTerrain)
+
+
+def test_a_world_path_resolves_against_its_own_file(tmp_path):
+    (tmp_path / "terraform").mkdir()
+    region = tmp_path / "saves" / "region"
+    region.mkdir(parents=True)
+    (region / "r.0.0.mca").write_bytes(b"")
+    written = tmp_path / "terraform" / "mainline.toml"
+    written.write_text('[terraform]\nworld = "../saves/region"\n')
+    assert read_plan(written).world.resolve() == region.resolve()
