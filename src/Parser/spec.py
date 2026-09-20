@@ -10,6 +10,7 @@ from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionOverride
 from ..Core.modes import ElevationMode, PlacementMode, StepMode
 from ..Stamping import DEFAULT_RESOLUTION, Heading
+from ..Terraform.plan import Plan as TerraformPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +170,7 @@ class BuildSpec:
     structures: tuple[StructureSpec, ...] = ()
     wires: tuple[WireSpec, ...] = ()
     lanes: tuple[LaneSpec, ...] = ()
+    terraform: TerraformPlan | None = None
 
     def marker(self, name: str) -> ColumnPos:
         if name not in self.markers:

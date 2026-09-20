@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
@@ -13,6 +13,7 @@ from ..Core.Path.path_frame import PathFrame
 from ..Core.World.block_world import BlockTransform, BlockWorld
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos
+from ..Core.modes import PlacementMode
 from ..Core.line import line
 from ..Format.litematic import write_litematic
 from ..Format.region import BlockRegion
@@ -20,6 +21,7 @@ from ..Generation.Geometry.frames import elevation_from_frames
 from ..Generation.Geometry.orientation import SectionOrientation
 from ..Generation.Sweep.delivery import cover
 from ..Generation.Sweep.paths import DeliveredPath, dashed, deliver_paths, rewalk
+from ..Terraform import Alignment, Terraforming, load_terrain, terraform
 from ..Stamping import (
     ClipRule,
     TurnStamp,
@@ -63,17 +65,94 @@ def assemble(spec: BuildSpec) -> BlockWorld:
     clip = in_frames(frames)
 
     runs = sweep(spec, schedules, path, frames)
+    fittings: dict[str, list[BlockPos]] = {}
     for laying in in_build_order(spec, everything(spec, runs, world, registry, domains, frames, clip)):
-        laying.lay()
+        placed = laying.lay()
+        if laying.fitting:
+            fittings.setdefault(laying.fitting, []).extend(
+                blocks_of(world, placed or ())
+            )
 
+    reshape(spec, world, registry, domains, path, fittings)
     resolve(world, registry, domains)
     return world
+
+
+def reshape(
+    spec: BuildSpec,
+    world: BlockWorld,
+    registry: BlockRegistry,
+    domains: DomainRegistry,
+    path: Path,
+    fittings: Mapping[str, Sequence[BlockPos]],
+) -> Terraforming | None:
+    if spec.terraform is None:
+        return None
+    shaped = terraform(
+        spec.terraform,
+        load_terrain(spec.terraform.world),
+        alignment_of(world, path),
+        registry.palette,
+        fittings=fittings,
+    )
+    if len(shaped.fill):
+        profile = domains.profile(spec.terraform.domain)
+        world.add_field(
+            shaped.fill,
+            placement_mode=PlacementMode.REPLACE_AIR_ONLY,
+            connectivity_domain=profile.domain_id,
+        )
+    if shaped.cut:
+        world.base_blocks = Excavated(world.base_blocks, shaped.cut)
+        world.invalidate_connectivity_policy()
+    return shaped
+
+
+def alignment_of(world: BlockWorld, path: Path) -> Alignment:
+    stations = {
+        (point.position.x, point.position.z): index
+        for index, point in enumerate(path.path_points)
+    }
+    laid = tuple(world.iter_source_positions())
+    return Alignment.of(laid, [nearest_station(stations, each) for each in laid])
+
+
+def nearest_station(stations: Mapping[tuple[int, int], int], at: BlockPos) -> int:
+    return min(
+        stations.items(),
+        key=lambda each: (each[0][0] - at.x) ** 2 + (each[0][1] - at.z) ** 2,
+    )[1]
+
+
+@dataclass(frozen=True, slots=True)
+class Excavated(Mapping):
+    held: Mapping
+    removed: frozenset[BlockPos]
+
+    def __getitem__(self, position):
+        if position in self.removed:
+            raise KeyError(position)
+        return self.held[position]
+
+    def __iter__(self):
+        return (each for each in self.held if each not in self.removed)
+
+    def __len__(self) -> int:
+        return sum(1 for _ in iter(self))
+
+
+def blocks_of(world: BlockWorld, placements: Iterable[int]) -> Iterator[BlockPos]:
+    for placement_id in placements:
+        placement = world.get_placement(placement_id)
+        for local, _ in placement.field.iter_block_ids():
+            yield placement.transform.apply(local)
 
 
 @dataclass(frozen=True, slots=True)
 class Laying:
     domain: str
-    lay: Callable[[], None]
+    lay: Callable[[], object]
+    fitting: str | None = None
 
 
 def in_build_order(spec: BuildSpec, layings: Iterable[Laying]) -> list[Laying]:
@@ -110,6 +189,7 @@ def everything(
                 partial(
                     stamp_along, stamp, world, points_for(structure, run), clip=clip
                 ),
+                structure.name,
             )
     for wire in spec.wires:
         for run in runs_under(spec, wire, runs):
@@ -131,6 +211,7 @@ def everything(
             yield Laying(
                 lane.domain,
                 partial(stamp_along, stamp, world, mark_lane(lane, run), clip=clip),
+                lane.name,
             )
 
 

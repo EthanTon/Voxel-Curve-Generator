@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+import numpy as np
+
+from ..Core.Field.block_field import BlockField
+from ..Core.block.states import BlockState
+from ..Core.coordinates import BlockPos
+from .classify import BlockClass, classify
+from .grid import Field, Grid
+
+
+CHUNK = 16
+ABSENT = -32768
+
+
+@runtime_checkable
+class Terrain(Protocol):
+    def generated(self, chunk_x: int, chunk_z: int) -> bool: ...
+
+    def column(self, x: int, z: int) -> Sequence[tuple[int, BlockState]]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class EmptyTerrain:
+    def generated(self, chunk_x: int, chunk_z: int) -> bool:
+        return False
+
+    def column(self, x: int, z: int) -> Sequence[tuple[int, BlockState]]:
+        return ()
+
+
+@dataclass(slots=True)
+class FieldTerrain:
+    blocks: BlockField
+    _columns: dict[tuple[int, int], list[tuple[int, BlockState]]] = field(
+        default_factory=dict, init=False
+    )
+
+    def __post_init__(self) -> None:
+        for position, block_id in self.blocks.iter_block_ids():
+            state = self.blocks.palette.get_state(block_id)
+            self._columns.setdefault((position.x, position.z), []).append(
+                (position.y, state)
+            )
+        for stack in self._columns.values():
+            stack.sort()
+
+    def generated(self, chunk_x: int, chunk_z: int) -> bool:
+        return any(
+            x // CHUNK == chunk_x and z // CHUNK == chunk_z for x, z in self._columns
+        )
+
+    def column(self, x: int, z: int) -> Sequence[tuple[int, BlockState]]:
+        return self._columns.get((x, z), ())
+
+
+@dataclass(frozen=True, slots=True)
+class Surface:
+    height: Field
+    available: Field
+    state: Mapping[tuple[int, int], BlockState]
+
+
+def read_surface(terrain: Terrain, grid: Grid) -> Surface:
+    height = grid.filled(ABSENT, dtype=np.int32)
+    available = grid.filled(False, dtype=bool)
+    states: dict[tuple[int, int], BlockState] = {}
+    chunks: dict[tuple[int, int], bool] = {}
+    for row, cell, column in grid.columns():
+        chunk = (column.x // CHUNK, column.z // CHUNK)
+        if chunk not in chunks:
+            chunks[chunk] = terrain.generated(*chunk)
+        if not chunks[chunk]:
+            continue
+        available[row, cell] = True
+        for y, state in reversed(terrain.column(column.x, column.z)):
+            if classify(state) is BlockClass.GROUND:
+                height[row, cell] = y
+                states[(row, cell)] = state
+                break
+    return Surface(height, available, states)
+
+
+def read_vegetation(terrain: Terrain, grid: Grid) -> frozenset[BlockPos]:
+    found: set[BlockPos] = set()
+    for _, _, column in grid.columns():
+        for y, state in terrain.column(column.x, column.z):
+            if classify(state) is BlockClass.VEGETATION:
+                found.add(BlockPos(column.x, y, column.z))
+    return frozenset(found)
+
+
+def read_solid(terrain: Terrain, grid: Grid) -> frozenset[BlockPos]:
+    found: set[BlockPos] = set()
+    for _, _, column in grid.columns():
+        for y, state in terrain.column(column.x, column.z):
+            if classify(state) in (BlockClass.GROUND, BlockClass.STRUCTURE):
+                found.add(BlockPos(column.x, y, column.z))
+    return frozenset(found)
+
+
+def load_terrain(source: Path | str | None) -> Terrain:
+    if source is None:
+        return EmptyTerrain()
+    source = Path(source)
+    if source.is_dir():
+        from .region import RegionTerrain
+
+        return RegionTerrain(source)
+    from ..Format.schematics import load_schematic
+    from ..Core.block.palette import BlockPalette
+    from ..Format.region import AIR
+
+    region, _ = load_schematic(source)
+    blocks = BlockField(BlockPalette())
+    for position, state in region.iter_occupied():
+        if state != AIR:
+            blocks.set_block(position, state)
+    return FieldTerrain(blocks)
