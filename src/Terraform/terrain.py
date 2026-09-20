@@ -16,6 +16,7 @@ from .grid import Field, Grid
 
 CHUNK = 16
 ABSENT = -32768
+SOLID = (BlockClass.GROUND, BlockClass.STRUCTURE)
 
 
 def region_directory(source: Path) -> Path:
@@ -71,48 +72,49 @@ class FieldTerrain:
 
 
 @dataclass(frozen=True, slots=True)
-class Surface:
+class Survey:
     height: Field
     available: Field
     state: Mapping[tuple[int, int], BlockState]
+    growth: frozenset[BlockPos]
+    intruding: frozenset[BlockPos]
 
 
-def read_surface(terrain: Terrain, grid: Grid) -> Surface:
+def survey(
+    terrain: Terrain,
+    grid: Grid,
+    intrudes=None,
+    growth: bool = True,
+) -> Survey:
     height = grid.filled(ABSENT, dtype=np.int32)
     available = grid.filled(False, dtype=bool)
     states: dict[tuple[int, int], BlockState] = {}
+    standing: set[BlockPos] = set()
+    inside: set[BlockPos] = set()
     chunks: dict[tuple[int, int], bool] = {}
-    for row, cell, column in grid.columns():
+    for row, cell, column in grid.by_chunk(CHUNK):
         chunk = (column.x // CHUNK, column.z // CHUNK)
         if chunk not in chunks:
             chunks[chunk] = terrain.generated(*chunk)
         if not chunks[chunk]:
             continue
         available[row, cell] = True
+        found = False
         for y, state in reversed(terrain.column(column.x, column.z)):
-            if classify(state) is BlockClass.GROUND:
+            kind = classify(state)
+            if kind is BlockClass.VEGETATION:
+                if growth:
+                    standing.add(BlockPos(column.x, y, column.z))
+                continue
+            if kind in SOLID and intrudes is not None and intrudes(row, cell, y):
+                inside.add(BlockPos(column.x, y, column.z))
+            if kind is BlockClass.GROUND and not found:
                 height[row, cell] = y
                 states[(row, cell)] = state
-                break
-    return Surface(height, available, states)
-
-
-def read_vegetation(terrain: Terrain, grid: Grid) -> frozenset[BlockPos]:
-    found: set[BlockPos] = set()
-    for _, _, column in grid.columns():
-        for y, state in terrain.column(column.x, column.z):
-            if classify(state) is BlockClass.VEGETATION:
-                found.add(BlockPos(column.x, y, column.z))
-    return frozenset(found)
-
-
-def read_solid(terrain: Terrain, grid: Grid) -> frozenset[BlockPos]:
-    found: set[BlockPos] = set()
-    for _, _, column in grid.columns():
-        for y, state in terrain.column(column.x, column.z):
-            if classify(state) in (BlockClass.GROUND, BlockClass.STRUCTURE):
-                found.add(BlockPos(column.x, y, column.z))
-    return frozenset(found)
+                found = True
+    return Survey(
+        height, available, states, frozenset(standing), frozenset(inside)
+    )
 
 
 def load_terrain(source: Path | str | None) -> Terrain:

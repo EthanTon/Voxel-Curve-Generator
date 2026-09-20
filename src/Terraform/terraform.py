@@ -15,7 +15,7 @@ from .grid import Field, Grid
 from .materialize import Earthworks, build
 from .plan import Action, Intensity, Look, Plan, Step, Stretch
 from .surroundings import Surroundings, measure
-from .terrain import ABSENT, Terrain, read_solid, read_surface, read_vegetation
+from .terrain import ABSENT, Terrain, survey
 from .vegetation import clearing as growth_clearing
 
 
@@ -135,7 +135,10 @@ def terraform(
         [*alignment.columns, *(each for held in anchors.values() for each in held.columns)],
         plan.margin,
     )
-    surface = read_surface(terrain, grid)
+    clearance = clearance or clearing.above(
+        grid, alignment.crest_blocks(), plan.headroom
+    )
+    surface = survey(terrain, grid, clearance.holds, plan.foliage.clear)
     known = surface.available & (surface.height > ABSENT)
     natural = surface.height.astype(np.float64)
     base = _levelled(natural, known)
@@ -145,9 +148,6 @@ def terraform(
     beyond = known & (ground.distance >= plan.reach * SAMPLE_OFFSET)
     surroundings = measure(surface.height, beyond)
 
-    clearance = clearance or clearing.above(
-        grid, alignment.crest_blocks(), plan.headroom
-    )
     permitted = _permitted(grid, plan, known)
     allowed = np.where(seeds, 0.0, permitted)
     stretches = plan.stretches(locate or alignment.locate, alignment.length)
@@ -163,11 +163,11 @@ def terraform(
     designed = np.where((writable > 0) & known, designed, natural)
     designed = np.where(np.abs(designed - natural) < DEAD_BAND, natural, designed)
 
-    cleared = _clear_growth(plan, terrain, grid, allowed)
+    cleared = _clear_growth(plan, surface.growth, grid, writable)
     earthworks = build(
         grid, natural, designed, plan.strata, palette or BlockPalette(), surface.state
     )
-    carved = earthworks.cut | clearance.carved(read_solid(terrain, grid), grid) | cleared
+    carved = earthworks.cut | surface.intruding | cleared
 
     return Terraforming(
         grid,
@@ -365,10 +365,8 @@ def _filters(plan: Plan, surroundings: Surroundings) -> tuple:
     )
 
 
-def _clear_growth(plan: Plan, terrain: Terrain, grid: Grid, allowed: Field):
-    if not plan.foliage.clear:
+def _clear_growth(plan: Plan, growth, grid: Grid, writable: Field):
+    if not plan.foliage.clear or not growth:
         return frozenset()
-    rows, cells = np.nonzero(allowed > 0)
-    return growth_clearing(
-        read_vegetation(terrain, grid), grid, set(zip(rows.tolist(), cells.tolist()))
-    )
+    rows, cells = np.nonzero(writable > 0)
+    return growth_clearing(growth, grid, set(zip(rows.tolist(), cells.tolist())))

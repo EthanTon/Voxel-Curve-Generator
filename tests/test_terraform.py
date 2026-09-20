@@ -28,7 +28,7 @@ from src.Terraform.distance import nearest
 from src.Terraform.layers import Level, Mound, shape
 from src.Terraform.plan import Keepout, load as read_plan
 from src.Terraform.surroundings import measure
-from src.Terraform.terrain import ABSENT, EmptyTerrain, load_terrain, read_surface
+from src.Terraform.terrain import ABSENT, EmptyTerrain, load_terrain, survey
 
 
 STONE = BlockState.create("minecraft:stone")
@@ -353,11 +353,13 @@ def test_foliage_can_be_left_alone():
     assert trunk not in result.cut
 
 
-def test_read_surface_skips_ungenerated_chunks():
+def test_a_survey_skips_ungenerated_chunks():
     grid = Grid(ColumnPos(0, 0), 4, 4)
-    surface = read_surface(EmptyTerrain(), grid)
-    assert not surface.available.any()
-    assert (surface.height == ABSENT).all()
+    found = survey(EmptyTerrain(), grid)
+    assert not found.available.any()
+    assert (found.height == ABSENT).all()
+    assert found.growth == frozenset()
+    assert found.intruding == frozenset()
 
 
 def test_strata_layer_by_depth():
@@ -617,3 +619,105 @@ def test_a_world_path_resolves_against_its_own_file(tmp_path):
     written = tmp_path / "terraform" / "mainline.toml"
     written.write_text('[terraform]\nworld = "../saves/region"\n')
     assert read_plan(written).world.resolve() == region.resolve()
+
+
+def saved_world(directory, columns, height=64, depth=40):
+    from src.Format.anvil import write_region_files
+    from src.Format.region import BlockRegion
+
+    least = BlockPos(min(x for x, _ in columns), height - depth, min(z for _, z in columns))
+    most = BlockPos(max(x for x, _ in columns), height, max(z for _, z in columns))
+    region = BlockRegion("world", least, most - least + BlockPos(1, 1, 1))
+    for x, z in columns:
+        for y in range(height - depth, height + 1):
+            region.set_state(BlockPos(x, y, z), GRASS if y == height else STONE)
+    directory.mkdir(parents=True, exist_ok=True)
+    write_region_files(region, directory, data_version=3700, merge=False)
+    return directory
+
+
+def test_region_terrain_reads_a_saved_world(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(32) for z in range(32)])
+    terrain = RegionTerrain(saved)
+    assert terrain.generated(0, 0)
+    assert not terrain.generated(40, 40)
+    stack = terrain.column(5, 5)
+    assert stack[-1][1] == GRASS
+    assert stack[-1][0] == 64
+
+
+def test_region_terrain_evicts_chunks_beyond_its_capacity(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(64) for z in range(64)])
+    terrain = RegionTerrain(saved, chunks=2)
+    for x in range(0, 64, 16):
+        for z in range(0, 64, 16):
+            terrain.column(x, z)
+    assert terrain.held_chunks == 2
+
+
+def test_an_evicted_chunk_reads_back_the_same(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(48) for z in range(48)])
+    terrain = RegionTerrain(saved, chunks=1)
+    first = list(terrain.column(3, 3))
+    for x in range(16, 48, 16):
+        terrain.column(x, 0)
+    assert terrain.held_chunks == 1
+    assert list(terrain.column(3, 3)) == first
+
+
+def test_region_terrain_keeps_only_the_top_levels(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(16) for z in range(16)])
+    terrain = RegionTerrain(saved, depth=4)
+    stack = terrain.column(2, 2)
+    assert len(stack) == 5
+    assert stack[0][0] == 60
+    assert stack[-1][0] == 64
+
+
+def test_presence_is_answered_without_decoding(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(16) for z in range(16)])
+    terrain = RegionTerrain(saved)
+    assert terrain.generated(0, 0)
+    assert terrain.held_chunks == 0
+
+
+def test_a_missing_chunk_is_remembered_as_missing(tmp_path):
+    from src.Terraform.region import RegionTerrain
+
+    saved = saved_world(tmp_path / "region", [(x, z) for x in range(16) for z in range(16)])
+    terrain = RegionTerrain(saved)
+    assert not terrain.generated(20, 20)
+    before = terrain.held_entries
+    assert not terrain.generated(20, 20)
+    assert terrain.held_entries == before
+
+
+def test_by_chunk_visits_every_column_once():
+    grid = Grid(ColumnPos(-3, 5), 21, 19)
+    walked = list(grid.by_chunk(8))
+    assert len(walked) == grid.width * grid.depth
+    assert {(row, cell) for row, cell, _ in walked} == {
+        (row, cell) for row in range(grid.depth) for cell in range(grid.width)
+    }
+    for row, cell, column in walked:
+        assert grid.at(column.x, column.z) == (row, cell)
+
+
+def test_by_chunk_finishes_a_chunk_before_the_next():
+    grid = Grid(ColumnPos(0, 0), 32, 32)
+    seen = []
+    for _, _, column in grid.by_chunk(16):
+        chunk = (column.x // 16, column.z // 16)
+        if not seen or seen[-1] != chunk:
+            seen.append(chunk)
+    assert len(seen) == len(set(seen))

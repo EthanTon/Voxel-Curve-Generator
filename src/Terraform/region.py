@@ -1,50 +1,75 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..Core.block.states import BlockState
-from ..Format.anvil import CELLS_PER_SECTION, RegionFile, decode_block_states, region_of
+from ..Format.anvil import (
+    CELLS_PER_SECTION,
+    decode_block_states,
+    read_region_chunk,
+    read_region_index,
+    region_of,
+)
 from ..Format.region import SECTION_SIZE
+
+
+HELD_CHUNKS = 16
+HELD_DEPTH = 32
+HELD_ENTRIES = 8192
+
+ChunkKey = tuple[int, int]
+ColumnKey = tuple[int, int]
+Stack = list[tuple[int, BlockState]]
 
 
 @dataclass(slots=True)
 class RegionTerrain:
     directory: Path
-    _files: dict[tuple[int, int], RegionFile | None] = field(
-        default_factory=dict, init=False
+    chunks: int = HELD_CHUNKS
+    depth: int = HELD_DEPTH
+    entries: int = HELD_ENTRIES
+    _index: OrderedDict[ChunkKey, tuple[Path, int, int] | None] = field(
+        default_factory=OrderedDict, init=False
     )
-    _loaded: set[tuple[int, int]] = field(default_factory=set, init=False)
-    _columns: dict[tuple[int, int], list[tuple[int, BlockState]]] = field(
-        default_factory=dict, init=False
+    _held: OrderedDict[ChunkKey, dict[ColumnKey, Stack]] = field(
+        default_factory=OrderedDict, init=False
     )
+
+    @property
+    def held_chunks(self) -> int:
+        return len(self._held)
+
+    @property
+    def held_entries(self) -> int:
+        return len(self._index)
 
     def generated(self, chunk_x: int, chunk_z: int) -> bool:
-        held = self._region(chunk_x, chunk_z)
-        return held is not None and (chunk_x, chunk_z) in held.chunks
+        return self._entry(chunk_x, chunk_z) is not None
 
     def column(self, x: int, z: int) -> Sequence[tuple[int, BlockState]]:
-        chunk = (x >> 4, z >> 4)
-        if chunk not in self._loaded:
-            self._read(*chunk)
-        return self._columns.get((x, z), ())
+        return self._columns(x >> 4, z >> 4).get((x, z), ())
 
-    def _region(self, chunk_x: int, chunk_z: int) -> RegionFile | None:
-        position = region_of(chunk_x, chunk_z)
-        key = (position.x, position.z)
-        if key not in self._files:
-            path = self.directory / position.file_name
-            self._files[key] = RegionFile.load(path, position) if path.exists() else None
-        return self._files[key]
+    def _columns(self, chunk_x: int, chunk_z: int) -> dict[ColumnKey, Stack]:
+        key = (chunk_x, chunk_z)
+        held = self._held.get(key)
+        if held is None:
+            held = self._decode(key)
+            self._held[key] = held
+            while len(self._held) > self.chunks:
+                self._held.popitem(last=False)
+        else:
+            self._held.move_to_end(key)
+        return held
 
-    def _read(self, chunk_x: int, chunk_z: int) -> None:
-        self._loaded.add((chunk_x, chunk_z))
-        held = self._region(chunk_x, chunk_z)
-        chunk = None if held is None else held.chunks.get((chunk_x, chunk_z))
-        if chunk is None:
-            return
-        gathered: dict[tuple[int, int], list[tuple[int, BlockState]]] = {}
+    def _decode(self, key: ChunkKey) -> dict[ColumnKey, Stack]:
+        entry = self._entry(*key)
+        if entry is None:
+            return {}
+        chunk = read_region_chunk(*entry)
+        gathered: dict[ColumnKey, Stack] = {}
         for section in chunk.get("sections", ()):
             if "block_states" not in section:
                 continue
@@ -54,11 +79,33 @@ class RegionTerrain:
                 state = states[indices[index]]
                 if state.name == "minecraft:air":
                     continue
-                key = (
-                    chunk_x * SECTION_SIZE + (index & 0xF),
-                    chunk_z * SECTION_SIZE + ((index >> 4) & 0xF),
+                column = (
+                    key[0] * SECTION_SIZE + (index & 0xF),
+                    key[1] * SECTION_SIZE + ((index >> 4) & 0xF),
                 )
-                gathered.setdefault(key, []).append((base + (index >> 8), state))
-        for key, stack in gathered.items():
-            stack.sort()
-            self._columns[key] = stack
+                gathered.setdefault(column, []).append((base + (index >> 8), state))
+        return {column: self._topmost(stack) for column, stack in gathered.items()}
+
+    def _topmost(self, stack: Stack) -> Stack:
+        stack.sort()
+        floor = stack[-1][0] - self.depth
+        kept = [each for each in stack if each[0] >= floor]
+        return kept
+
+    def _entry(self, chunk_x: int, chunk_z: int) -> tuple[Path, int, int] | None:
+        key = (chunk_x, chunk_z)
+        if key in self._index:
+            self._index.move_to_end(key)
+            return self._index[key]
+        self._read_index(chunk_x, chunk_z)
+        return self._index.get(key)
+
+    def _read_index(self, chunk_x: int, chunk_z: int) -> None:
+        position = region_of(chunk_x, chunk_z)
+        path = self.directory / position.file_name
+        found = read_region_index(path, position) if path.exists() else {}
+        for key, (offset, sectors) in found.items():
+            self._index[key] = (path, offset, sectors)
+        self._index.setdefault((chunk_x, chunk_z), None)
+        while len(self._index) > self.entries:
+            self._index.popitem(last=False)

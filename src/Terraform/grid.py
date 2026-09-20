@@ -54,6 +54,22 @@ class Grid:
             for cell in range(self.width):
                 yield row, cell, self.column(row, cell)
 
+    def by_chunk(self, size: int = 16) -> Iterator[tuple[int, int, ColumnPos]]:
+        last_x = self.origin.x + self.width - 1
+        last_z = self.origin.z + self.depth - 1
+        for chunk_z in range(self.origin.z // size, last_z // size + 1):
+            for chunk_x in range(self.origin.x // size, last_x // size + 1):
+                for z in range(
+                    max(chunk_z * size, self.origin.z),
+                    min((chunk_z + 1) * size - 1, last_z) + 1,
+                ):
+                    for x in range(
+                        max(chunk_x * size, self.origin.x),
+                        min((chunk_x + 1) * size - 1, last_x) + 1,
+                    ):
+                        row, cell = self.at(x, z)
+                        yield row, cell, ColumnPos(x, z)
+
     def filled(self, value: float, dtype=np.float64) -> Field:
         return np.full(self.shape, value, dtype=dtype)
 
