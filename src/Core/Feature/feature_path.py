@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from math import hypot
 
-from ..CrossSection.turns import CLOCKWISE, Rotation, Turn
+from ..CrossSection.turns import CLOCKWISE, Rotation, Turn, angle_between
 from ..coordinates import BlockPos, Vec3
 
 
@@ -49,6 +50,89 @@ DEFAULT_RULES: tuple[FeaturePathRule, ...] = (
     not_in_previous_delivery,
     not_in_current_delivery,
 )
+
+
+def either(*rules: FeaturePathRule) -> FeaturePathRule:
+    # A point any of these rules would keep. Rules are otherwise all required,
+    # so this is how a point earns its place two different ways.
+    def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
+        return any(each(path, point) for each in rules)
+
+    return rule
+
+
+def apart(spacing: float) -> FeaturePathRule:
+    # Keep a point once it is `spacing` blocks from the last one kept,
+    # measured in plan so a climb does not shorten the gap.
+    def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
+        if not path.points:
+            return True
+        last = path.points[-1].position
+        return hypot(
+            point.position.x - last.x, point.position.z - last.z
+        ) >= spacing
+
+    return rule
+
+
+def every(count: int) -> FeaturePathRule:
+    # Keep a point once `count` path points have passed since the last one
+    # kept. Counted in points rather than blocks, for a run whose points are
+    # not a block apart.
+    def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
+        if not path.points:
+            return True
+        return point.path_index - path.points[-1].path_index >= count
+
+    return rule
+
+
+def turning(angle: float) -> FeaturePathRule:
+    # Keep a point once the path's heading there is `angle` degrees off its
+    # heading at the last point kept.
+    #
+    # This is what holds a wire over the track it spans: the line between two
+    # poles is straight, so bounding how far the track turns between them
+    # bounds how far the wire strays from it. Measured between the headings
+    # rather than along the line between the poles, which on block positions
+    # is quantised to eighths of a turn and says little over a short span.
+    def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
+        if not path.points:
+            return True
+        return abs(angle_between(path.points[-1].gradient, point.gradient)) >= angle
+
+    return rule
+
+
+def ending_at(position: BlockPos) -> FeaturePathRule:
+    # Always keep the point a run ends on. A wire is anchored at both ends,
+    # and so is whatever holds it up; without this a run whose length is not a
+    # whole number of spacings stops short of its own end.
+    #
+    # Matched on the position rather than the path point it came from: one
+    # path point delivers several positions, and only the last is the end.
+    position = BlockPos.coerce(position)
+
+    def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
+        return point.position == position
+
+    return rule
+
+
+def spacing_rules(
+    spacing: float, angle: float, by_index: bool = False
+) -> tuple[FeaturePathRule, ...]:
+    # Where something placed at intervals along a path sits: far enough
+    # along it, or far enough round from the last one. Either on its own is
+    # the whole rule; neither keeps every point.
+    rules = []
+    if spacing > 0:
+        rules.append(every(int(spacing)) if by_index else apart(spacing))
+    if angle > 0:
+        rules.append(turning(angle))
+    if not rules:
+        return ()
+    return (either(*rules),)
 
 
 class FeaturePath:

@@ -1,0 +1,1133 @@
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from src.Assembly import assemble
+from src.Parser import load, parse
+from src.Assembly.assemble import (
+    fitted_sections,
+    points_for,
+    strand_of,
+    runs_under,
+    sweep,
+)
+from src.Assembly.structure import (
+    build_domains,
+    build_elevation_frames,
+    build_path_frames,
+    build_path,
+    build_schedules,
+    build_sections,
+    build_structure,
+    resolve_spans,
+)
+from src.Parser.spec import SectionElevation
+from src.Core.coordinates import BlockPos, ColumnPos
+from src.Core.block.connectivity_options import ConnectionAction
+from src.Core.modes import (
+    ElevationMode,
+    PlacementMode,
+    StepMode,
+    TerrainMaskMode,
+)
+from src.Core.Field.block_field import BlockField
+from src.Core.block.registry import BlockRegistry
+from src.Core.block.states import BlockState
+from src.Format.region import BlockRegion
+from src.Format.schematics import state_key, write_schematic
+
+
+def config(**overrides) -> dict:
+    data = {
+        "path": {
+            "points": [[0, 64, 0], [1, 64, 0], [2, 64, 0]],
+            "gradients": [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        },
+        "output": {"path": "out.litematic"},
+        "domain": [{"name": "rail"}],
+    }
+    data.update(overrides)
+    return data
+
+
+class SectionTestCase(unittest.TestCase):
+    def sectioned(self, spans=None, **overrides) -> dict:
+        data = config(
+            path={
+                "points": [[n, 64, 0] for n in range(5)],
+                "gradients": [[1, 0, 0]] * 5,
+            },
+            marker={
+                "start": [0, 0],
+                "bridge_in": [1, 0],
+                "bridge_out": [2, 0],
+                "brim_in": [3, 0],
+                "end": [4, 0],
+            },
+        )
+        data["section"] = [
+            {
+                "name": "standard",
+                "domain": "rail",
+                "schematic": "schems/stdtrack.schem",
+                "width": 21,
+                "depth": 7,
+                **overrides,
+            }
+        ]
+        data["assignment"] = [
+            {"from": start, "to": stop, "sections": ["standard"]}
+            for start, stop in ([["start", "bridge_in"]] if spans is None else spans)
+        ]
+        return data
+
+
+
+class SectionTests(SectionTestCase):
+    def assigned(self, **overrides) -> dict:
+        data = self.sectioned()
+        data["assignment"] = [{"sections": ["standard"], **overrides}]
+        return data
+
+    def test_a_section_says_what_it_is_not_where_it_goes(self) -> None:
+        section = parse(self.sectioned()).section("standard")
+
+        self.assertEqual(section.schematic, Path("schems/stdtrack.schem"))
+        self.assertEqual(section.domain, "rail")
+        self.assertEqual(section.width, 21)
+        self.assertEqual(section.elevation, SectionElevation.FOLLOW)
+
+    def test_an_assignment_says_where_a_section_goes(self) -> None:
+        assignment = parse(self.sectioned()).assignments[0]
+
+        self.assertEqual(assignment.sections, ("standard",))
+        self.assertEqual(str(assignment.span), "start..bridge_in")
+
+    def test_a_stretch_may_give_its_own_columns(self) -> None:
+        spec = parse(self.assigned(**{"from": [0, 0], "to": [2, 0]}))
+
+        self.assertEqual(str(spec.assignments[0].span), "(0, 0)..(2, 0)")
+
+    def test_one_stretch_may_carry_several_sections(self) -> None:
+        data = self.sectioned()
+        data["section"].append(
+            {"name": "brim", "domain": "rail", "schematic": "brim.schem"}
+        )
+        data["assignment"][0]["sections"].append("brim")
+
+        self.assertEqual(
+            parse(data).assignments[0].sections, ("standard", "brim")
+        )
+
+    def test_elevation_is_read_by_name(self) -> None:
+        section = parse(self.sectioned(elevation="min")).section("standard")
+
+        self.assertEqual(section.elevation, SectionElevation.MIN)
+
+    def test_an_unknown_marker_names_what_wanted_it(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "a stretch assigned standard names marker 'nowhere'"
+        ):
+            parse(self.assigned(**{"from": "start", "to": "nowhere"}))
+
+    def test_a_stretch_needs_a_start_and_a_stop(self) -> None:
+        with self.assertRaisesRegex(ValueError, "missing required key 'to'"):
+            parse(self.assigned(**{"from": "start"}))
+
+    def test_a_stretch_may_not_end_where_it_starts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ends where it starts"):
+            parse(self.assigned(**{"from": "start", "to": "start"}))
+
+    def test_a_stretch_must_be_assigned_something(self) -> None:
+        data = self.sectioned()
+        data["assignment"][0]["sections"] = []
+
+        with self.assertRaisesRegex(ValueError, "assigned no sections"):
+            parse(data)
+
+    def test_an_assignment_must_name_a_section_that_exists(self) -> None:
+        data = self.sectioned()
+        data["assignment"][0]["sections"] = ["nowhere"]
+
+        with self.assertRaisesRegex(KeyError, "No section named 'nowhere'"):
+            parse(data)
+
+
+
+
+class SpanResolutionTests(SectionTestCase):
+    def resolve(self, spans=None, **overrides):
+        data = self.sectioned(spans, **overrides)
+        spec = parse(data)
+        return resolve_spans(spec, build_path(spec))
+
+    def test_spans_become_path_indices(self) -> None:
+        self.assertEqual(self.resolve(), {"standard": ((0, 1),)})
+
+    def test_disjoint_spans_are_kept_in_path_order(self) -> None:
+        resolved = self.resolve(
+            spans=[["brim_in", "end"], ["start", "bridge_in"]]
+        )
+
+        self.assertEqual(resolved, {"standard": ((0, 1), (3, 4))})
+
+    def test_overlapping_stretches_of_one_section_become_one(self) -> None:
+        resolved = self.resolve(
+            spans=[["start", "bridge_out"], ["bridge_in", "end"]]
+        )
+
+        self.assertEqual(resolved, {"standard": ((0, 4),)})
+
+    def test_stretches_that_meet_become_one_sweep(self) -> None:
+        # Spans are inclusive at both ends, so a section carried along two
+        # stretches in a row is one sweep, not two that collide at the join.
+        resolved = self.resolve(
+            spans=[["start", "bridge_in"], ["bridge_in", "bridge_out"]]
+        )
+
+        self.assertEqual(resolved, {"standard": ((0, 2),)})
+
+    def test_a_span_may_not_run_backwards(self) -> None:
+        with self.assertRaisesRegex(ValueError, "runs backwards"):
+            self.resolve(spans=[["bridge_out", "start"]])
+
+    def test_a_marker_off_the_path_is_refused(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, r"but \(9, 9\) is not a point on the path"
+        ):
+            self.resolve(spans=[["start", [9, 9]]])
+
+    def test_sections_may_stack_on_the_same_stretch(self) -> None:
+        data = self.sectioned()
+        data["section"].append(
+            {
+                "name": "standardbrim",
+                "domain": "rail",
+                "schematic": "schems/stdbrim1.schem",
+            }
+        )
+        data["assignment"][0]["sections"].append("standardbrim")
+        spec = parse(data)
+
+        resolved = resolve_spans(spec, build_path(spec))
+
+        self.assertEqual(resolved, {"standard": ((0, 1),), "standardbrim": ((0, 1),)})
+
+
+
+class SchematicTests(SectionTestCase):
+    def profile(self, directory: Path, name="stdtrack", blocks=None,
+                block="minecraft:stone") -> Path:
+        # A 3-wide, 1-deep profile, written as a real .schem. The Offset is
+        # what centres it on the path, so it is written too.
+        registry = BlockRegistry()
+        field = BlockField(registry.palette)
+        for position in blocks or [(-1, 0, 0), (0, 0, 0), (1, 0, 0)]:
+            field.set_block(position, BlockState.create(block))
+        directory.mkdir(parents=True, exist_ok=True)
+        region = BlockRegion.from_field(field, name=name)
+        return write_schematic(
+            region, directory / f"{name}.schem",
+            data_version=3700, offset=region.origin,
+        )
+
+    def built(self, directory, **overrides):
+        data = self.sectioned(**overrides)
+        data["section"][0]["schematic"] = "schems/stdtrack.schem"
+        self.profile(Path(directory) / "schems")
+        spec = parse(data, Path(directory))
+        registry = BlockRegistry()
+        domains = build_domains(spec)
+        return spec, registry, domains, build_path(spec)
+
+    def test_a_schematic_becomes_the_sections_swept_profile(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=3, depth=1)
+
+            section = build_sections(
+                spec, registry, domains, resolve_spans(spec, path)
+            )["standard"]
+
+        self.assertEqual(len(section.points), 1)
+        annotation = next(iter(section.points))
+        self.assertEqual(annotation.name, "standard")
+        self.assertEqual(len(annotation.feature.blocks), 3)
+
+    def test_a_section_takes_its_domain(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=3, depth=1)
+
+            section = build_sections(
+                spec, registry, domains, resolve_spans(spec, path)
+            )["standard"]
+
+        annotation = next(iter(section.points))
+        self.assertEqual(annotation.feature.domain, domains.get("rail"))
+
+    def test_a_declared_width_must_match_the_schematic(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=21)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "declares a width of 21, but its schematic is 3 across",
+            ):
+                build_sections(spec, registry, domains, resolve_spans(spec, path))
+
+    def test_an_undeclared_extent_is_not_checked(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=0, depth=0)
+
+            self.assertIn(
+                "standard",
+                build_sections(spec, registry, domains, resolve_spans(spec, path)),
+            )
+
+    def test_a_missing_schematic_says_where_it_looked(self) -> None:
+        data = self.sectioned()
+        spec = parse(data, Path("/nowhere"))
+
+        with self.assertRaisesRegex(
+            ValueError, "section 'standard' has no schematic at /nowhere"
+        ):
+            build_sections(
+                spec, BlockRegistry(), build_domains(spec),
+                resolve_spans(spec, build_path(spec)),
+            )
+
+    def test_spans_become_a_schedule_of_the_section(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=3, depth=1)
+
+            schedules = build_schedules(
+            build_sections(spec, registry, domains, resolve_spans(spec, path)),
+            resolve_spans(spec, path),
+            len(path.path_points),
+        )
+
+        schedule = schedules["standard"]
+        self.assertEqual(
+            [(span.path_start, span.path_stop) for span in schedule.spans], [(0, 1)]
+        )
+        self.assertIsNotNone(schedule.at(0))
+        self.assertIsNone(schedule.at(3))
+
+    def test_stacked_sections_each_get_their_own_schedule(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1)
+            data["section"].append(
+                {
+                    "name": "standardbrim",
+                    "domain": "rail",
+                    "schematic": "schems/stdbrim1.schem",
+                }
+            )
+            data["assignment"][0]["sections"].append("standardbrim")
+            self.profile(Path(directory) / "schems")
+            self.profile(Path(directory) / "schems", "stdbrim1")
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            path = build_path(spec)
+            spans = resolve_spans(spec, path)
+
+            sections = build_sections(spec, registry, domains, spans)
+            schedules = build_schedules(sections, spans, len(path.path_points))
+
+        self.assertEqual(sorted(schedules), ["standard", "standardbrim"])
+
+
+
+class FrameTests(SchematicTests):
+    def framed(self, directory, points=None, **overrides):
+        # A single-block profile, so a lead of one point is enough for it.
+        data = self.sectioned(width=1, depth=1, **overrides)
+        data["path"]["lead"] = 1
+        if points is not None:
+            data["path"]["points"] = points
+        self.profile(Path(directory) / "schems", blocks=[(0, 0, 0)])
+        spec = parse(data, Path(directory))
+        registry = BlockRegistry()
+        domains = build_domains(spec)
+        path = build_path(spec)
+        sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+        schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+        return spec, schedules, path
+
+    def test_a_level_path_is_one_elevation_frame(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, schedules, path = self.framed(directory)
+            sections = [s.section for q in schedules.values() for s in q.spans]
+
+            elevation = build_elevation_frames(spec, path, sections)
+
+        self.assertEqual(len(elevation), 1)
+        self.assertEqual(elevation[0].y_offset, 64)
+
+    def test_the_path_changing_height_breaks_it_into_frames(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, schedules, path = self.framed(
+                directory,
+                points=[[0, 64, 0], [1, 64, 0], [2, 66, 0], [3, 66, 0], [4, 66, 0]],
+            )
+            sections = [s.section for q in schedules.values() for s in q.spans]
+
+            elevation = build_elevation_frames(spec, path, sections)
+
+        self.assertEqual([frame.y_offset for frame in elevation], [64, 66])
+        # Index 3, not 2: a lead of one point shifts the path proper along.
+        self.assertEqual(elevation[1].path_start, 3)
+
+    def test_section_frames_cut_at_levels_and_at_span_ends(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, schedules, path = self.framed(
+                directory,
+                points=[[0, 64, 0], [1, 64, 0], [2, 64, 0], [3, 66, 0], [4, 66, 0]],
+                spans=[["start", "bridge_in"]],
+            )
+
+            frames = build_path_frames(spec, schedules, path)
+
+        # Cut where the section runs out (3) and where the level changes (4).
+        self.assertEqual([frame.path_start for frame in frames], [1, 3, 4])
+        self.assertEqual([frame.y_offset for frame in frames], [64, 64, 66])
+
+    def test_every_frame_clips_its_own_columns(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, schedules, path = self.framed(directory)
+
+            frames = build_path_frames(spec, schedules, path)
+
+        # A frame is a ColumnMask: adjacent frames share a boundary and the
+        # half-open convention puts each column in exactly one of them.
+        inside = [frame for frame in frames if frame.contains(0.0, 0.0)]
+        self.assertEqual(len(inside), 1)
+
+    def test_a_short_lead_says_how_much_is_needed(self) -> None:
+        with TemporaryDirectory() as directory:
+            # A five-wide profile reaches further than a lead of nothing.
+            data = self.sectioned(width=5, depth=1)
+            self.profile(
+                Path(directory) / "schems",
+                blocks=[(x, 0, 0) for x in range(-2, 3)],
+            )
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            path = build_path(spec)
+            sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+            schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+
+            with self.assertRaisesRegex(
+                ValueError, r"need a lead of \d+ points at each end, and the path gives 0"
+            ):
+                build_path_frames(spec, schedules, path)
+
+
+
+class SweepTests(SchematicTests):
+    def swept(self, directory, **overrides):
+        data = self.sectioned(width=3, depth=1, **overrides)
+        data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 9
+        data["path"]["lead"] = 3
+        self.profile(Path(directory) / "schems")
+        spec = parse(data, Path(directory))
+        registry = BlockRegistry()
+        domains = build_domains(spec)
+        path = build_path(spec)
+        sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+        schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+        frames = build_path_frames(spec, schedules, path)
+        return sweep(spec, schedules, path, frames)
+
+    def test_a_section_sweeps_into_one_run_per_span(self) -> None:
+        with TemporaryDirectory() as directory:
+            runs = self.swept(directory, spans=[["start", "bridge_in"],
+                                                ["brim_in", "end"]])
+
+        self.assertEqual([run.span for run in runs], [0, 1])
+        self.assertEqual({run.annotation.name for run in runs}, {"standard"})
+
+    def test_a_run_keeps_the_annotations_own_feature(self) -> None:
+        with TemporaryDirectory() as directory:
+            runs = self.swept(directory)
+
+        feature = runs[0].annotation.feature
+        self.assertEqual(feature.elevation_mode, ElevationMode.RIGID)
+        self.assertEqual(len(feature.blocks), 3)
+
+    def test_every_delivered_point_carries_its_frames_level(self) -> None:
+        with TemporaryDirectory() as directory:
+            runs = self.swept(
+                directory,
+                spans=[["start", "end"]],
+            )
+
+        levels = {point.y_offset for run in runs for point in run.path}
+        self.assertEqual(levels, {64})
+
+    def test_a_climb_gives_a_run_points_at_both_levels(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+            data["path"]["points"] = [[n, 64 + (n >= 3), 0] for n in range(9)]
+            data["path"]["gradients"] = [[1, 0, 0]] * 9
+            data["path"]["lead"] = 3
+            self.profile(Path(directory) / "schems")
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            path = build_path(spec)
+            sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+            schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+            frames = build_path_frames(spec, schedules, path)
+
+            runs = sweep(spec, schedules, path, frames)
+
+        # One run across the break, carrying both levels.
+        self.assertEqual(len(runs), 1)
+        self.assertEqual({point.y_offset for point in runs[0].path}, {64, 65})
+
+    def test_stacked_sections_sweep_into_separate_runs(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1)
+            data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+            data["path"]["gradients"] = [[1, 0, 0]] * 9
+            data["path"]["lead"] = 3
+            data["section"].append(
+                {
+                    "name": "standardbrim",
+                    "domain": "rail",
+                    "width": 3,
+                    "depth": 1,
+                    "schematic": "schems/stdbrim1.schem",
+                }
+            )
+            data["assignment"][0]["sections"].append("standardbrim")
+            self.profile(Path(directory) / "schems")
+            self.profile(Path(directory) / "schems", "stdbrim1")
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            path = build_path(spec)
+            sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+            schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+            frames = build_path_frames(spec, schedules, path)
+
+            runs = sweep(spec, schedules, path, frames)
+
+        self.assertEqual(
+            sorted(run.annotation.name for run in runs),
+            ["standard", "standardbrim"],
+        )
+
+    def test_a_swept_section_reaches_the_world(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+            data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+            data["path"]["gradients"] = [[1, 0, 0]] * 9
+            data["path"]["lead"] = 3
+            self.profile(Path(directory) / "schems")
+
+            world = assemble(parse(data, Path(directory)))
+
+        # Three columns wide, across travel rather than along it.
+        columns = {(position.x, position.z) for position in world.iter_source_positions()}
+        self.assertEqual({z for _, z in columns}, {-1, 0, 1})
+
+
+
+class StructureTests(SweepTests):
+    def structured(self, directory, **overrides):
+        data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+        data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 9
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = [8, 0]
+        data["structure"] = [
+            {
+                "name": "pillar",
+                "domain": "rail",
+                "sections": ["standard"],
+                "headings": {"0.0": "schems/pillar.schem"},
+                **overrides,
+            }
+        ]
+        self.profile(Path(directory) / "schems")
+        self.profile(Path(directory) / "schems", "pillar", blocks=[(0, 0, 0)],
+                     block="minecraft:gold_block")
+        return data
+
+    def test_a_structure_names_its_sections_and_schematics(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec = parse(self.structured(directory), Path(directory))
+
+        structure = spec.structure("pillar")
+        self.assertEqual(structure.sections, ("standard",))
+        self.assertEqual(structure.resolution, 90.0)
+        self.assertEqual(list(structure.headings), [0.0])
+
+    def test_one_schematic_covers_every_quadrant(self) -> None:
+        # A resolution of 90 has one authored heading; quarter turns do the rest.
+        with TemporaryDirectory() as directory:
+            spec = parse(self.structured(directory), Path(directory))
+            domains = build_domains(spec)
+
+            stamp = build_structure(spec.structure("pillar"), BlockRegistry(), domains)
+
+        self.assertEqual(stamp.headings, (0.0,))
+        self.assertEqual(stamp.at(180.0)[1], 2)
+
+    def test_an_unquoted_heading_says_to_quote_it(self) -> None:
+        # TOML reads a bare 0.0 as a dotted key, so it arrives nested.
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory)
+            data["structure"][0]["headings"] = {"0": {"0": "schems/pillar.schem"}}
+
+            with self.assertRaisesRegex(ValueError, "write it quoted"):
+                parse(data, Path(directory))
+
+    def test_a_finer_resolution_needs_every_heading(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, resolution=22.5)
+
+            with self.assertRaisesRegex(
+                ValueError, r"missing \[22.5, 45.0, 67.5\]"
+            ):
+                parse(data, Path(directory))
+
+    def test_a_structure_must_ride_on_something(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, sections=[])
+
+            with self.assertRaisesRegex(ValueError, "assigned to no sections"):
+                parse(data, Path(directory))
+
+    def test_an_unknown_section_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, sections=["nowhere"])
+
+            with self.assertRaisesRegex(KeyError, "No section named 'nowhere'"):
+                parse(data, Path(directory))
+
+    def test_a_negative_spacing_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, spacing=-1)
+
+            with self.assertRaisesRegex(ValueError, "negative spacing"):
+                parse(data, Path(directory))
+
+    def test_an_angle_must_be_a_turn(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, angle=200)
+
+            with self.assertRaisesRegex(ValueError, "between 0 and 180 degrees"):
+                parse(data, Path(directory))
+
+    def test_a_bend_earns_a_structure_of_its_own(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory, spacing=0, angle=45)
+            # Straight for five, then a diagonal.
+            data["path"]["points"] = [
+                *[[n, 64, 0] for n in range(5)],
+                *[[5 + n, 64, -n] for n in range(1, 4)],
+            ]
+            data["path"]["gradients"] = [*[[1, 0, 0]] * 5, *[[1, 0, -1]] * 3]
+            data["marker"]["end"] = [7, -2]
+
+            world = assemble(parse(data, Path(directory)))
+            marks = sorted(
+                (position.x, position.z)
+                for position in world.iter_source_positions()
+                if world.registry.get_state(
+                    world.get_block_id(position)
+                ).name.endswith("gold_block")
+            )
+
+        # One where the run starts, one where it turns, one where it ends.
+        self.assertEqual(len(marks), 3)
+        self.assertEqual(marks[0], (0, 0))
+
+    def test_it_rides_only_the_runs_of_its_own_sections(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.structured(directory)
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            path = build_path(spec)
+            sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+            schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+            frames = build_path_frames(spec, schedules, path)
+            runs = sweep(spec, schedules, path, frames)
+
+        carried = runs_under(spec, spec.structure("pillar"), runs)
+        self.assertEqual([run.annotation.name for run in carried], ["standard"])
+        self.assertEqual(runs_under(spec, spec.structure("pillar"), ()), ())
+
+    def test_spacing_thins_a_structure_along_its_section(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.structured(directory, spacing=3),
+                                   Path(directory)))
+            marks = sorted(
+                position.x
+                for position in world.iter_source_positions()
+                if world.registry.get_state(
+                    world.get_block_id(position)
+                ).name.endswith("gold_block")
+            )
+
+        # Every three blocks along, rather than at every point, and the end.
+        self.assertEqual(marks, [0, 3, 6, 7])
+
+    def test_without_spacing_it_lands_at_every_point(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.structured(directory), Path(directory)))
+            marks = sorted(
+                position.x
+                for position in world.iter_source_positions()
+                if world.registry.get_state(
+                    world.get_block_id(position)
+                ).name.endswith("gold_block")
+            )
+
+        self.assertEqual(marks, [0, 1, 2, 3, 4, 5, 6, 7])
+
+    def test_an_offset_turns_with_the_structure(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.structured(directory, spacing=8,
+                                                   offset=[2, 0, 0]),
+                                   Path(directory)))
+            marks = [
+                tuple(position)
+                for position in world.iter_source_positions()
+                if world.registry.get_state(
+                    world.get_block_id(position)
+                ).name.endswith("gold_block")
+            ]
+
+        # Travelling east, two to the right of travel is two south. The run
+        # ends anchored, so the far end carries one too.
+        self.assertEqual(marks, [(0, 64, 2), (7, 64, 2)])
+
+
+
+class WireTests(SweepTests):
+    def wired(self, directory, **overrides):
+        data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+        data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 9
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = [8, 0]
+        data["wire"] = [
+            {
+                "name": "catenary",
+                "domain": "rail",
+                "sections": ["standard"],
+                "schematic": "schems/wire.schem",
+                "spacing": 4,
+                **overrides,
+            }
+        ]
+        self.profile(Path(directory) / "schems")
+        self.profile(Path(directory) / "schems", "wire", blocks=[(0, 0, 0)],
+                     block="minecraft:tripwire")
+        return data
+
+    def prepared(self, directory, **overrides):
+        spec = parse(self.wired(directory, **overrides), Path(directory))
+        registry = BlockRegistry()
+        domains = build_domains(spec)
+        path = build_path(spec)
+        sections = build_sections(spec, registry, domains, resolve_spans(spec, path))
+        schedules = build_schedules(
+            sections, resolve_spans(spec, path), len(path.path_points)
+        )
+        frames = build_path_frames(spec, schedules, path)
+        runs = sweep(spec, schedules, path, frames)
+        return spec, runs, registry, domains
+
+    def strand(self, world):
+        return sorted(
+            tuple(position)
+            for position in world.iter_source_positions()
+            if world.registry.get_state(
+                world.get_block_id(position)
+            ).name.endswith("tripwire")
+        )
+
+    def test_a_wire_names_its_sections_and_stepping(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec = parse(self.wired(directory), Path(directory))
+
+        wire = spec.wire("catenary")
+        self.assertEqual(wire.sections, ("standard",))
+        self.assertEqual(wire.step, StepMode.MANHATTAN)
+        self.assertEqual(wire.spacing, 4)
+
+    def test_stepping_is_read_by_name(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec = parse(self.wired(directory, step="chebyshev"), Path(directory))
+
+        self.assertEqual(spec.wire("catenary").step, StepMode.CHEBYSHEV)
+
+    def test_a_wire_must_ride_on_something(self) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "not both and not neither"):
+                parse(self.wired(directory, sections=[]), Path(directory))
+
+    def test_a_negative_spacing_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "wire 'catenary' has a negative"):
+                parse(self.wired(directory, spacing=-1), Path(directory))
+
+    def test_a_wire_runs_from_pole_to_pole(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.wired(directory), Path(directory)))
+
+        # Poles every four blocks along a run of eight: an unbroken strand
+        # from the first to the last, not a block at each pole.
+        self.assertEqual(
+            self.strand(world),
+            [(x, 64, 0) for x in range(0, 8)],
+        )
+
+    def test_an_offset_hangs_the_wire_off_the_path(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(
+                parse(self.wired(directory, offset=[1, 3, 0]), Path(directory))
+            )
+
+        # Three up and one to the right of travel, which heading east is south.
+        self.assertEqual(self.strand(world), [(x, 67, 1) for x in range(0, 8)])
+
+    def test_a_wire_is_one_placement_however_long_it_runs(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, runs, registry, domains = self.prepared(directory)
+            world = assemble(spec)
+
+        wires = [
+            placement
+            for placement in world.instances
+            if placement.connectivity_domain == domains.id_of("rail")
+            and len(placement.field) > 3
+        ]
+        self.assertEqual(len(wires), 1)
+
+    def test_a_wire_spans_its_run_however_wide_the_spacing(self) -> None:
+        # The run's last point is a pole whatever the spacing, so a wire too
+        # long to be spaced still reaches from one end to the other.
+        with TemporaryDirectory() as directory:
+            spec, runs, registry, domains = self.prepared(directory, spacing=100)
+            strand = strand_of(spec, spec.wire("catenary"), runs[0])
+
+        self.assertEqual(min(strand).x, 0)
+        self.assertEqual(max(strand).x, 7)
+
+    def test_manhattan_stepping_keeps_the_strand_face_connected(self) -> None:
+        with TemporaryDirectory() as directory:
+            spec, runs, registry, domains = self.prepared(
+                directory, offset=[0, 2, 0], spacing=4
+            )
+            # Segments share the pole they meet at, so the strand is deduped.
+            blocks = sorted(set(strand_of(spec, spec.wire("catenary"), runs[0])))
+
+        for before, after in zip(blocks, blocks[1:]):
+            self.assertEqual(
+                sum(abs(after[axis] - before[axis]) for axis in range(3)), 1
+            )
+
+
+
+class DropperTests(SweepTests):
+    def hung(self, directory, points=None, gradients=None, **overrides):
+        data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+        count = 25 if points is None else len(points)
+        data["path"]["points"] = points or [[n, 64, 0] for n in range(count)]
+        data["path"]["gradients"] = gradients or [[1, 0, 0]] * count
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = data["path"]["points"][-1][::2]
+        strand = lambda name, offset: {
+            "name": name, "domain": "rail", "sections": ["standard"],
+            "schematic": "schems/wire.schem", "offset": offset,
+            "spacing": 8, "step": "chebyshev",
+        }
+        data["wire"] = [
+            strand("messenger", [0, 6, 0]),
+            strand("contact", [0, 3, 0]),
+            {
+                "name": "dropper", "domain": "rail",
+                "between": ["messenger", "contact"],
+                "schematic": "schems/drop.schem", "spacing": 4,
+                "step": "manhattan", **overrides,
+            },
+        ]
+        self.profile(Path(directory) / "schems")
+        self.profile(Path(directory) / "schems", "wire", blocks=[(0, 0, 0)],
+                     block="minecraft:tripwire")
+        self.profile(Path(directory) / "schems", "drop", blocks=[(0, 0, 0)],
+                     block="minecraft:chain")
+        return data
+
+    def chains(self, world):
+        return sorted(
+            (position.x, position.y, position.z)
+            for position in world.iter_source_positions()
+            if world.registry.get_state(
+                world.get_block_id(position)
+            ).name.endswith("chain")
+        )
+
+    def test_a_wire_runs_along_sections_or_between_wires(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.hung(directory, sections=["standard"])
+
+            with self.assertRaisesRegex(ValueError, "not both and not neither"):
+                parse(data, Path(directory))
+
+    def test_a_dropper_stretches_between_exactly_two(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.hung(directory, between=["messenger"])
+
+            with self.assertRaisesRegex(ValueError, "and names 1"):
+                parse(data, Path(directory))
+
+    def test_a_dropper_may_not_hang_from_another_dropper(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.hung(directory)
+            data["wire"].append({
+                "name": "second", "domain": "rail",
+                "between": ["dropper", "messenger"],
+                "schematic": "schems/drop.schem",
+            })
+
+            with self.assertRaisesRegex(
+                ValueError, "which is itself stretched between other wires"
+            ):
+                parse(data, Path(directory))
+
+    def test_a_dropper_rides_whatever_the_wires_it_joins_ride(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.hung(directory)
+            spec = parse(data, Path(directory))
+
+            self.assertEqual(
+                fitted_sections(spec, spec.wire("dropper")), ("standard",)
+            )
+
+    def test_droppers_hang_at_their_own_spacing(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.hung(directory), Path(directory)))
+
+        columns = sorted({x for x, _, _ in self.chains(world)})
+        # Every four, and the point the run ends on whatever the spacing.
+        self.assertEqual(columns, [0, 4, 8, 12, 16, 20, 23])
+
+    def test_a_dropper_reaches_from_one_wire_to_the_other(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.hung(directory), Path(directory)))
+
+        at_start = sorted(y for x, y, _ in self.chains(world) if x == 0)
+        self.assertEqual(at_start, [67, 68, 69, 70])
+
+    def test_a_dropper_hangs_from_where_a_wire_actually_is(self) -> None:
+        # Poles every eight over a bend: between them the wire lies on the
+        # straight line, so a dropper reaches that rather than the offset.
+        with TemporaryDirectory() as directory:
+            points = [[n, 64, 0] for n in range(9)]
+            points += [[8 + n, 64, -n] for n in range(1, 9)]
+            gradients = [[1, 0, 0]] * 9 + [[1, 0, -1]] * 8
+            world = assemble(
+                parse(self.hung(directory, points, gradients), Path(directory))
+            )
+
+        # Every dropper still finds both wires, none silently missing.
+        self.assertEqual(len({x for x, _, _ in self.chains(world)}), 6)
+
+
+
+class LaneTests(SweepTests):
+    def laned(self, directory, **overrides):
+        data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+        data["path"]["points"] = [[n, 64, 0] for n in range(17)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 17
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = [16, 0]
+        data["lane"] = [
+            {
+                "name": "centre",
+                "domain": "rail",
+                "sections": ["standard"],
+                "block": "minecraft:white_concrete",
+                "on": 3,
+                "off": 5,
+                **overrides,
+            }
+        ]
+        self.profile(Path(directory) / "schems")
+        return data
+
+    def marks(self, world):
+        return sorted(
+            position.x
+            for position in world.iter_source_positions()
+            if world.registry.get_state(
+                world.get_block_id(position)
+            ).name.endswith("white_concrete")
+        )
+
+    def test_a_lane_is_a_dash_and_a_gap_over_and_over(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.laned(directory), Path(directory)))
+
+        # Three on, five off, from where the run starts.
+        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10])
+
+    def test_a_lane_may_be_counted_in_blocks(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(
+                parse(self.laned(directory, measure="distance"), Path(directory))
+            )
+
+        # The run's points are a block apart, so both measures agree here.
+        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10])
+
+    def test_a_lane_takes_a_block_or_a_schematic(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.laned(directory, schematic="schems/stdtrack.schem")
+
+            with self.assertRaisesRegex(ValueError, "not both and not neither"):
+                parse(data, Path(directory))
+
+    def test_a_lane_needs_one_of_them(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.laned(directory)
+            del data["lane"][0]["block"]
+
+            with self.assertRaisesRegex(ValueError, "not both and not neither"):
+                parse(data, Path(directory))
+
+    def test_a_dash_keeps_at_least_one_block(self) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "at least one block"):
+                parse(self.laned(directory, on=0), Path(directory))
+
+    def test_a_gap_may_be_nothing_at_all(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.laned(directory, off=0), Path(directory)))
+
+        self.assertEqual(self.marks(world), list(range(0, 16)))
+
+    def test_a_negative_gap_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "no blocks at all"):
+                parse(self.laned(directory, off=-1), Path(directory))
+
+    def test_a_lane_is_offset_the_way_the_path_faces(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = assemble(
+                parse(self.laned(directory, offset=[1, 1, 0]), Path(directory))
+            )
+            columns = sorted(
+                (position.x, position.y, position.z)
+                for position in world.iter_source_positions()
+                if world.registry.get_state(
+                    world.get_block_id(position)
+                ).name.endswith("white_concrete")
+            )
+
+        # One up and one right of travel, which heading east is south.
+        self.assertEqual(columns[0], (0, 65, 1))
+
+
+
+
+class BuildOrderTests(SweepTests):
+    def ordered(self, directory, deck_order, paint_order):
+        data = self.sectioned(width=1, depth=1, spans=[["start", "end"]])
+        data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 9
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = [8, 0]
+        data["domain"] = [
+            {"name": "rail", "order": deck_order,
+             "placement": {"mode": "OVERWRITE"}},
+            {"name": "paint", "order": paint_order,
+             "placement": {"mode": "OVERWRITE"}},
+        ]
+        data["lane"] = [
+            {"name": "line", "domain": "paint", "sections": ["standard"],
+             "block": "minecraft:white_concrete", "on": 1, "off": 0},
+        ]
+        self.profile(Path(directory) / "schems", blocks=[(0, 0, 0)])
+        return assemble(parse(data, Path(directory)))
+
+    def blocks_in(self, world):
+        return {
+            world.registry.get_state(world.get_block_id(position)).name
+            for position in world.iter_source_positions()
+        }
+
+    def test_a_later_domain_covers_an_earlier_one(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = self.ordered(directory, deck_order=0, paint_order=1)
+
+        self.assertEqual(self.blocks_in(world), {"minecraft:white_concrete"})
+
+    def test_an_earlier_domain_is_covered_by_what_follows(self) -> None:
+        with TemporaryDirectory() as directory:
+            world = self.ordered(directory, deck_order=1, paint_order=0)
+
+        self.assertEqual(self.blocks_in(world), {"minecraft:stone"})
+
+    def test_a_section_takes_its_domains_placement_mode(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1)
+            data["domain"] = [{"name": "rail",
+                               "placement": {"mode": "KEEP_EXISTING"}}]
+            self.profile(Path(directory) / "schems")
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            spans = resolve_spans(spec, build_path(spec))
+
+            section = build_sections(spec, registry, domains, spans)["standard"]
+
+        annotation = next(iter(section.points))
+        self.assertEqual(
+            annotation.feature.placement_mode, PlacementMode.KEEP_EXISTING
+        )
+
+    def test_a_section_may_override_its_domain(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1,
+                                  placement_mode="REPLACE_AIR_ONLY")
+            data["domain"] = [{"name": "rail",
+                               "placement": {"mode": "KEEP_EXISTING"}}]
+            self.profile(Path(directory) / "schems")
+            spec = parse(data, Path(directory))
+            registry = BlockRegistry()
+            domains = build_domains(spec)
+            spans = resolve_spans(spec, build_path(spec))
+
+            section = build_sections(spec, registry, domains, spans)["standard"]
+
+        annotation = next(iter(section.points))
+        self.assertEqual(
+            annotation.feature.placement_mode, PlacementMode.REPLACE_AIR_ONLY
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

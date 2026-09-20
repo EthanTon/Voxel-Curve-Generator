@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+import tomllib
+from collections.abc import Mapping
+from pathlib import Path
+
+from ..Core.coordinates import BlockPos, ColumnPos, Vec3
+from .spec import OutputSpec, PathSpec
+from .values import read_column, require
+
+
+def read_path(data: Mapping, base: Path = Path(".")) -> PathSpec:
+    source = {**read_path_file(base / data["path"]), **data} if "path" in data else data
+    points = tuple(BlockPos.coerce(each) for each in require(source, "points"))
+    gradients = tuple(Vec3.coerce(each) for each in require(source, "gradients"))
+    if len(points) != len(gradients):
+        raise ValueError(
+            f"path has {len(points)} points and {len(gradients)} gradients"
+        )
+    lead = source.get("lead", 0)
+    if lead < 0:
+        raise ValueError(f"lead must be non-negative, got {lead}")
+    if lead and lead * 2 >= len(points):
+        raise ValueError(
+            f"a lead of {lead} at each end needs more than {lead * 2} points, "
+            f"and the path has {len(points)}"
+        )
+    return PathSpec(points, gradients, lead)
+
+
+def read_path_file(path: Path) -> Mapping:
+    if not path.exists():
+        raise ValueError(f"no path file at {path}")
+    data = tomllib.loads(path.read_text())
+    return data.get("path", data)
+
+
+def read_markers(data: Mapping) -> dict[str, ColumnPos]:
+    return {name: read_column(value, name) for name, value in data.items()}
+
+
+def read_output(data: Mapping) -> OutputSpec:
+    return OutputSpec(
+        path=Path(require(data, "path")),
+        name=data.get("name", "build"),
+        data_version=data.get("data_version", 3700),
+    )
