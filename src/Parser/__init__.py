@@ -53,7 +53,7 @@ def load(path: Path | str) -> BuildSpec:
 def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
     markers = read_markers(data.get("marker", {}))
     spec = BuildSpec(
-        output=read_output(require(data, "output")),
+        output=read_output(require(data, "output"), base),
         path=read_path(require(data, "path"), base),
         markers=markers,
         sections=read_sections(data, markers, base),

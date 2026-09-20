@@ -39,9 +39,12 @@ def read_markers(data: Mapping) -> dict[str, ColumnPos]:
     return {name: read_column(value, name) for name, value in data.items()}
 
 
-def read_output(data: Mapping) -> OutputSpec:
+def read_output(data: Mapping, base: Path = Path(".")) -> OutputSpec:
+    # Written beside the build that asked for it, like every other path in
+    # the file, so where the build is run from does not move its output. An
+    # absolute path is left where it was written.
     return OutputSpec(
-        path=Path(require(data, "path")),
+        path=base / require(data, "path"),
         name=data.get("name", "build"),
         data_version=data.get("data_version", 3700),
     )

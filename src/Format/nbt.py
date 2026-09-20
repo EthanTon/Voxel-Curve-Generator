@@ -98,7 +98,11 @@ def loads(data: bytes) -> _nbt.NamedTag:
 
 
 def write(path: Path | str, tag: CompoundTag, *, name: str = "") -> Path:
+    # The directory is made rather than demanded: a build names where its
+    # output goes, and having to create that by hand first is a failure with
+    # nothing to say for itself.
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(dumps(tag, name))
     return path
 
