@@ -6,6 +6,33 @@ from src.Core.block.registry import BlockRegistry
 from src.Core.block.states import BlockState
 
 
+class CatalogedRegistryTests(unittest.TestCase):
+    # A field writes straight into the palette rather than registering, so a
+    # cataloged registry has to recognise what turned up that way. Without
+    # this a rail read out of a schematic never takes a shape.
+
+    def test_a_block_added_to_the_palette_is_looked_up(self) -> None:
+        registry = BlockRegistry.for_vanilla_26_2()
+        rail_id = registry.palette.add(BlockState.create("minecraft:rail"))
+
+        info = registry.get_info(rail_id)
+
+        self.assertEqual(info.neighbor_rule, NeighborRule.RAIL)
+        self.assertEqual(info.behavior, "rail")
+
+    def test_a_block_the_catalog_lacks_falls_back_to_the_default(self) -> None:
+        registry = BlockRegistry.for_vanilla_26_2()
+        unknown = registry.palette.add(BlockState.create("modded:widget"))
+
+        self.assertEqual(registry.get_info(unknown), registry.default_info)
+
+    def test_without_a_catalog_nothing_is_looked_up(self) -> None:
+        registry = BlockRegistry()
+        rail_id = registry.palette.add(BlockState.create("minecraft:rail"))
+
+        self.assertEqual(registry.get_info(rail_id), registry.default_info)
+
+
 class BlockRegistryTests(unittest.TestCase):
     def test_registry_stays_aligned_with_shared_palette(self) -> None:
         palette = BlockPalette()

@@ -4,7 +4,13 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from math import hypot
 
-from ..CrossSection.turns import CLOCKWISE, Rotation, Turn, angle_between
+from ..CrossSection.turns import (
+    CLOCKWISE,
+    Rotation,
+    Turn,
+    angle_between,
+    normalize,
+)
 from ..coordinates import BlockPos, Vec3
 
 
@@ -24,9 +30,25 @@ class FeaturePathPoint:
     # same heading is reached by turning either way round, and the section is
     # laid out mirrored when it was reached counter-clockwise.
     direction: Rotation
+    # The one of the eight layouts a section placed this position in. Where
+    # a point is laid out more than once, to cover the seam between a run of
+    # one layout and a run of another, it is not the turn the path point is
+    # at. None where nothing placed it in a layout at all.
+    layout: Turn | None = None
+    # Whether that layout is the mirrored one. The quarters alternate, so the
+    # layout alone does not say which way depth runs.
+    mirrored: bool = False
     # Elevation at this point's own column. Features that ignore per-block
     # elevation use it as the y offset for everything built from this point.
-    y_offset: int
+    y_offset: int = 0
+
+    @property
+    def laid_at(self) -> Turn:
+        # The layout that placed this position, or the point's own turn where
+        # nothing placed it in one -- a lane paints onto the path.
+        if self.layout is not None:
+            return self.layout
+        return normalize(self.turn * self.direction)
 
 
 # Decides whether a point may be appended to a path. Rules see the path as it
@@ -104,6 +126,17 @@ def turning(angle: float) -> FeaturePathRule:
     return rule
 
 
+def one_per_delivery(path: FeaturePath, point: FeaturePathPoint) -> bool:
+    # Keep the first position a path point delivered and drop the rest.
+    #
+    # A swept profile delivers more than one position at a point wherever it
+    # would otherwise leave a gap, which is what keeps a deck solid round a
+    # bend. Something painted along that run inherits the filling and comes
+    # out four-connected. Thinned to one position a point, it steps
+    # diagonally instead.
+    return not path.current_delivery
+
+
 def ending_at(position: BlockPos) -> FeaturePathRule:
     # Always keep the point a run ends on. A wire is anchored at both ends,
     # and so is whatever holds it up; without this a run whose length is not a
@@ -171,6 +204,8 @@ class FeaturePath:
         path_index: int,
         y_offset: int,
         direction: Rotation = CLOCKWISE,
+        layout: Turn | None = None,
+        mirrored: bool = False,
     ) -> FeaturePathPoint | None:
         if path_index != self._delivery_index:
             if self._current:
@@ -186,6 +221,8 @@ class FeaturePath:
             turn=turn,
             direction=direction,
             y_offset=y_offset,
+            layout=layout,
+            mirrored=mirrored,
         )
         if not all(rule(self, point) for rule in self.rules):
             return None

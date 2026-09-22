@@ -19,8 +19,9 @@ def lateral_reach(
     # of travel, then widened by its feature's blocks.
     #
     # Oriented positions are used rather than the authored ones because a
-    # diagonal layout shifts its two quarter layouts, which can move positions
-    # further out than they were authored.
+    # diagonal is not a row across travel: it is the two quarters either side
+    # of it carried along it, so a column sits where that quarter put it and
+    # not where the diagonal would have.
     turns = range(0, 360, 45) if turn is None else (turn,)
     left = right = 0.0
     for section in sections:

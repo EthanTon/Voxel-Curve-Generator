@@ -13,6 +13,7 @@ from src.Core.coordinates import BlockPos, Vec3
 from src.Core.modes import ElevationMode, PlacementMode
 from src.Stamping import (
     UNCLIPPED,
+    laid_offset,
     FixedStamp,
     HeadingStamp,
     Stamp,
@@ -30,6 +31,34 @@ from src.Stamping import (
 )
 
 
+class LaidOffsetTests(unittest.TestCase):
+    # An offset lands where the section puts its own column at that local x,
+    # in the layout that placed the position -- and mirrored the same way
+    # that layout is.
+
+    def test_local_x_is_placed_by_the_layout(self) -> None:
+        # Two to the right of travel, travelling north, is two east.
+        self.assertEqual(laid_offset(BlockPos(2, 1, 0), 90), BlockPos(2, 1, 0))
+        self.assertEqual(laid_offset(BlockPos(2, 1, 0), 0), BlockPos(0, 1, -2))
+
+    def test_the_mirror_leaves_local_x_alone(self) -> None:
+        # A mirror across the long edge moves nothing sideways, so a fitting
+        # authored flat is in the same place either way.
+        for layout in (0, 90, 180, 270):
+            with self.subTest(layout=layout):
+                self.assertEqual(
+                    laid_offset(BlockPos(2, 1, 0), layout, mirrored=True),
+                    laid_offset(BlockPos(2, 1, 0), layout),
+                )
+
+    def test_the_mirror_turns_local_depth_over(self) -> None:
+        # One ahead of the path at 90 is one north; mirrored, one south.
+        self.assertEqual(laid_offset(BlockPos(0, 0, -1), 90), BlockPos(0, 0, -1))
+        self.assertEqual(
+            laid_offset(BlockPos(0, 0, -1), 90, mirrored=True), BlockPos(0, 0, 1)
+        )
+
+
 class HeadingTests(unittest.TestCase):
     def test_headings_are_measured_clockwise_from_west(self) -> None:
         self.assertEqual(heading_of((-1, 0, 0)), 0.0)
@@ -45,9 +74,17 @@ class HeadingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             authored_headings(40.0)
 
-    def test_one_heading_authored_per_rotation(self) -> None:
+    def test_only_the_first_octant_is_authored(self) -> None:
+        # Rotation carries a variant into the other three quadrants and a
+        # mirror carries it across the diagonal into the other half of its
+        # own, so 67.5 is 22.5 and does not want authoring twice.
         self.assertEqual(authored_headings(45.0), (0.0, 45.0))
-        self.assertEqual(authored_headings(22.5), (0.0, 22.5, 45.0, 67.5))
+        self.assertEqual(authored_headings(22.5), (0.0, 22.5, 45.0))
+        self.assertEqual(authored_headings(15.0), (0.0, 15.0, 30.0, 45.0))
+
+    def test_a_heading_past_the_diagonal_is_not_a_variant(self) -> None:
+        with self.assertRaisesRegex(ValueError, "22.5 mirrored"):
+            by_authored({0.0: "a", 22.5: "b", 45.0: "c", 67.5: "d"}, 22.5)
 
     def test_a_heading_is_the_variant_it_is_turned_from(self) -> None:
         self.assertEqual(authored_turn(22.5, 22.5), (22.5, 0))
@@ -100,9 +137,11 @@ class StampingTestCase(unittest.TestCase):
         )
 
     def point(self, position=(0, 64, 0), gradient=(-1, 0, 0), y_offset=0,
-              turn=0, direction=1):
+              turn=0, direction=1, layout=None):
         path = FeaturePath(rules=())
-        return path.add(position, gradient, turn, 0, y_offset, direction)
+        return path.add(
+            position, gradient, turn, 0, y_offset, direction, layout
+        )
 
     def path(self, *points) -> FeaturePath:
         path = FeaturePath(rules=())
@@ -132,9 +171,8 @@ class FixedStampTests(StampingTestCase):
         stamp = FixedStamp(self.feature(), self.domains)
         point = self.point(gradient=(0, 0, -1))
 
-        placement = self.world.get_placement(
-            stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
-        )
+        [placed] = stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
+        placement = self.world.get_placement(placed)
 
         self.assertEqual(placement.transform.quarter_turns, 0)
         self.assertEqual(placement.transform.origin, BlockPos(0, 64, 0))
@@ -160,11 +198,37 @@ class HeadingStampTests(StampingTestCase):
         # 112.5 degrees: the 22.5 feature, one quarter round.
         self.assertIs(stamp.rule(point), features[22.5])
         self.assertEqual(stamp.at(112.5)[1], 1)
-        placement = self.world.get_placement(
-            stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
-        )
+        [placed] = stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
+        placement = self.world.get_placement(placed)
         # One quarter round its orbit, laid out across travel: 0.
         self.assertEqual(placement.transform.quarter_turns, 0)
+
+    def test_a_heading_past_the_diagonal_is_its_reflection(self) -> None:
+        # 67.5 is 22.5 mirrored across the diagonal, so it is stamped from
+        # the same feature, mirrored rather than turned.
+        features = self.quadrant()
+        stamp = HeadingStamp(features, 22.5)
+
+        self.assertEqual(stamp.at(22.5), (features[22.5], 0, False))
+        self.assertEqual(stamp.at(67.5), (features[22.5], 0, True))
+
+    def test_the_mirror_reflects_what_it_lays_about_the_diagonal(self) -> None:
+        # An L, so a reflection shows: what 67.5 lays is what 22.5 lays with
+        # x and z swapped, which is what a mirror across the diagonal is.
+        shape = self.feature()
+        shape.blocks.set_block(BlockPos(2, 0, 0), BlockState.create("minecraft:stone"))
+        shape.blocks.set_block(BlockPos(0, 0, 2), BlockState.create("minecraft:gold_block"))
+        stamp = HeadingStamp({h: shape for h in (0.0, 22.5, 45.0)}, 22.5, self.domains)
+
+        laid = {}
+        for heading, gradient in ((22.5, (-1, 0, -0.414)), (67.5, (-0.414, 0, -1))):
+            world = BlockWorld(BlockRegistry())
+            self.domains.bind(world)
+            point = self.point(gradient=gradient)
+            stamp.stamp(world, stamp.rule(point), point, clip=UNCLIPPED)
+            laid[heading] = {(p.x, p.z) for p in world.iter_source_positions()}
+
+        self.assertEqual(laid[67.5], {(z, x) for x, z in laid[22.5]})
 
     def test_grade_does_not_change_which_feature_is_stamped(self) -> None:
         features = self.quadrant()
@@ -324,9 +388,8 @@ class TurnStampTests(StampingTestCase):
         stamp = TurnStamp(self.feature(), self.domains)
         point = self.point(turn=180)
 
-        placement = self.world.get_placement(
-            stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
-        )
+        [placed] = stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
+        placement = self.world.get_placement(placed)
 
         self.assertEqual(placement.transform.quarter_turns, 1)
 
@@ -334,12 +397,48 @@ class TurnStampTests(StampingTestCase):
         stamp = TurnStamp(self.feature(), self.domains)
         point = self.point(turn=90, direction=-1)
 
-        placement = self.world.get_placement(
-            stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
-        )
+        [placed] = stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
+        placement = self.world.get_placement(placed)
 
         # 90 counter-clockwise travels south, which lays out at 2.
         self.assertEqual(placement.transform.quarter_turns, 2)
+
+
+class DiagonalTurnStampTests(StampingTestCase):
+    # A diagonal is two quarter layouts staggered. The section records which
+    # of them placed each position, and the stamp turns each half its own
+    # way. Left to the turn alone both halves would take the quarter below
+    # the diagonal, which is what tore a wedge out of the inside of a bend.
+
+    def test_a_position_is_turned_by_the_quarter_that_placed_it(self) -> None:
+        stamp = TurnStamp(self.feature(), self.domains)
+
+        for quarter in (180, 270):
+            point = self.point(turn=225, layout=quarter)
+            [placed] = stamp.stamp(
+                self.world, stamp.rule(point), point, clip=UNCLIPPED
+            )
+            self.assertEqual(
+                self.world.get_placement(placed).transform.quarter_turns,
+                lateral_turns(quarter),
+                f"quarter {quarter}",
+            )
+
+    def test_without_one_it_falls_back_to_the_points_own_turn(self) -> None:
+        # A lane paints onto the path rather than being placed in a layout.
+        stamp = TurnStamp(self.feature(), self.domains)
+        point = self.point(turn=180)
+
+        self.assertIsNone(point.layout)
+        self.assertEqual(stamp.layout(point), 180)
+
+    def test_the_two_halves_of_a_diagonal_take_different_layouts(self) -> None:
+        stamp = TurnStamp(self.feature(), self.domains)
+
+        self.assertNotEqual(
+            stamp.layout(self.point(turn=225, layout=180)),
+            stamp.layout(self.point(turn=225, layout=270)),
+        )
 
 
 class StampAlongTests(StampingTestCase):

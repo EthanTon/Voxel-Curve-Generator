@@ -19,6 +19,10 @@ class Delivery(NamedTuple):
     # feature is placed.
     annotation: FeatureAnnotation
     positions: tuple[BlockPos, ...]
+    # The one of the eight layouts these positions were placed in, and
+    # whether that layout was the mirrored one.
+    layout: int = 0
+    mirrored: bool = False
 
 
 def deliver_offset(point: PathPoint, offset: SectionOffset) -> Delivery:
@@ -27,6 +31,8 @@ def deliver_offset(point: PathPoint, offset: SectionOffset) -> Delivery:
     return Delivery(
         offset.annotation,
         tuple(BlockPos(x + o.x, o.y, z + o.z) for o in offset.offsets),
+        offset.layout,
+        offset.mirrored,
     )
 
 
@@ -45,6 +51,8 @@ def deliver(
         Delivery(
             delivery.annotation,
             tuple(p for p in delivery.positions if mask.contains(p.x, p.z)),
+            delivery.layout,
+            delivery.mirrored,
         )
         for delivery in deliveries
     )

@@ -4,10 +4,16 @@ from math import cos, radians, sin
 from src.Core.CrossSection.annotations import FeatureAnnotation
 from src.Core.CrossSection.cross_section import CrossSection, PointField, orient_annotation
 from src.Core.CrossSection.schedule import SectionSchedule, SectionSpan
-from src.Core.CrossSection.turns import heading, snap
+from src.Core.CrossSection.turns import (
+    DIAGONAL_TOLERANCE,
+    JOIN_TOLERANCE,
+    heading,
+    snap,
+    turns_along,
+)
 from src.Core.Domain import Domain
 from src.Core.Feature.feature import PointFeature
-from src.Core.Feature.feature_path import FeaturePath
+from src.Core.Feature.feature_path import FeaturePath, every
 from src.Core.Field.block_field import BlockField
 from src.Core.Path.boundary import Boundary
 from src.Core.Path.path import Path, PathPoint
@@ -15,6 +21,13 @@ from src.Core.Path.path_frame import PathFrame
 from src.Core.coordinates import BlockPos, Vec2, Vec3
 from src.Core.modes import PlacementMode, StepMode
 from src.Generation.Sweep.delivery import FrameCover, cover, deliver, deliver_offset
+from src.Generation.Sweep.paths import (
+    along_travel,
+    at_their_own_level,
+    dashed,
+    one_line,
+    rewalk,
+)
 from src.Generation.Sweep.schedule import lead_for, walk_schedule
 from src.Generation.Geometry.boundaries import orthogonal, path_bounds
 from src.Generation.Geometry.orientation import SectionOrientation
@@ -75,24 +88,248 @@ class TurnTests(unittest.TestCase):
     def test_magnitude_and_grade_do_not_matter(self) -> None:
         self.assertEqual(snap((3.0, 7.0, -3.0)), 135)
 
-    def test_diagonals_need_a_heading_very_close_to_45(self) -> None:
+    def test_a_heading_takes_the_nearest_of_the_eight(self) -> None:
+        # Every one of these is nearer the diagonal than either quarter.
         self.assertEqual(snap((1.0, 0.0, -1.01)), 135)
-        self.assertEqual(snap((1.0, 0.0, -1.2)), 90)
-        self.assertEqual(snap((1.0, 0.0, -0.8)), 180)
-        self.assertEqual(snap((-1.0, 0.0, 0.8)), 0)
+        self.assertEqual(snap((1.0, 0.0, -1.2)), 135)
+        self.assertEqual(snap((1.0, 0.0, -0.8)), 135)
+        self.assertEqual(snap((-1.0, 0.0, 0.8)), 315)
 
-    def test_tolerance_can_be_widened(self) -> None:
-        self.assertEqual(snap((1.0, 0.0, -1.2), tolerance=0.2), 135)
+    def test_a_quarter_wins_once_it_is_the_nearer(self) -> None:
+        # Half a step from the diagonal is 22.5 degrees; past that the
+        # quarter is nearer and takes it.
+        self.assertEqual(snap((1.0, 0.0, -0.3)), 180)
+        self.assertEqual(snap((0.3, 0.0, -1.0)), 90)
+
+    def test_the_tolerance_can_be_narrowed(self) -> None:
+        # A narrower tolerance holds the quarter further round, which is what
+        # the layout did everywhere before the default was widened.
+        self.assertEqual(snap((1.0, 0.0, -1.2), tolerance=0.02), 90)
 
     def test_vertical_gradients_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             snap((0.0, 1.0, 0.0))
 
 
+class OnceAtDiagonalsTests(unittest.TestCase):
+    # A diagonal is the join between two quarters, stamped as one piece that
+    # reaches half a section either side of itself. It is laid once: where a
+    # run of headings near the diagonal begins if the path has one, and at
+    # the change from one quarter to the other if it does not. Everything
+    # past it is laid out at the quarter being taken up.
+
+    def swept(self, *degrees, tolerance=JOIN_TOLERANCE):
+        bend = lambda d: (sin(radians(d)), 0.0, -cos(radians(d)))
+        path = Path(
+            [(0, 64, -n) for n in range(len(degrees))],
+            [bend(d) for d in degrees],
+        )
+        orientation = SectionOrientation(tolerance=tolerance)
+        return (
+            [
+                turn.absolute
+                for turn in turns_along((bend(d) for d in degrees), tolerance=tolerance)
+            ],
+            [turn.absolute for turn in orientation.turns(path)],
+        )
+
+    def test_the_walk_puts_a_whole_run_on_the_diagonal(self) -> None:
+        walked, _ = self.swept(*range(0, 91, 10), tolerance=DIAGONAL_TOLERANCE)
+
+        self.assertEqual(walked.count(135), 4)
+
+    def test_the_layout_takes_it_once(self) -> None:
+        for tolerance in (JOIN_TOLERANCE, DIAGONAL_TOLERANCE):
+            with self.subTest(tolerance=tolerance):
+                _, laid = self.swept(*range(0, 91, 10), tolerance=tolerance)
+
+                self.assertEqual(laid.count(135), 1)
+                self.assertTrue(
+                    all(turn % 90 == 0 for turn in laid if turn != 135), laid
+                )
+
+    def test_a_run_on_the_diagonal_is_joined_where_it_begins(self) -> None:
+        walked, laid = self.swept(*range(0, 91, 10), tolerance=DIAGONAL_TOLERANCE)
+
+        self.assertEqual(laid, [90] * 3 + [135] + [180] * 6)
+        self.assertEqual(laid.index(135), walked.index(135))
+
+    def test_a_path_with_no_run_is_joined_at_the_change(self) -> None:
+        # Ten degrees a point and a two degree band: nothing lands near
+        # enough to the diagonal to hold the join, so it goes at the point
+        # that crossed, which is where the nearest quarter changes too.
+        walked, laid = self.swept(*range(0, 91, 10))
+
+        self.assertNotIn(135, walked)
+        self.assertEqual(laid, [90] * 5 + [135] + [180] * 4)
+
+    def test_a_path_that_never_reaches_a_diagonal_keeps_its_quarter(self) -> None:
+        _, laid = self.swept(0, 5, 10, 5, 0)
+
+        self.assertEqual(set(laid), {90})
+
+
+class OneLineTests(unittest.TestCase):
+    # A lane is a line, so it takes one position a path point whatever the
+    # section delivered there -- except at a join, where the point was
+    # delivered in both quarters either side of it and the points the join
+    # reaches over delivered nothing at all.
+
+    def delivered(self, *deliveries):
+        path = FeaturePath(rules=())
+        for index, positions in deliveries:
+            for x, z, layout in positions:
+                path.add(
+                    BlockPos(x, 0, z), Vec3(0.0, 0.0, -1.0), 90, index, 64, 1, layout
+                )
+        return path
+
+    def laid(self, path):
+        return [(p.position.x, p.position.z, p.layout) for p in one_line(path)]
+
+    def test_a_point_delivered_once_keeps_what_it_delivered(self) -> None:
+        self.assertEqual(
+            self.laid(self.delivered((0, [(0, 0, 90)]), (1, [(0, -1, 90)]))),
+            [(0, 0, 90), (0, -1, 90)],
+        )
+
+    def test_the_section_s_own_filling_is_thinned_away(self) -> None:
+        # A stepping column delivers twice, both in the one layout.
+        self.assertEqual(
+            self.laid(
+                self.delivered(
+                    (0, [(0, 0, 90), (0, -1, 90)]),
+                    (1, [(0, -1, 90), (0, -2, 90)]),
+                )
+            ),
+            [(0, 0, 90), (0, -1, 90)],
+        )
+
+    def test_a_join_follows_the_arm_carried_forward(self) -> None:
+        # Point 1 is the join: the quarter being taken up carried back over
+        # what is already passed, and the quarter being left carried forward
+        # over points 2 and 3, which then deliver nothing of their own.
+        self.assertEqual(
+            self.laid(
+                self.delivered(
+                    (0, [(0, 0, 180)]),
+                    (1, [(1, -1, 90), (0, 0, 90), (1, -1, 180), (2, -2, 180)]),
+                    (4, [(3, -3, 90)]),
+                )
+            ),
+            [(0, 0, 180), (1, -1, 180), (2, -2, 180), (3, -3, 90)],
+        )
+
+
+class CarriedThroughTests(unittest.TestCase):
+    # Everything that walks a run again and builds a new one has to carry the
+    # mirror on. A pass that drops it hands whatever rides the run a layout
+    # with no mirror, and the fitting is placed as though the quarter were
+    # the plain one -- which is half of them.
+
+    def run_of(self, count=6):
+        path = FeaturePath(rules=())
+        for index in range(count):
+            path.add(
+                BlockPos(0, 0, -index), Vec3(0.0, 0.0, -1.0), 90, index, 64, 1, 90,
+                True,
+            )
+        return path
+
+    def test_rewalk_carries_the_mirror(self) -> None:
+        # What a pole or a wire rides: the run thinned to its own spacing.
+        walked = rewalk(self.run_of(), (every(2),))
+
+        self.assertTrue(len(walked))
+        self.assertTrue(all(p.mirrored for p in walked))
+
+    def test_dashing_carries_the_mirror(self) -> None:
+        # What every lane rides, dashed or not.
+        dashes = dashed(self.run_of(), on=2, off=1)
+
+        self.assertTrue(len(dashes))
+        self.assertTrue(all(p.mirrored for p in dashes))
+
+    def test_one_line_carries_the_mirror(self) -> None:
+        line = one_line(self.run_of())
+
+        self.assertTrue(len(line))
+        self.assertTrue(all(p.mirrored for p in line))
+
+
+class AlongTravelTests(unittest.TestCase):
+    # `CrossSection.along` answers in the section's own terms, so the walk it
+    # describes turns over at a mirrored layout. Half the quarters are
+    # mirrored, so a fitting that ignored this would land a block the wrong
+    # side of the column it rides over half the curve.
+
+    def run_of(self, mirrored):
+        path = FeaturePath(rules=())
+        path.add(
+            BlockPos(0, 0, 0), Vec3(0.0, 0.0, -1.0), 90, 0, 64, 1, 90, mirrored
+        )
+        return path
+
+    def laid(self, mirrored):
+        return [
+            (p.position.x, p.position.z)
+            for p in along_travel(self.run_of(mirrored), (0, 1))
+        ]
+
+    def test_a_plain_layout_steps_along_travel(self) -> None:
+        # 90 travels north, so a step forward is one less z.
+        self.assertEqual(self.laid(False), [(0, 0), (0, -1)])
+
+    def test_a_mirrored_layout_steps_the_other_way(self) -> None:
+        self.assertEqual(self.laid(True), [(0, 0), (0, 1)])
+
+    def test_the_mirror_is_carried_on(self) -> None:
+        self.assertTrue(all(p.mirrored for p in along_travel(self.run_of(True), (0, 1))))
+
+
+class AtTheirOwnLevelTests(unittest.TestCase):
+    # A fitting rides the centreline and is only moved to the side when it is
+    # placed, so the column it lands in can belong to the frame after the one
+    # its point was delivered into. A change of level cuts across the deck.
+
+    def run_of(self, count=4):
+        path = FeaturePath(rules=())
+        for index in range(count):
+            path.add(BlockPos(0, 0, -index), Vec3(0.0, 0.0, -1.0), 90, index, 64, 1, 90)
+        return path
+
+    # The deck steps up from x = 2 on, which is where a lane two to the right
+    # of travel lands.
+    def level(self, x, z):
+        return 65 if x >= 2 else 64
+
+    def test_a_point_takes_the_level_of_the_column_it_lands_in(self) -> None:
+        levelled = at_their_own_level(
+            self.run_of(), self.level, lambda layout: BlockPos(2, 1, 0)
+        )
+
+        self.assertEqual([p.y_offset for p in levelled], [65] * 4)
+
+    def test_with_no_offset_it_is_the_point_s_own_column(self) -> None:
+        levelled = at_their_own_level(self.run_of(), self.level)
+
+        self.assertEqual([p.y_offset for p in levelled], [64] * 4)
+
+    def test_nothing_else_about_the_point_changes(self) -> None:
+        [before] = list(self.run_of(1))
+        [after] = list(at_their_own_level(self.run_of(1), self.level))
+
+        self.assertEqual(
+            (after.position, after.path_index, after.turn, after.layout),
+            (before.position, before.path_index, before.turn, before.layout),
+        )
+
+
 class SectionOrientationTests(unittest.TestCase):
     def setUp(self) -> None:
-        # Starts heading north, then bends 30 degrees east of north.
-        bend = (sin(radians(30)), 0.0, -cos(radians(30)))
+        # Starts heading north, then bends 15 degrees east of north, which is
+        # less than half a step and so still lays out for north.
+        bend = (sin(radians(15)), 0.0, -cos(radians(15)))
         self.path = Path(
             [(0, 64, 0), (0, 64, -1), (1, 64, -2), (1, 64, -3)],
             [(0.0, 0.0, -1.0), (0.0, 0.0, -1.0), bend, bend],
@@ -128,6 +365,11 @@ class SectionOrientationTests(unittest.TestCase):
 
 
 class DeliverTests(unittest.TestCase):
+    # Mostly at 90, which is a mirrored quarter: a quarter turn adds a mirror
+    # across the long edge, so the odd ones carry one and the even ones do
+    # not. What the section calls forward therefore reads as +z here, and as
+    # -z at 180 -- `test_forward_follows_the_quarter_layout` is the even one.
+
     def deliver(self, position, turn=90, at=point()):
         section = CrossSection(PointField((annotation(position, StepMode.MANHATTAN),)))
         (offset,) = section.orient(turn)
@@ -139,13 +381,13 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual([tuple(p) for p in delivery.positions], [(9, 2, 5)])
 
     def test_manhattan_left_steps_forward(self) -> None:
-        self.assertEqual(self.deliver((-1, 0, 0)), [(-1, 0, 0), (-1, 0, -1)])
+        self.assertEqual(self.deliver((-1, 0, 0)), [(-1, 0, 0), (-1, 0, 1)])
 
     def test_manhattan_right_steps_backward(self) -> None:
-        self.assertEqual(self.deliver((1, 0, 0)), [(1, 0, 0), (1, 0, 1)])
+        self.assertEqual(self.deliver((1, 0, 0)), [(1, 0, 0), (1, 0, -1)])
 
     def test_manhattan_on_the_origin_steps_forward(self) -> None:
-        self.assertEqual(self.deliver((0, 0, 0)), [(0, 0, 0), (0, 0, -1)])
+        self.assertEqual(self.deliver((0, 0, 0)), [(0, 0, 0), (0, 0, 1)])
 
     def test_forward_follows_the_quarter_layout(self) -> None:
         # At 180 the left point sits north of the path and forward is east.
@@ -166,7 +408,7 @@ class DeliverTests(unittest.TestCase):
         )
         [full] = deliver(point(), section.orient(90))
         [clipped] = deliver(point(), section.orient(90), frame)
-        self.assertEqual([tuple(p) for p in full.positions], [(-1, 0, 0), (-1, 0, -1)])
+        self.assertEqual([tuple(p) for p in full.positions], [(-1, 0, 0), (-1, 0, 1)])
         self.assertEqual([tuple(p) for p in clipped.positions], [(-1, 0, 0)])
 
     def test_annotations_emptied_by_a_mask_still_deliver(self) -> None:
@@ -276,7 +518,10 @@ class FeaturePathAlongFramesTests(unittest.TestCase):
                         position, path_point.gradient, turn.turn, path_index, 64, turn.direction
                     )
 
-        self.assertEqual([p.position.z for p in feature_path], [0, -1, -2, -3])
+        # 90 is a mirrored quarter, so the stepping column reaches +z: the
+        # first point lays two and each one after it lays the one the point
+        # before had not already covered.
+        self.assertEqual([p.position.z for p in feature_path], [0, 1, -1, -2])
         self.assertEqual([p.path_index for p in feature_path], [0, 0, 1, 2])
         self.assertEqual([p.point_index for p in feature_path], [0, 1, 2, 3])
 
@@ -314,8 +559,8 @@ class FeaturePathAlongFramesTests(unittest.TestCase):
 
         bounds = path_bounds(path)
         self.assertTrue(all(bounds.contains(p.position.x, p.position.z) for p in feature_path))
-        self.assertEqual([tuple(p.position) for p in feature_path], [(-1, 0, -z) for z in range(2, 21)])
-        self.assertEqual([p.y_offset for p in feature_path], [64 if z < 8 else 65 for z in range(2, 21)])
+        self.assertEqual([tuple(p.position) for p in feature_path], [(-1, 0, -z) for z in range(2, 22)])
+        self.assertEqual([p.y_offset for p in feature_path], [64 if z < 8 else 65 for z in range(2, 22)])
 
 
 if __name__ == "__main__":

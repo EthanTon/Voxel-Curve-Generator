@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ..Core.coordinates import BlockPos
-from ..Core.modes import ElevationMode, PlacementMode, StepMode
+from ..Core.modes import ElevationMode, LineMode, PlacementMode, StepMode
 from ..Stamping import authored_headings
 from .spec import LaneSpec, Measure, StructureSpec, WireSpec
 from .values import read_enum, require
@@ -51,7 +51,7 @@ def read_wire(data: Mapping, base: Path = Path(".")) -> WireSpec:
         spacing=spacing,
         angle=angle,
         measure=measure,
-        step=read_enum(StepMode, data.get("step"), StepMode.MANHATTAN),
+        step=read_enum(LineMode, data.get("step"), LineMode.MANHATTAN),
         placement_mode=read_enum(PlacementMode, data.get("placement_mode")),
     )
 
@@ -70,6 +70,7 @@ def read_lane(data: Mapping, base: Path = Path(".")) -> LaneSpec:
         block=block,
         measure=read_enum(Measure, data.get("measure"), Measure.INDEX),
         offset=BlockPos.coerce(data.get("offset", (0, 0, 0))),
+        step=read_enum(StepMode, data.get("step"), StepMode.MANHATTAN),
         placement_mode=read_enum(PlacementMode, data.get("placement_mode")),
     )
 

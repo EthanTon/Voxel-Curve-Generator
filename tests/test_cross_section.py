@@ -18,8 +18,11 @@ from src.Core.CrossSection.turns import (
     COUNTER_CLOCKWISE,
     angle_between,
     heading,
+    neighbors,
+    normalize,
     sense,
     snap,
+    step_along,
     travel,
     turn_from,
     turn_of,
@@ -97,13 +100,27 @@ class QuarterLayoutTests(unittest.TestCase):
     def test_two_seventy_travels_south(self) -> None:
         self.assertEqual(layout(row(), 270), line(NAMES, (3, 0), (-1, 0)))
 
-    def test_depth_follows_travel_at_even_quarters_and_mirrors_at_odd(self) -> None:
-        # One right of the origin and one ahead of it, as authored.
+    def test_each_quarter_adds_a_mirror_to_the_one_before_it(self) -> None:
+        # One right of the origin and one ahead of it, as authored. A quarter
+        # turn adds a mirror across the long edge, and a mirror twice is
+        # nothing, so the four alternate: the section as authored at 0 and at
+        # 180, turned over at 90 and at 270. The point is to the right of
+        # travel at all four either way -- the mirror is across the long
+        # edge, so it never moves a column off its own side.
         section = CrossSection(PointField((annotation((1, 0, -1)),)))
         self.assertEqual(layout(section, 0), [("a", -1, -1)])    # north, and ahead (west)
         self.assertEqual(layout(section, 90), [("a", 1, 1)])     # east, and behind (south)
         self.assertEqual(layout(section, 180), [("a", 1, 1)])    # south, and ahead (east)
         self.assertEqual(layout(section, 270), [("a", -1, -1)])  # west, and behind (north)
+
+    def test_local_x_lands_right_of_travel_at_every_quarter(self) -> None:
+        # The mirror is across the long edge, so it never moves a column off
+        # its own side: local x is to the right of travel at all four.
+        section = CrossSection(PointField((annotation((1, 0, 0)),)))
+        for quarter in (0, 90, 180, 270):
+            with self.subTest(quarter=quarter):
+                ahead = heading(quarter)
+                self.assertEqual(layout(section, quarter), [("a", -ahead.z, ahead.x)])
 
     def test_positions_are_relative_to_the_origin(self) -> None:
         section = CrossSection(PointField((annotation((2, 1, 0)),)), origin=(2, 1, 0))
@@ -130,48 +147,141 @@ class QuarterLayoutTests(unittest.TestCase):
             row().orient(30)
 
 
+def arms(section, turn, direction=CLOCKWISE):
+    # The two halves of a join, keyed by the quarter each was laid in: every
+    # annotation's positions, in the order they came out.
+    gathered = {}
+    for offset in section.orient(turn, direction):
+        gathered.setdefault(offset.layout, {})[offset.annotation.name] = [
+            (p.x, p.z) for p in offset.offsets
+        ]
+    return gathered
+
+
 class DiagonalLayoutTests(unittest.TestCase):
-    def test_forty_five_joins_zero_and_ninety(self) -> None:
-        # The west layout moves forward 3 and the north layout, joined at f,
-        # backtracks 3; they meet at the north-west corner.
-        self.assertEqual(
-            layout(row(), 45),
-            line(NAMES, (-3, 3), (0, -1)) + line(NAMES, (-3, -3), (1, 0)),
-        )
+    # A diagonal is not a row. Blocks only turn by quarters, so there is no
+    # row to lay at 45: the diagonal is the join between the two quarters
+    # either side of it, stamped as one piece where the path crosses it.
+    #
+    # The quarter being left is carried forward of the joint and the quarter
+    # taking up is carried back behind it, half the row's width each and a
+    # step along the diagonal apart. The two are laid through each other, so
+    # the wedge one opens on the inside of the turn the other has already
+    # filled.
 
-    def test_one_thirty_five_joins_ninety_and_one_eighty(self) -> None:
-        self.assertEqual(
-            layout(row(), 135),
-            line(NAMES, (-3, -3), (1, 0)) + line(NAMES, (3, -3), (0, 1)),
-        )
+    def test_a_diagonal_is_the_two_quarters_either_side_of_it(self) -> None:
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                self.assertEqual(set(arms(row(), turn)), set(neighbors(turn)))
 
-    def test_two_twenty_five_joins_one_eighty_and_two_seventy(self) -> None:
-        self.assertEqual(
-            layout(row(), 225),
-            line(NAMES, (3, -3), (0, 1)) + line(NAMES, (3, 3), (-1, 0)),
-        )
+    def test_each_arm_is_its_quarter_carried_a_step_at_a_time(self) -> None:
+        # Half the row's width of copies, each one diagonal step on from the
+        # one before. Where the piece sits as a whole is a separate question
+        # -- it is centred on the path point -- so this asks only about the
+        # shape, which a translation does not change.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                step = step_along(turn)
+                for laid in arms(row(), turn).values():
+                    for positions in laid.values():
+                        self.assertEqual(len(positions), 3)
+                        for before, after in zip(positions, positions[1:]):
+                            self.assertEqual(
+                                (after[0] - before[0], after[1] - before[1]), step
+                            )
 
-    def test_three_fifteen_joins_two_seventy_and_zero(self) -> None:
-        self.assertEqual(
-            layout(row(), 315),
-            line(NAMES, (3, 3), (-1, 0)) + line(NAMES, (-3, 3), (0, -1)),
-        )
+    def test_the_join_is_centred_on_the_path_point(self) -> None:
+        # A join covers a stretch of path either side of where it is stamped,
+        # so the point it is stamped at belongs in the middle of it. Laid
+        # from one arm outwards instead, the piece reaches off one way and
+        # sits half a section down the path from where it is meant to be.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                places = [
+                    (p.x, p.z) for offset in row().orient(turn) for p in offset.offsets
+                ]
+                for axis in (0, 1):
+                    values = [corner[axis] for corner in places]
+                    self.assertEqual((max(values) + min(values)) // 2, 0)
 
-    def test_half_the_long_length_rounds_down(self) -> None:
+    def stepped(self):
+        # Eleven columns with the two a rail would ride stepping, like the
+        # sample build's trackbed. The leads that gives are what the join has
+        # to line up, and the mirror is invisible without them.
+        return CrossSection(PointField(
+            annotation(
+                (x, 0, 0),
+                StepMode.MANHATTAN if abs(x) == 2 else StepMode.CHEBYSHEV,
+                f"c{x}",
+            )
+            for x in range(-5, 6)
+        ))
+
+    def test_both_edges_carry_round_the_corner(self) -> None:
+        # The arm taking up is mirrored across the section's long edge, and
+        # that is what carries both of the section's edges through the joint.
+        # Turned rather than mirrored, only the edge they are lined up on
+        # joins and the other comes out as two runs side by side.
+        section = self.stepped()
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                laid = arms(section, turn)
+                lower, upper = neighbors(turn)
+                for edge in ("c5", "c-5"):
+                    self.assertTrue(
+                        set(laid[lower][edge]) & set(laid[upper][edge]),
+                        f"{edge} does not meet at turn {turn}",
+                    )
+
+    def test_each_arm_keeps_its_own_quarter(self) -> None:
+        # A mirror across the long edge moves nothing sideways, so the arm
+        # stays in the quarter it was laid for. Anything riding it is placed
+        # by that quarter and lands on the right side of the path.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                self.assertEqual(
+                    set(arms(self.stepped(), turn)), set(neighbors(turn))
+                )
+
+    def test_the_two_arms_share_their_outermost_column(self) -> None:
+        # What "lined up" means: the edge of one arm is the edge of the other.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                lower, upper = neighbors(turn)
+                laid = arms(row(), turn)
+                self.assertTrue(set(laid[lower]["f"]) & set(laid[upper]["f"]))
+
+    def test_the_carry_is_half_the_row(self) -> None:
         section = CrossSection(
             PointField(annotation((x, 0, 0), name=str(x)) for x in range(-3, 5))
         )
         self.assertEqual(section.long_length, 8)
-        offsets = section.orient(135)
-        # The north layout moves forward 4; the east layout starts one below it.
-        self.assertEqual({o.offsets[0].z for o in offsets[:8]}, {-4})
-        self.assertEqual(offsets[8].offsets[0], BlockPos(4, 0, -3))
+        laid = arms(section, 135)
+
+        self.assertEqual(sorted(len(p) for p in laid[90].values()), [4] * 8)
+        self.assertEqual(sorted(len(p) for p in laid[180].values()), [4] * 8)
+
+    def test_every_arm_runs_down_the_path(self) -> None:
+        # Whatever rides a join reads its positions in order, so they have to
+        # be in one. A stepping column delivers its own position and one
+        # along, and on the right of the section that one is behind, so the
+        # pairs come out against travel unless they are put in order.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                ahead = step_along(turn)
+                for offset in row().orient(turn):
+                    along = [p.x * ahead[0] + p.z * ahead[1] for p in offset.offsets]
+                    self.assertEqual(along, sorted(along), offset.annotation.name)
+
+    def test_a_row_too_narrow_to_carry_is_just_the_two_quarters(self) -> None:
+        # Nothing one column wide opens a wedge, so there is nothing to fill.
+        section = CrossSection(PointField((annotation((0, 0, 0)),)))
+        self.assertEqual(arms(section, 45), {0: {"a": [(0, 0)]}, 90: {"a": [(0, 0)]}})
 
     def test_each_feature_point_exists_once_on_its_path(self) -> None:
-        # A single point has nothing to shift, so both layouts land on it; the
-        # feature path keeps it once.
+        # The arms are laid through each other, so they share positions. A
+        # feature only ever builds one block on each.
         section = CrossSection(PointField((annotation((0, 0, 0)),)))
-        self.assertEqual(layout(section, 45), [("a", 0, 0), ("a", 0, 0)])
         feature_path = FeaturePath()
         for offset in section.orient(45):
             for position in offset.offsets:
@@ -205,9 +315,16 @@ class ReachTests(unittest.TestCase):
         self.assertEqual(row().reach(0), 0.0)
         self.assertEqual(row().reach(90), 0.0)
 
-    def test_diagonals_reach_by_their_shifted_corners(self) -> None:
-        # the 45 layout's far corner sits at (-3, -3), three diagonal steps ahead
-        self.assertAlmostEqual(row().reach(45), 3 * 2 ** 0.5)
+    def test_a_row_across_travel_reaches_nothing_along_a_quarter(self) -> None:
+        self.assertEqual(row().reach(180), 0.0)
+        self.assertEqual(row().reach(270), 0.0)
+
+    def test_a_join_reaches_half_of_itself_either_way(self) -> None:
+        # Nine blocks of diagonal end to end, centred on the path point, so
+        # it reaches three each way -- six over root two along the diagonal.
+        for turn in (45, 135, 225, 315):
+            with self.subTest(turn=turn):
+                self.assertAlmostEqual(row().reach(turn), 6 / 2 ** 0.5)
 
     def test_manhattan_leads_reach_along_travel(self) -> None:
         section = ManhattanLeadTests().section("de")
@@ -264,11 +381,11 @@ class TurnOfTests(unittest.TestCase):
         self.assertEqual(snap(SOUTH), 270)
         self.assertEqual(snap(SOUTHWEST), 315)
 
-    def test_only_a_near_exact_diagonal_lays_out_as_one(self) -> None:
-        # The tolerance is a little over a degree, so a heading a few degrees
-        # off the diagonal takes the quarter it is nearest instead.
+    def test_a_diagonal_lays_out_as_one_when_it_is_nearest(self) -> None:
+        # The tolerance is half the step from one layout to the next, so a
+        # heading takes the nearest of the eight and nothing further.
         self.assertEqual(snap((-1.0, 0.0, 0.99)), 315)
-        self.assertEqual(snap((-1.0, 0.0, 0.9)), 0)
+        self.assertEqual(snap((-1.0, 0.0, 0.9)), 315)
         self.assertEqual(snap((-1.0, 0.0, 0.1)), 0)
 
     def test_west_to_north_is_clockwise_and_west_to_south_counter(self) -> None:
@@ -337,7 +454,7 @@ class TurnsAlongTests(unittest.TestCase):
         # The two degrees back the wrong way take the angle from 10 to 8, and
         # nothing else: the section stays laid out the way the curve is going.
         self.assertEqual(
-            self.turns(toward(0), toward(10), toward(8), toward(30), toward(45)),
+            self.turns(toward(0), toward(10), toward(8), toward(15), toward(45)),
             [(0, CLOCKWISE), (0, CLOCKWISE), (0, CLOCKWISE), (0, CLOCKWISE), (45, CLOCKWISE)],
         )
 
@@ -345,9 +462,23 @@ class TurnsAlongTests(unittest.TestCase):
         bends = [toward(-12 * step) for step in range(9)]
         # Each bend on its own is a heading that lays out as authored.
         self.assertEqual(snap(bends[1]), 0)
-        self.assertEqual(self.turns(*bends[:4])[-1], (0, CLOCKWISE))
+        self.assertEqual(self.turns(*bends[:2])[-1], (0, CLOCKWISE))
         # Eight of them are a quarter turn counter-clockwise.
         self.assertEqual(self.turns(*bends)[-1], (90, COUNTER_CLOCKWISE))
+
+    def test_a_gentle_curve_never_lays_out_45_degrees_off(self) -> None:
+        # A curve turns through every angle, not just the eight. Whichever
+        # one it is at, the layout it takes is the nearest of the eight, so
+        # it is never more than half a step out. Before the tolerance was
+        # widened a curve sat 45 degrees off for almost its whole length.
+        walk = self.turns(*(toward(quarter / 4) for quarter in range(361)))
+        for (turn, direction), angle in zip(walk, (q / 4 for q in range(361))):
+            laid = turn * direction
+            self.assertLessEqual(
+                min(abs(angle - laid), abs(abs(angle - laid) - 360)),
+                22.5 + 1e-9,
+                f"a heading of {angle} degrees was laid out at {laid}",
+            )
 
     def test_a_path_can_turn_past_a_full_circle(self) -> None:
         loop = [toward(-45 * step) for step in range(10)]
@@ -420,21 +551,23 @@ class CounterClockwiseTests(unittest.TestCase):
             self.offsets(self.section(), 90, COUNTER_CLOCKWISE)[-1], ("f", [(0, -1)])
         )
 
-    def test_a_diagonal_staggers_from_the_other_half(self) -> None:
-        # The 45 layout leads with its west half and lays the north half
-        # behind it; counted counter-clockwise the trailing half is the south
-        # one, so the stagger leans the other way.
+    def test_a_diagonal_mirrors_the_way_a_quarter_does(self) -> None:
+        # Both arms of a join mirror, and so does the quarter each was laid
+        # in. Counted the other way round, a turn of 45 still leaves the
+        # quarter it was authored at and takes up the mirror of the one it
+        # took up clockwise, so the arm in front stays the arm in front.
         section = self.section()
+        clockwise = arms(section, 45)
+        self.assertEqual(set(clockwise), {0, 90})
         self.assertEqual(
-            [positions for _, positions in self.offsets(section, 45)[4:]],
-            [[(-2, -3)], [(0, -3)], [(3, -3)], [(0, -2)]],
-        )
-        self.assertEqual(
-            [
-                positions
-                for _, positions in self.offsets(section, 45, COUNTER_CLOCKWISE)[4:]
-            ],
-            [[(-2, 3)], [(0, 3)], [(3, 3)], [(0, 2)]],
+            arms(section, 45, COUNTER_CLOCKWISE),
+            {
+                normalize(-quarter): {
+                    name: [(x, -z) for x, z in positions]
+                    for name, positions in laid.items()
+                }
+                for quarter, laid in clockwise.items()
+            },
         )
 
     def test_each_direction_is_laid_out_and_kept_on_its_own(self) -> None:
@@ -486,12 +619,19 @@ class StepRuleTests(unittest.TestCase):
             step_rules=rules,
         )
         offsets = {o.annotation.name: o.offsets for o in section.orient(90)}
-        self.assertEqual([o.z for o in offsets["inner"]], [0, -1, -2])
+        self.assertEqual([o.z for o in offsets["inner"]], [0, 1, 2])
         # The last step, two blocks, moves the point beyond it.
-        self.assertEqual(offsets["outer"], (BlockPos(-1, 0, -2),))
+        self.assertEqual(offsets["outer"], (BlockPos(-1, 0, 2),))
 
 
 class ManhattanLeadTests(unittest.TestCase):
+    # Measured at 90, which is a mirrored quarter: a quarter turn adds a
+    # mirror across the long edge, so the odd ones carry one. The step rule
+    # is unchanged by that -- a column left of a stepping one still moves
+    # with it -- but the mirror turns the staircase over, so what the section
+    # calls forward reads as +z on the ground here. At 0 and at 180 it does
+    # not; `test_moves_follow_the_quarter_layout` measures one of those.
+
     def section(self, manhattan):
         return CrossSection(
             PointField(
@@ -512,19 +652,33 @@ class ManhattanLeadTests(unittest.TestCase):
 
     def test_points_right_of_a_right_manhattan_point_move_backward(self) -> None:
         depths = self.depths(self.section("d"))
-        self.assertEqual([depths[n][1] for n in NAMES], [0, 0, 0, 0, 0, 1, 1])
+        self.assertEqual([depths[n][1] for n in NAMES], [0, 0, 0, 0, 0, -1, -1])
 
     def test_points_left_of_a_left_manhattan_point_move_forward(self) -> None:
         depths = self.depths(self.section("c"))
-        self.assertEqual([depths[n][1] for n in NAMES], [-1, -1, 0, 0, 0, 0, 0])
+        self.assertEqual([depths[n][1] for n in NAMES], [1, 1, 0, 0, 0, 0, 0])
 
     def test_moves_add_up_across_manhattan_points(self) -> None:
         depths = self.depths(self.section("bcde"))
-        self.assertEqual([depths[n][1] for n in NAMES], [-2, -1, 0, 0, 0, 1, 2])
+        self.assertEqual([depths[n][1] for n in NAMES], [2, 1, 0, 0, 0, -1, -2])
 
     def test_the_origin_column_moves_the_left_side(self) -> None:
         depths = self.depths(self.section("o"))
-        self.assertEqual([depths[n][1] for n in NAMES], [-1, -1, -1, 0, 0, 0, 0])
+        self.assertEqual([depths[n][1] for n in NAMES], [1, 1, 1, 0, 0, 0, 0])
+
+    def test_a_stepping_column_is_the_corner_of_the_staircase(self) -> None:
+        # Everything beyond it moves with it, whether it steps itself or not,
+        # and it stands in both segments: the row is a staircase, and this
+        # column is the corner joining one run of it to the next.
+        section = self.section("d")
+        [corner] = [o for o in section.orient(90) if o.annotation.name == "d"]
+
+        self.assertEqual([p.z for p in corner.offsets], [0, -1])
+        self.assertEqual(self.depths(section)["e"][1], -1)
+
+    def test_every_stepping_column_on_a_side_adds_to_the_lead(self) -> None:
+        depths = self.depths(self.section("abco"))
+        self.assertEqual([depths[n][1] for n in NAMES], [3, 2, 1, 0, 0, 0, 0])
 
     def test_manhattan_points_in_one_column_move_the_points_beyond_once(self) -> None:
         section = CrossSection(
@@ -536,7 +690,7 @@ class ManhattanLeadTests(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual(self.depths(section)["out"], (2, 1))
+        self.assertEqual(self.depths(section)["out"], (2, -1))
 
     def test_moves_follow_the_quarter_layout(self) -> None:
         # At 180, forward is east, so the right side moves west.
@@ -546,7 +700,7 @@ class ManhattanLeadTests(unittest.TestCase):
 
     def test_moved_manhattan_points_still_step_from_where_they_moved(self) -> None:
         offsets = {o.annotation.name: o for o in self.section("de").orient(90)}
-        self.assertEqual([tuple(p) for p in offsets["e"].offsets], [(2, 0, 1), (2, 0, 2)])
+        self.assertEqual([tuple(p) for p in offsets["e"].offsets], [(2, 0, -1), (2, 0, -2)])
 
 
 class FeaturePathTests(unittest.TestCase):

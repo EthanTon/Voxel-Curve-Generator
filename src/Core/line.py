@@ -3,13 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 
 from .coordinates import BlockPos
-from .modes import StepMode
+from .modes import LineMode
 
 
 def line(
     start: BlockPos | Sequence[int],
     end: BlockPos | Sequence[int],
-    mode: StepMode = StepMode.CHEBYSHEV,
+    mode: LineMode = LineMode.CHEBYSHEV,
 ) -> tuple[BlockPos, ...]:
     # A straight run of blocks from one position to another, both included.
     #
@@ -25,11 +25,11 @@ def line(
     if end < start:
         return line(end, start, mode)[::-1]
     diagonal = tuple(_walk(start, end))
-    if mode == StepMode.CHEBYSHEV:
+    if mode == LineMode.CHEBYSHEV:
         return diagonal
-    if mode == StepMode.MANHATTAN:
+    if mode == LineMode.MANHATTAN:
         return tuple(_face_connected(diagonal))
-    raise ValueError(f"Unknown step mode: {mode}")
+    raise ValueError(f"Unknown line mode: {mode}")
 
 
 def _walk(start: BlockPos, end: BlockPos) -> Iterator[BlockPos]:
@@ -62,18 +62,33 @@ def _walk(start: BlockPos, end: BlockPos) -> Iterator[BlockPos]:
 
 def _face_connected(diagonal: Sequence[BlockPos]) -> Iterator[BlockPos]:
     # The same run with every diagonal step broken into single-axis moves, so
-    # consecutive blocks always share a face. The longest axis moves first,
-    # which keeps the run against the line it is drawn along.
+    # consecutive blocks share a face -- the stepped Bresenham the reference
+    # draws a connected line with, which on a diagonal step emits the block
+    # one along the first axis before the block that moved both.
+    #
+    # In plan only. A step that climbs keeps the climb on its last move
+    # across, so that move is one along and one up: that is a slope, and it
+    # is the only way a rail can climb. Split off as a move of its own the
+    # climb puts a block in the corner instead, which a rail cannot express
+    # -- it comes out flat and cuts into whatever it runs over.
+    #
+    # The two axes across go in their own order, x then z, rather than the
+    # longer first. A fixed order makes the staircase lean the same way the
+    # whole length of a run; picking per step by which axis has travelled
+    # furthest makes it change sides partway along.
     if not diagonal:
         return
     yield diagonal[0]
     for before, after in zip(diagonal, diagonal[1:]):
-        moves = [axis for axis in range(3) if after[axis] != before[axis]]
-        moves.sort(key=lambda axis: -abs(after[axis] - diagonal[0][axis]))
         position = list(before)
-        for axis in moves:
+        across = [axis for axis in (0, 2) if after[axis] != position[axis]]
+        for axis in across[:-1]:
             position[axis] = after[axis]
             yield BlockPos(*position)
+        if across:
+            position[across[-1]] = after[across[-1]]
+        position[1] = after[1]
+        yield BlockPos(*position)
 
 
 def _sign(value: int) -> int:

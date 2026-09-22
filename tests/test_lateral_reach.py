@@ -77,12 +77,16 @@ class LateralReachTests(unittest.TestCase):
             LateralReach(3.0, 0.0),
         )
 
-    def test_diagonal_layouts_can_reach_further_than_quarters(self) -> None:
+    def test_a_diagonal_reaches_less_far_to_the_side_than_its_quarters(self) -> None:
+        # A join is the two quarters carried along the diagonal and then
+        # centred on the path point. Carrying something along travel does not
+        # move it sideways, and centring pulls it back in, so what is left is
+        # a quarter's row foreshortened and no longer lopsided.
         wide_right = section((-2, feature()), (5, feature()))
         quarter = lateral_reach([wide_right], 90)
         diagonal = lateral_reach([wide_right], 135)
-        self.assertGreater(diagonal.left, quarter.left)
-        self.assertGreater(diagonal.right, quarter.right)
+        self.assertLess(diagonal.half_width, quarter.half_width)
+        self.assertAlmostEqual(diagonal.right, 4 / 2 ** 0.5)
 
     def test_without_a_turn_it_takes_the_worst_of_every_turn(self) -> None:
         wide_right = section((-2, feature()), (5, feature()))

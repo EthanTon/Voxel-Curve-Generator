@@ -49,6 +49,11 @@ def column_pushes(steps: Iterable[tuple[int, tuple[int, ...]]]) -> dict[int, int
 def lead(column: int, pushes: Mapping[int, int]) -> int:
     # How far a point at `column` is moved by the columns between it and the
     # origin on its side.
+    #
+    # Everything beyond a stepping column moves with it, whether it steps
+    # itself or not. That is what makes the row a staircase rather than a
+    # straight line with two bumps in it: the stepping column is the corner
+    # joining the segment inboard of it to the segment outboard.
     return sum(
         push
         for pushing, push in pushes.items()

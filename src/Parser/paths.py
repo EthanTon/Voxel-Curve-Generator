@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ..Core.coordinates import BlockPos, ColumnPos, Vec3
+from ..Core.CrossSection.turns import JOIN_DEGREES
 from .spec import OutputSpec, PathSpec
 from .values import read_column, require
 
@@ -25,7 +26,18 @@ def read_path(data: Mapping, base: Path = Path(".")) -> PathSpec:
             f"a lead of {lead} at each end needs more than {lead * 2} points, "
             f"and the path has {len(points)}"
         )
-    return PathSpec(points, gradients, lead)
+    return PathSpec(points, gradients, lead, read_diagonal(source))
+
+
+def read_diagonal(source: Mapping) -> float:
+    degrees = source.get("diagonal_degrees", JOIN_DEGREES)
+    if not 0 <= degrees <= 45:
+        raise ValueError(
+            f"diagonal_degrees is how near a diagonal a heading has to be "
+            f"for the join to be laid there, between 0 and 45 degrees, and "
+            f"the path gives {degrees}"
+        )
+    return degrees
 
 
 def read_path_file(path: Path) -> Mapping:

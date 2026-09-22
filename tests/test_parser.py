@@ -30,6 +30,37 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.output.name, "build")
         self.assertEqual(spec.domain("rail").name, "rail")
 
+    def test_the_output_is_written_beside_the_build(self) -> None:
+        # Every other path in a build is relative to the build's own file,
+        # and the output is too, so it does not move with the working
+        # directory the build was run from.
+        spec = parse(config(), Path("builds/curve"))
+
+        self.assertEqual(spec.output.path, Path("builds/curve/out.litematic"))
+
+    def test_an_absolute_output_is_left_where_it_was_written(self) -> None:
+        data = config(output={"path": "/tmp/out.litematic"})
+
+        spec = parse(data, Path("builds/curve"))
+
+        self.assertEqual(spec.output.path, Path("/tmp/out.litematic"))
+
+    def test_a_path_lays_the_join_close_to_the_diagonal_by_default(self) -> None:
+        self.assertEqual(parse(config()).path.diagonal_degrees, 2.0)
+
+    def test_a_path_may_narrow_what_counts_as_a_diagonal(self) -> None:
+        data = config()
+        data["path"]["diagonal_degrees"] = 1.0
+
+        self.assertEqual(parse(data).path.diagonal_degrees, 1.0)
+
+    def test_a_diagonal_wider_than_half_a_step_is_refused(self) -> None:
+        data = config()
+        data["path"]["diagonal_degrees"] = 60
+
+        with self.assertRaisesRegex(ValueError, "between 0 and 45 degrees"):
+            parse(data)
+
     def test_a_missing_key_says_which_one(self) -> None:
         data = config()
         del data["path"]["gradients"]

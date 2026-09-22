@@ -2,10 +2,12 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from src.Assembly import assemble
+from src.Assembly import assemble, write
 from src.Parser import load, parse
 from src.Assembly.assemble import (
     fitted_sections,
+    lane_support,
+    mark_lane,
     points_for,
     strand_of,
     runs_under,
@@ -23,9 +25,11 @@ from src.Assembly.structure import (
 )
 from src.Parser.spec import SectionElevation
 from src.Core.coordinates import BlockPos, ColumnPos
+from src.Core.line import line
 from src.Core.block.connectivity_options import ConnectionAction
 from src.Core.modes import (
     ElevationMode,
+    LineMode,
     PlacementMode,
     StepMode,
     TerrainMaskMode,
@@ -34,7 +38,63 @@ from src.Core.Field.block_field import BlockField
 from src.Core.block.registry import BlockRegistry
 from src.Core.block.states import BlockState
 from src.Format.region import BlockRegion
-from src.Format.schematics import state_key, write_schematic
+from src.Format.litematic import load_litematic
+from src.Format.schematics import load_schematic, state_key, write_schematic
+from src.Generation.Geometry.frames import elevation_from_frames
+from src.Generation.Sweep.delivery import cover
+from src.Stamping.stamp import laid_offset
+
+
+class CurveRailRegressionTests(unittest.TestCase):
+    def test_rails_follow_the_sleeper_columns_through_climbs_and_join(self):
+        sample = Path(__file__).resolve().parents[1] / "sandbox/curve800/build.toml"
+        spec = load(sample)
+        path = build_path(spec)
+        spans = resolve_spans(spec, path)
+        sections = build_sections(spec, BlockRegistry(), build_domains(spec), spans)
+        schedules = build_schedules(sections, spans, len(path.path_points))
+        frames = build_path_frames(spec, schedules, path)
+        runs = sweep(spec, schedules, path, frames)
+        centre = next(run for run in runs if run.annotation.name == "trackbed")
+        level = elevation_from_frames(frames)
+        mask = cover(frames)
+
+        for lane in spec.lanes[:2]:
+            with self.subTest(lane=lane.name):
+                support = lane_support(lane, centre, runs)
+                rails = {
+                    BlockPos(
+                        point.position.x + offset.x,
+                        point.position.y + point.y_offset + offset.y,
+                        point.position.z + offset.z,
+                    )
+                    for point in mark_lane(
+                        lane, centre, sections["trackbed"], level, support
+                    )
+                    for offset in (
+                        laid_offset(lane.offset, point.laid_at, point.mirrored),
+                    )
+                    if mask.contains(point.position.x + offset.x,
+                                     point.position.z + offset.z)
+                }
+                self.assertTrue(rails)
+                self.assertFalse(rails - support)
+
+                remaining = set(rails)
+                reached = {remaining.pop()}
+                frontier = list(reached)
+                while frontier:
+                    here = frontier.pop()
+                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        for dy in (-1, 0, 1):
+                            neighbor = BlockPos(
+                                here.x + dx, here.y + dy, here.z + dz
+                            )
+                            if neighbor in remaining:
+                                remaining.remove(neighbor)
+                                reached.add(neighbor)
+                                frontier.append(neighbor)
+                self.assertEqual(reached, rails)
 
 
 def config(**overrides) -> dict:
@@ -215,21 +275,24 @@ class SpanResolutionTests(SectionTestCase):
 
 
 
+def profile_schematic(directory: Path, name="stdtrack", blocks=None,
+                      block="minecraft:stone") -> Path:
+    # A 3-wide, 1-deep profile, written as a real .schem. The Offset is
+    # what centres it on the path, so it is written too.
+    registry = BlockRegistry()
+    field = BlockField(registry.palette)
+    for position in blocks or [(-1, 0, 0), (0, 0, 0), (1, 0, 0)]:
+        field.set_block(position, BlockState.create(block))
+    directory.mkdir(parents=True, exist_ok=True)
+    region = BlockRegion.from_field(field, name=name)
+    return write_schematic(
+        region, directory / f"{name}.schem",
+        data_version=3700, offset=region.origin,
+    )
+
+
 class SchematicTests(SectionTestCase):
-    def profile(self, directory: Path, name="stdtrack", blocks=None,
-                block="minecraft:stone") -> Path:
-        # A 3-wide, 1-deep profile, written as a real .schem. The Offset is
-        # what centres it on the path, so it is written too.
-        registry = BlockRegistry()
-        field = BlockField(registry.palette)
-        for position in blocks or [(-1, 0, 0), (0, 0, 0), (1, 0, 0)]:
-            field.set_block(position, BlockState.create(block))
-        directory.mkdir(parents=True, exist_ok=True)
-        region = BlockRegion.from_field(field, name=name)
-        return write_schematic(
-            region, directory / f"{name}.schem",
-            data_version=3700, offset=region.origin,
-        )
+    profile = staticmethod(profile_schematic)
 
     def built(self, directory, **overrides):
         data = self.sectioned(**overrides)
@@ -248,10 +311,56 @@ class SchematicTests(SectionTestCase):
                 spec, registry, domains, resolve_spans(spec, path)
             )["standard"]
 
-        self.assertEqual(len(section.points), 1)
-        annotation = next(iter(section.points))
-        self.assertEqual(annotation.name, "standard")
-        self.assertEqual(len(annotation.feature.blocks), 3)
+        # A point per column of the profile, so a diagonal has halves to
+        # stagger. The column on the centreline is named for the section.
+        self.assertEqual(len(section.points), 3)
+        self.assertEqual(
+            sorted(each.name for each in section.points),
+            ["standard", "standard[-1,0]", "standard[1,0]"],
+        )
+        self.assertEqual(
+            {each.section for each in section.points}, {"standard"}
+        )
+        self.assertEqual(
+            [len(each.feature.blocks) for each in section.points], [1, 1, 1]
+        )
+
+    def test_columns_step_the_way_the_section_says(self) -> None:
+        # A solid row is chebyshev by default: its columns already share
+        # faces along the row, and stepping would push the ones beyond them.
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(directory, width=3, depth=1)
+
+            section = build_sections(
+                spec, registry, domains, resolve_spans(spec, path)
+            )["standard"]
+
+        self.assertEqual(
+            {each.step_mode for each in section.points}, {StepMode.CHEBYSHEV}
+        )
+
+    def test_a_column_may_be_told_to_step(self) -> None:
+        # A column that has to stay face-connected along the path says so.
+        with TemporaryDirectory() as directory:
+            spec, registry, domains, path = self.built(
+                directory, width=3, depth=1, steps={"1,0": "manhattan"}
+            )
+
+            section = build_sections(
+                spec, registry, domains, resolve_spans(spec, path)
+            )["standard"]
+
+        modes = {tuple(each.position): each.step_mode for each in section.points}
+        self.assertEqual(modes[(1, 0, 0)], StepMode.MANHATTAN)
+        self.assertEqual(modes[(0, 0, 0)], StepMode.CHEBYSHEV)
+
+    def test_a_badly_written_column_says_how_to_write_it(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1, steps={"middle": "manhattan"})
+            self.profile(Path(directory) / "schems")
+
+            with self.assertRaisesRegex(ValueError, 'a column is written "x,z"'):
+                parse(data, Path(directory))
 
     def test_a_section_takes_its_domain(self) -> None:
         with TemporaryDirectory() as directory:
@@ -452,16 +561,24 @@ class SweepTests(SchematicTests):
             runs = self.swept(directory, spans=[["start", "bridge_in"],
                                                 ["brim_in", "end"]])
 
-        self.assertEqual([run.span for run in runs], [0, 1])
-        self.assertEqual({run.annotation.name for run in runs}, {"standard"})
+        # One run per column per span, and every one of them the same section.
+        self.assertEqual(sorted({run.span for run in runs}), [0, 1])
+        self.assertEqual({run.annotation.section for run in runs}, {"standard"})
+        self.assertEqual(len(runs), 6)
 
     def test_a_run_keeps_the_annotations_own_feature(self) -> None:
         with TemporaryDirectory() as directory:
             runs = self.swept(directory)
 
-        feature = runs[0].annotation.feature
-        self.assertEqual(feature.elevation_mode, ElevationMode.RIGID)
-        self.assertEqual(len(feature.blocks), 3)
+        # Each run carries its own column's blocks, and the three columns
+        # together are the profile.
+        self.assertEqual(
+            {run.annotation.feature.elevation_mode for run in runs},
+            {ElevationMode.RIGID},
+        )
+        self.assertEqual(
+            sum(len(run.annotation.feature.blocks) for run in runs), 3
+        )
 
     def test_every_delivered_point_carries_its_frames_level(self) -> None:
         with TemporaryDirectory() as directory:
@@ -492,9 +609,13 @@ class SweepTests(SchematicTests):
 
             runs = sweep(spec, schedules, path, frames)
 
-        # One run across the break, carrying both levels.
-        self.assertEqual(len(runs), 1)
-        self.assertEqual({point.y_offset for point in runs[0].path}, {64, 65})
+        # A run per column, each carrying both levels across the break.
+        self.assertEqual(len(runs), 3)
+        for run in runs:
+            self.assertEqual(
+                {point.y_offset for point in run.path}, {64, 65},
+                f"{run.annotation.name} does not cross the break",
+            )
 
     def test_stacked_sections_sweep_into_separate_runs(self) -> None:
         with TemporaryDirectory() as directory:
@@ -527,7 +648,7 @@ class SweepTests(SchematicTests):
             runs = sweep(spec, schedules, path, frames)
 
         self.assertEqual(
-            sorted(run.annotation.name for run in runs),
+            sorted({run.annotation.section for run in runs}),
             ["standard", "standardbrim"],
         )
 
@@ -602,7 +723,7 @@ class StructureTests(SweepTests):
             data = self.structured(directory, resolution=22.5)
 
             with self.assertRaisesRegex(
-                ValueError, r"missing \[22.5, 45.0, 67.5\]"
+                ValueError, r"missing \[22.5, 45.0\]"
             ):
                 parse(data, Path(directory))
 
@@ -689,7 +810,7 @@ class StructureTests(SweepTests):
             )
 
         # Every three blocks along, rather than at every point, and the end.
-        self.assertEqual(marks, [0, 3, 6, 7])
+        self.assertEqual(marks, [0, 3, 6, 8])
 
     def test_without_spacing_it_lands_at_every_point(self) -> None:
         with TemporaryDirectory() as directory:
@@ -702,7 +823,7 @@ class StructureTests(SweepTests):
                 ).name.endswith("gold_block")
             )
 
-        self.assertEqual(marks, [0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(marks, [0, 1, 2, 3, 4, 5, 6, 7, 8])
 
     def test_an_offset_turns_with_the_structure(self) -> None:
         with TemporaryDirectory() as directory:
@@ -719,7 +840,7 @@ class StructureTests(SweepTests):
 
         # Travelling east, two to the right of travel is two south. The run
         # ends anchored, so the far end carries one too.
-        self.assertEqual(marks, [(0, 64, 2), (7, 64, 2)])
+        self.assertEqual(marks, [(0, 64, 2), (8, 64, 2)])
 
 
 
@@ -756,7 +877,7 @@ class WireTests(SweepTests):
         )
         frames = build_path_frames(spec, schedules, path)
         runs = sweep(spec, schedules, path, frames)
-        return spec, runs, registry, domains
+        return spec, runs, registry, domains, sections
 
     def strand(self, world):
         return sorted(
@@ -773,14 +894,14 @@ class WireTests(SweepTests):
 
         wire = spec.wire("catenary")
         self.assertEqual(wire.sections, ("standard",))
-        self.assertEqual(wire.step, StepMode.MANHATTAN)
+        self.assertEqual(wire.step, LineMode.MANHATTAN)
         self.assertEqual(wire.spacing, 4)
 
     def test_stepping_is_read_by_name(self) -> None:
         with TemporaryDirectory() as directory:
             spec = parse(self.wired(directory, step="chebyshev"), Path(directory))
 
-        self.assertEqual(spec.wire("catenary").step, StepMode.CHEBYSHEV)
+        self.assertEqual(spec.wire("catenary").step, LineMode.CHEBYSHEV)
 
     def test_a_wire_must_ride_on_something(self) -> None:
         with TemporaryDirectory() as directory:
@@ -796,11 +917,11 @@ class WireTests(SweepTests):
         with TemporaryDirectory() as directory:
             world = assemble(parse(self.wired(directory), Path(directory)))
 
-        # Poles every four blocks along a run of eight: an unbroken strand
+        # Poles every four blocks along a run of nine: an unbroken strand
         # from the first to the last, not a block at each pole.
         self.assertEqual(
             self.strand(world),
-            [(x, 64, 0) for x in range(0, 8)],
+            [(x, 64, 0) for x in range(0, 9)],
         )
 
     def test_an_offset_hangs_the_wire_off_the_path(self) -> None:
@@ -810,11 +931,11 @@ class WireTests(SweepTests):
             )
 
         # Three up and one to the right of travel, which heading east is south.
-        self.assertEqual(self.strand(world), [(x, 67, 1) for x in range(0, 8)])
+        self.assertEqual(self.strand(world), [(x, 67, 1) for x in range(0, 9)])
 
     def test_a_wire_is_one_placement_however_long_it_runs(self) -> None:
         with TemporaryDirectory() as directory:
-            spec, runs, registry, domains = self.prepared(directory)
+            spec, runs, registry, domains, sections = self.prepared(directory)
             world = assemble(spec)
 
         wires = [
@@ -829,24 +950,43 @@ class WireTests(SweepTests):
         # The run's last point is a pole whatever the spacing, so a wire too
         # long to be spaced still reaches from one end to the other.
         with TemporaryDirectory() as directory:
-            spec, runs, registry, domains = self.prepared(directory, spacing=100)
-            strand = strand_of(spec, spec.wire("catenary"), runs[0])
+            spec, runs, registry, domains, sections = self.prepared(directory, spacing=100)
+            strand = strand_of(
+                spec, spec.wire("catenary"), runs[0], sections["standard"],
+                lambda x, z: 64,
+            )
 
         self.assertEqual(min(strand).x, 0)
-        self.assertEqual(max(strand).x, 7)
+        self.assertEqual(max(strand).x, 8)
 
     def test_manhattan_stepping_keeps_the_strand_face_connected(self) -> None:
         with TemporaryDirectory() as directory:
-            spec, runs, registry, domains = self.prepared(
+            spec, runs, registry, domains, sections = self.prepared(
                 directory, offset=[0, 2, 0], spacing=4
             )
             # Segments share the pole they meet at, so the strand is deduped.
-            blocks = sorted(set(strand_of(spec, spec.wire("catenary"), runs[0])))
+            blocks = sorted(set(strand_of(
+                spec, spec.wire("catenary"), runs[0], sections["standard"],
+                lambda x, z: 64,
+            )))
 
         for before, after in zip(blocks, blocks[1:]):
             self.assertEqual(
                 sum(abs(after[axis] - before[axis]) for axis in range(3)), 1
             )
+
+    def test_a_wire_climbs_between_anchors_independently_of_the_track(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.wired(directory, offset=[0, 3, 0], spacing=100)
+            data["path"]["points"] = [
+                [x, 64 + (x >= 2), 0] for x in range(9)
+            ]
+            world = assemble(parse(data, Path(directory)))
+
+        expected = sorted(tuple(point) for point in line(
+            (0, 67, 0), (8, 68, 0), LineMode.MANHATTAN
+        ))
+        self.assertEqual(self.strand(world), expected)
 
 
 
@@ -932,7 +1072,7 @@ class DropperTests(SweepTests):
 
         columns = sorted({x for x, _, _ in self.chains(world)})
         # Every four, and the point the run ends on whatever the spacing.
-        self.assertEqual(columns, [0, 4, 8, 12, 16, 20, 23])
+        self.assertEqual(columns, [0, 4, 8, 12, 16, 20, 24])
 
     def test_a_dropper_reaches_from_one_wire_to_the_other(self) -> None:
         with TemporaryDirectory() as directory:
@@ -940,6 +1080,19 @@ class DropperTests(SweepTests):
 
         at_start = sorted(y for x, y, _ in self.chains(world) if x == 0)
         self.assertEqual(at_start, [67, 68, 69, 70])
+
+    def test_a_dropper_joins_the_wires_at_their_interpolated_height(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.hung(directory)
+            data["path"]["points"] = [
+                [x, 64 + (x >= 2), 0] for x in range(25)
+            ]
+            world = assemble(parse(data, Path(directory)))
+
+        # The deck has already risen at x=4, but each wire spanning x=0..8
+        # reaches its new height later. The dropper follows those wire blocks.
+        at_four = sorted(y for x, y, _ in self.chains(world) if x == 4)
+        self.assertEqual(at_four, [67, 68, 69, 70])
 
     def test_a_dropper_hangs_from_where_a_wire_actually_is(self) -> None:
         # Poles every eight over a bend: between them the wire lies on the
@@ -952,8 +1105,19 @@ class DropperTests(SweepTests):
                 parse(self.hung(directory, points, gradients), Path(directory))
             )
 
-        # Every dropper still finds both wires, none silently missing.
-        self.assertEqual(len({x for x, _, _ in self.chains(world)}), 6)
+        # Every dropper still reaches from one wire to the other. Counting
+        # the columns would only say how many there are, and a bend moves
+        # that about; what matters is that none of them stops short.
+        columns: dict[tuple[int, int], list[int]] = {}
+        for x, y, z in self.chains(world):
+            columns.setdefault((x, z), []).append(y)
+
+        self.assertTrue(columns)
+        for where, heights in sorted(columns.items()):
+            self.assertEqual(
+                sorted(heights), [67, 68, 69, 70],
+                f"the dropper at {where} does not reach both wires",
+            )
 
 
 
@@ -989,19 +1153,34 @@ class LaneTests(SweepTests):
 
     def test_a_lane_is_a_dash_and_a_gap_over_and_over(self) -> None:
         with TemporaryDirectory() as directory:
-            world = assemble(parse(self.laned(directory), Path(directory)))
+            world = assemble(
+                parse(self.laned(directory, step="chebyshev"), Path(directory))
+            )
 
         # Three on, five off, from where the run starts.
-        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10])
+        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10, 16])
 
     def test_a_lane_may_be_counted_in_blocks(self) -> None:
         with TemporaryDirectory() as directory:
             world = assemble(
-                parse(self.laned(directory, measure="distance"), Path(directory))
+                parse(
+                    self.laned(directory, step="chebyshev", measure="distance"),
+                    Path(directory),
+                )
             )
 
         # The run's points are a block apart, so both measures agree here.
-        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10])
+        self.assertEqual(self.marks(world), [0, 1, 2, 8, 9, 10, 16])
+
+    def test_a_stepping_lane_paints_a_block_along_travel_as_well(self) -> None:
+        # A lane sits at a local column and answers the same step question a
+        # column of the section does. Stepping, it paints where it sits and a
+        # block along travel, so a dash of three points is four blocks long
+        # and consecutive blocks share a face.
+        with TemporaryDirectory() as directory:
+            world = assemble(parse(self.laned(directory), Path(directory)))
+
+        self.assertEqual(self.marks(world), [0, 1, 2, 3, 8, 9, 10, 11, 16])
 
     def test_a_lane_takes_a_block_or_a_schematic(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1027,7 +1206,7 @@ class LaneTests(SweepTests):
         with TemporaryDirectory() as directory:
             world = assemble(parse(self.laned(directory, off=0), Path(directory)))
 
-        self.assertEqual(self.marks(world), list(range(0, 16)))
+        self.assertEqual(self.marks(world), list(range(0, 17)))
 
     def test_a_negative_gap_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1126,6 +1305,50 @@ class BuildOrderTests(SweepTests):
         annotation = next(iter(section.points))
         self.assertEqual(
             annotation.feature.placement_mode, PlacementMode.REPLACE_AIR_ONLY
+        )
+
+
+class OutputTests(SectionTestCase):
+    def written(self, directory, name):
+        # The suffix on the output is what picks the format. The path is long
+        # enough, and led far enough, for the profile to reach past its ends.
+        data = self.sectioned(width=3, depth=1, spans=[["start", "end"]])
+        data["path"]["points"] = [[n, 64, 0] for n in range(9)]
+        data["path"]["gradients"] = [[1, 0, 0]] * 9
+        data["path"]["lead"] = 3
+        data["marker"]["end"] = [8, 0]
+        data["output"] = {"path": f"out/{name}", "name": "curve"}
+        profile_schematic(Path(directory) / "schems")
+        spec = parse(data, Path(directory))
+        return write(assemble(spec), spec)
+
+    def test_a_litematic_suffix_writes_a_litematic(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = self.written(directory, "curve.litematic")
+
+            regions = load_litematic(path)
+
+        self.assertEqual([region.name for region in regions], ["curve"])
+
+    def test_a_schem_suffix_writes_a_schematic(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = self.written(directory, "curve.schem")
+
+            region, offset = load_schematic(path)
+
+        self.assertTrue(region.has_content)
+        # The Offset is the region's own origin, so the build pastes at the
+        # coordinates it was laid out at rather than at the paste point.
+        self.assertEqual(offset, region.origin)
+
+    def test_both_formats_hold_the_same_blocks(self) -> None:
+        with TemporaryDirectory() as directory:
+            litematic = load_litematic(self.written(directory, "curve.litematic"))[0]
+            schematic, _ = load_schematic(self.written(directory, "curve.schem"))
+
+        self.assertEqual(
+            sorted(state_key(state) for _, state in litematic.iter_occupied()),
+            sorted(state_key(state) for _, state in schematic.iter_occupied()),
         )
 
 

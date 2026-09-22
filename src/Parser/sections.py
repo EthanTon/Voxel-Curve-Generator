@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from ..Core.coordinates import ColumnPos
-from ..Core.modes import PlacementMode
+from ..Core.modes import PlacementMode, StepMode
 from .spec import SectionElevation, SectionSpec, SpanSpec
 from .values import read_column, read_enum, require
 
@@ -42,7 +42,25 @@ def read_section(
         elevation=read_enum(
             SectionElevation, defined.get("elevation"), SectionElevation.FOLLOW
         ),
+        step=read_enum(StepMode, defined.get("step"), StepMode.CHEBYSHEV),
+        steps=read_steps(defined.get("steps", {}), name),
     )
+
+
+def read_steps(data: Mapping, name: str) -> dict[tuple[int, int], StepMode]:
+    # Per-column step modes, keyed "x,z" in the profile's own local axes.
+    steps = {}
+    for column, mode in data.items():
+        try:
+            x, _, z = column.partition(",")
+            where = (int(x), int(z))
+        except ValueError:
+            raise ValueError(
+                f"section {name!r} keys a step by {column!r}; a column is "
+                'written "x,z", as in "0,0"'
+            ) from None
+        steps[where] = read_enum(StepMode, mode)
+    return steps
 
 
 def with_definition_from_file(data: Mapping, base: Path) -> Mapping:

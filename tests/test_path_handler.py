@@ -77,7 +77,10 @@ class PathGeometryTests(unittest.TestCase):
         [frame] = geometry.elevation_frames
         self.assertEqual((frame.path_start, frame.path_stop), (2, 5))
         self.assertEqual(geometry.bounds.start.path_index, 2)
-        self.assertEqual(geometry.bounds.end.path_index, 5)
+        # The end plane is a block past the last point, so that point's own
+        # column is inside the path. It is not a plane at a path point and
+        # carries no index.
+        self.assertIsNone(geometry.bounds.end.path_index)
         self.assertTrue(geometry.bounds.contains(0, 2))
         self.assertFalse(geometry.bounds.contains(0, 4))
         self.assertFalse(geometry.bounds.contains(0, -1))

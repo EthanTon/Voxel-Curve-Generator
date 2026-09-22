@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ..Core.Domain import DomainRegistry
-from ..Core.CrossSection.turns import normalize
+from ..Core.CrossSection.turns import (
+    normalize,
+    place_along as placed_column,
+    quarter_of,
+)
 from ..Core.Feature.feature import Feature
 from ..Core.Feature.feature_path import FeaturePath, FeaturePathPoint
 from ..Core.Path.path_frame import PathFrame
@@ -21,6 +25,7 @@ from ..Core.coordinates import BlockPos, quarter_turn
 from ..Core.modes import ElevationMode
 from .variants import (
     DEFAULT_RESOLUTION,
+    authored_for,
     Heading,
     authored_headings,
     by_authored,
@@ -72,6 +77,7 @@ class Stamp(Protocol):
 
     def rule(self, point: FeaturePathPoint) -> Feature: ...
 
+    # Every placement the stamp made at this point.
     def stamp(
         self,
         world: BlockWorld,
@@ -81,7 +87,7 @@ class Stamp(Protocol):
         clip: ColumnMask,
         y_offset: YOffset | None = None,
         sequence_index: int | None = None,
-    ) -> PlacementId: ...
+    ) -> tuple[PlacementId, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,16 +110,24 @@ class FixedStamp:
         clip: ColumnMask,
         y_offset: YOffset | None = None,
         sequence_index: int | None = None,
-    ) -> PlacementId:
-        return place(
-            world,
-            feature,
-            point,
-            clip=clip,
-            domains=self.domains,
-            y_offset=y_offset,
-            sequence_index=sequence_index,
+    ) -> tuple[PlacementId, ...]:
+        return (
+            place(
+                world,
+                feature,
+                point,
+                clip=clip,
+                domains=self.domains,
+                y_offset=y_offset,
+                sequence_index=sequence_index,
+            ),
         )
+
+
+# Mirroring across the diagonal is a mirror across one axis and a quarter
+# turn together. A reflection is not a rotation, but the two compose into
+# one, and this is the turn that goes with the mirror across x.
+DIAGONAL_TURN = 1
 
 
 def laid_out(quarter_turns: int) -> int:
@@ -135,14 +149,21 @@ class TurnStamp:
     # profile is stamped by one of these: the section chose the turn, so the
     # blocks follow it rather than deciding again from the gradient.
     #
-    # Only quarter turns rotate blocks. A diagonal is a stagger of quarter
-    # layouts, not a rotation, so its blocks stay at the quarter below it.
+    # Blocks only turn by quarters. A diagonal is two quarter layouts
+    # staggered, and the section records which of them placed each position,
+    # so each half is turned its own way. Left to the turn alone both halves
+    # would take the quarter below the diagonal: entering a diagonal would
+    # change nothing, and leaving one would turn the profile 90 degrees in a
+    # single step and tear a wedge out of the inside of the bend.
 
     feature: Feature
     domains: DomainRegistry | None = None
 
     def rule(self, point: FeaturePathPoint) -> Feature:
         return self.feature
+
+    def layout(self, point: FeaturePathPoint) -> int:
+        return point.laid_at
 
     def stamp(
         self,
@@ -153,25 +174,34 @@ class TurnStamp:
         clip: ColumnMask,
         y_offset: YOffset | None = None,
         sequence_index: int | None = None,
-    ) -> PlacementId:
-        return place(
-            world,
-            feature,
-            point,
-            clip=clip,
-            quarter_turns=lateral_turns(point.turn * point.direction),
-            domains=self.domains,
-            y_offset=y_offset,
-            sequence_index=sequence_index,
+    ) -> tuple[PlacementId, ...]:
+        return (
+            place(
+                world,
+                feature,
+                point,
+                clip=clip,
+                quarter_turns=lateral_turns(quarter_of(self.layout(point))),
+                offset_layout=self.layout(point),
+                # A mirrored layout mirrors its blocks too. Across local
+                # depth, the section's own long edge, which is the same
+                # mirror the positions took.
+                mirror="z" if point.mirrored else None,
+                domains=self.domains,
+                y_offset=y_offset,
+                sequence_index=sequence_index,
+            ),
         )
 
 
 class HeadingStamp:
     # A feature per heading, picked by the way the path travels in plan view.
     #
-    # Only the first quadrant is authored; quarter turns cover the rest, so
-    # 22.5 degree spacing needs four features, not sixteen. Grade is ignored:
-    # a climb and a level run on the same bearing get the same feature.
+    # Only the first octant is authored. Quarter turns carry a variant into
+    # the other three quadrants and a mirror carries it across the diagonal
+    # into the other half of its own, so 22.5 degree spacing needs three
+    # features, not sixteen and not four -- 67.5 is 22.5 mirrored. Grade is
+    # ignored: a climb and a level run on the same bearing get the same one.
 
     def __init__(
         self,
@@ -182,22 +212,24 @@ class HeadingStamp:
         self.resolution = resolution
         self.domains = domains
         self._features = by_authored(features, resolution)
-        self._turns: dict[int, tuple[Feature, int]] = {}
+        self._turns: dict[int, tuple[Feature, int, bool]] = {}
 
     @property
     def headings(self) -> tuple[Heading, ...]:
         return authored_headings(self.resolution)
 
-    def at(self, heading: Heading) -> tuple[Feature, int]:
-        # The feature authored for a heading and the quarter turns round its
-        # own orbit. `stamp` shifts those by the authoring convention.
-        # Cached so the same feature object comes back every time, keeping
-        # BlockWorld's rotated-state cache warm.
+    def at(self, heading: Heading) -> tuple[Feature, int, bool]:
+        # The feature authored for a heading, the quarter turns round its own
+        # orbit, and whether it is mirrored across the diagonal to get there.
+        # `stamp` shifts the turns by the authoring convention. Cached so the
+        # same feature object comes back every time, keeping BlockWorld's
+        # rotated-state cache warm.
         step = step_of(heading, self.resolution)
         found = self._turns.get(step)
         if found is None:
-            quarter_turns, offset = divmod(step, steps_per_quarter(self.resolution))
-            found = (self._features[offset], quarter_turns)
+            quarter_turns, within = divmod(step, steps_per_quarter(self.resolution))
+            offset, mirrored = authored_for(within, self.resolution)
+            found = (self._features[offset], quarter_turns, mirrored)
             self._turns[step] = found
         return found
 
@@ -213,17 +245,29 @@ class HeadingStamp:
         clip: ColumnMask,
         y_offset: YOffset | None = None,
         sequence_index: int | None = None,
-    ) -> PlacementId:
-        _, quarter_turns = self.at(heading_of(point.gradient))
-        return place(
-            world,
-            feature,
-            point,
-            clip=clip,
-            quarter_turns=laid_out(quarter_turns),
-            domains=self.domains,
-            y_offset=y_offset,
-            sequence_index=sequence_index,
+    ) -> tuple[PlacementId, ...]:
+        _, quarter_turns, mirrored = self.at(heading_of(point.gradient))
+        return (
+            place(
+                world,
+                feature,
+                point,
+                clip=clip,
+                # Mirroring across the diagonal is a mirror across one axis
+                # and a quarter turn together: a reflection cannot be a
+                # rotation, but the two compose into one.
+                quarter_turns=laid_out(quarter_turns + (DIAGONAL_TURN if mirrored else 0)),
+                mirror="x" if mirrored else None,
+                # Where it stands is the section's business, not the
+                # heading's: a pole beside the deck belongs where the
+                # section put the column it stands on. Rotating its offset
+                # by the heading's own quarter drifts it as the heading
+                # turns within that quarter.
+                offset_layout=point.layout,
+                domains=self.domains,
+                y_offset=y_offset,
+                sequence_index=sequence_index,
+            ),
         )
 
 
@@ -234,6 +278,8 @@ def place(
     *,
     clip: ColumnMask,
     quarter_turns: int = 0,
+    offset_layout: int | None = None,
+    mirror: str | None = None,
     domains: DomainRegistry | None = None,
     y_offset: YOffset | None = None,
     sequence_index: int | None = None,
@@ -249,13 +295,16 @@ def place(
     #
     # add_field rather than DomainPolicy.place, which cannot pass a clip.
     rigid = feature.elevation_mode == ElevationMode.RIGID
-    origin = BlockPos.coerce(point.position) + turned_offset(
-        feature.offset, quarter_turns
+    origin = BlockPos.coerce(point.position) + (
+        turned_offset(feature.offset, quarter_turns)
+        if offset_layout is None
+        else laid_offset(feature.offset, offset_layout, point.mirrored)
     )
     transform = BlockTransform(
         origin + BlockPos(0, point.y_offset, 0) if rigid else origin,
         quarter_turns,
         _elevation(feature, y_offset),
+        mirror,
     )
     profile = None if domains is None else domains.profile(feature.domain)
     return world.add_field(
@@ -290,7 +339,9 @@ def stamp_along(
     #
     # Connectivity is left for resolve(), once every feature is in.
     return tuple(
-        stamp.stamp(
+        placed
+        for point in path
+        for placed in stamp.stamp(
             world,
             stamp.rule(point),
             point,
@@ -298,7 +349,6 @@ def stamp_along(
             y_offset=y_offset,
             sequence_index=sequence_index,
         )
-        for point in path
     )
 
 
@@ -306,6 +356,22 @@ def turned_offset(offset: BlockPos, quarter_turns: int) -> BlockPos:
     # An offset authored in local axes, turned with the blocks it belongs to.
     x, z = quarter_turn(offset.x, offset.z, quarter_turns)
     return BlockPos(round(x), offset.y, round(z))
+
+
+def laid_offset(offset: BlockPos, layout: int, mirrored: bool = False) -> BlockPos:
+    # Where an offset lands: exactly where the section puts its own column at
+    # that local x, in the layout that placed this position -- and mirrored
+    # the same way that layout is, since a mirror across the long edge turns
+    # local depth over and leaves local x alone.
+    #
+    # Asked as an angle instead -- rotate the offset and round it -- a
+    # diagonal shortens it, because rounding each axis on its own lands
+    # inside the true point. An offset of 2 at 225 degrees is (-1.41, +1.41),
+    # which rounds to (-1, +1): a rail meant to sit two to the right of
+    # travel ends up one and a half, off the column it belongs on. Placing it
+    # the way the section places that column puts it back on the deck.
+    x, z = placed_column(layout, offset.x, -offset.z if mirrored else offset.z)
+    return BlockPos(x, offset.y, z)
 
 
 def _elevation(feature: Feature, y_offset: YOffset | None) -> YOffset | None:

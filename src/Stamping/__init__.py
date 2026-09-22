@@ -11,6 +11,7 @@ from .stamp import (
     lateral_turns,
     place,
     stamp_along,
+    laid_offset,
     turned_offset,
     unclipped,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "snap",
     "stamp_along",
     "step_of",
+    "laid_offset",
     "turned_offset",
     "unclipped",
     "steps_per_quarter",

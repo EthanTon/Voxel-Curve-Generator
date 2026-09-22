@@ -97,6 +97,18 @@ class LitematicTests(unittest.TestCase):
             list(region.iter_cells()),
         )
 
+    def test_writing_makes_the_directory_it_was_pointed_at(self) -> None:
+        # A build names where its output goes; the directory is made rather
+        # than demanded of whoever runs it.
+        path = write_litematic(
+            [self.sample()],
+            self.directory / "out" / "nested" / "curve.litematic",
+            data_version=DATA_VERSION,
+        )
+
+        self.assertTrue(path.exists())
+        self.assertEqual(len(load_litematic(path)), 1)
+
     def test_round_trip_preserves_names_positions_and_cells(self) -> None:
         region = self.sample()
         path = write_litematic([region], self.directory / "curve.litematic", data_version=DATA_VERSION)

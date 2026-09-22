@@ -24,6 +24,10 @@ class FeatureAnnotation:
     position: BlockPos
     feature: Feature
     step_mode: StepMode = StepMode.MANHATTAN
+    # The section this annotation belongs to, where it is one of several
+    # standing for one thing -- a swept profile is a point per column, and
+    # every one of them is still the same section.
+    section: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "position", BlockPos.coerce(self.position))

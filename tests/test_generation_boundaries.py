@@ -58,10 +58,21 @@ class PathBoundsBuilderTests(unittest.TestCase):
         self.path = straight(12, lead_in=2, lead_out=3)
         self.bounds = path_bounds(self.path)
 
-    def test_planes_sit_at_the_first_and_last_path_points(self) -> None:
-        self.assertEqual((self.bounds.start.path_index, self.bounds.end.path_index), (2, 8))
+    def test_the_start_plane_sits_on_the_first_path_point(self) -> None:
+        self.assertEqual(self.bounds.start.path_index, 2)
         self.assertEqual(self.bounds.start.origin, Vec2(0, 2))
-        self.assertEqual(self.bounds.end.origin, Vec2(0, 8))
+
+    def test_the_end_plane_sits_a_block_past_the_last(self) -> None:
+        # A frame holds the columns at or after its start and before its end,
+        # so an end plane on the last point would leave that point outside.
+        # It is not a plane at a path point, and carries no index.
+        self.assertEqual(self.bounds.end.origin, Vec2(0, 9))
+        self.assertIsNone(self.bounds.end.path_index)
+
+    def test_both_path_ends_are_inside(self) -> None:
+        for index in (self.path.first_index, self.path.last_index):
+            position = self.path.path_points[index].position
+            self.assertTrue(self.bounds.contains(position.x, position.z))
 
     def test_padding_columns_fall_outside(self) -> None:
         for index, point in enumerate(self.path.path_points):
@@ -75,8 +86,11 @@ class PathBoundsBuilderTests(unittest.TestCase):
                 [self.bounds.contains(0, z) for z in range(12)],
             )
 
-    def test_single_point_path_is_degenerate(self) -> None:
-        self.assertTrue(path_bounds(Path([(0, 0, 0)], [(1.0, 0.0, 0.0)])).is_degenerate)
+    def test_a_single_point_path_owns_its_own_column(self) -> None:
+        bounds = path_bounds(Path([(0, 0, 0)], [(1.0, 0.0, 0.0)]))
+        self.assertFalse(bounds.is_degenerate)
+        self.assertTrue(bounds.contains(0, 0))
+        self.assertFalse(bounds.contains(1, 0))
 
     def test_empty_path_cannot_be_bounded(self) -> None:
         with self.assertRaises(ValueError):

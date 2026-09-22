@@ -6,9 +6,10 @@ from enum import Enum
 from pathlib import Path
 
 from ..Core.coordinates import BlockPos, ColumnPos, Vec3
+from ..Core.CrossSection.turns import JOIN_DEGREES
 from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionOverride
-from ..Core.modes import ElevationMode, PlacementMode, StepMode
+from ..Core.modes import ElevationMode, LineMode, PlacementMode, StepMode
 from ..Stamping import DEFAULT_RESOLUTION, Heading
 from ..Terraform.plan import Plan as TerraformPlan
 
@@ -17,9 +18,17 @@ from ..Terraform.plan import Plan as TerraformPlan
 class PathSpec:
     # Positions and vectors as given. The only path work is the lead: points
     # extended straight off either end so the ends are framed like any other.
+    #
+    # `diagonal_degrees` is how near a diagonal a heading has to be for the
+    # join between the two quarters either side of it to be laid there. The
+    # join is stamped once, where that run of headings begins, so a wide band
+    # hands the quarter over early and a narrow one puts the join on the
+    # diagonal. A path that swings past a diagonal between two points has its
+    # join laid at the change, so 0 still joins.
     points: tuple[BlockPos, ...]
     gradients: tuple[Vec3, ...]
     lead: int = 0
+    diagonal_degrees: float = JOIN_DEGREES
 
 
 class Measure(Enum):
@@ -51,6 +60,19 @@ class SpanSpec:
 
 @dataclass(frozen=True, slots=True)
 class SectionSpec:
+    # `step` is how the columns of the profile reach the next point along the
+    # path, and `steps` overrides it for named columns, written "x,z".
+    #
+    # CHEBYSHEV delivers a column where it sits and nowhere else. A solid row
+    # wants this: its columns already share faces along the row, and stepping
+    # would make each one push the columns beyond it, so an eleven wide
+    # profile would come out a staircase four deep instead of a row across
+    # the path.
+    #
+    # MANHATTAN also delivers it one block along travel, and pushes whatever
+    # is further out by the same. That is for a column that has to stay
+    # face-connected along the path -- a rail, a wire, a fence in the profile
+    # -- where a diagonal step would leave it touching only at a corner.
     name: str
     domain: str
     schematic: Path
@@ -58,6 +80,8 @@ class SectionSpec:
     width: int = 0
     depth: int = 0
     elevation: SectionElevation = SectionElevation.FOLLOW
+    step: StepMode = StepMode.CHEBYSHEV
+    steps: Mapping[tuple[int, int], StepMode] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,13 +156,17 @@ class WireSpec:
     spacing: float = 0.0
     angle: float = 0.0
     measure: Measure = Measure.DISTANCE
-    step: StepMode = StepMode.MANHATTAN
+    # How the run between two anchors is drawn: a wire is a line between
+    # poles, not a point of a section, so this is a LineMode.
+    step: LineMode = LineMode.MANHATTAN
     placement_mode: PlacementMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class LaneSpec:
-    # A dash of `on` blocks then a gap of `off`, over and over.
+    # A dash of `on` path points then a gap of `off`, over and over. A
+    # stepping lane paints a block along travel as well, so its dash is a
+    # block longer than it is points.
     name: str
     domain: str
     sections: tuple[str, ...]
@@ -148,6 +176,11 @@ class LaneSpec:
     block: str | None = None
     measure: Measure = Measure.INDEX
     offset: BlockPos = BlockPos(0, 0, 0)
+    # How the lane reaches the next path point, the same question a column
+    # of a section answers: MANHATTAN also paints a block along travel, so
+    # the line is four-connected and lands on a column stepping the same way.
+    # CHEBYSHEV paints one block a point and steps diagonally.
+    step: StepMode = StepMode.MANHATTAN
     placement_mode: PlacementMode | None = None
 
 

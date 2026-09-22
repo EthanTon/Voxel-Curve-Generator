@@ -38,6 +38,15 @@ class SchematicTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = Path(tempfile.mkdtemp())
 
+    def test_writing_makes_the_directory_it_was_pointed_at(self) -> None:
+        path = write_schematic(
+            sample_region(),
+            self.directory / "schems" / "nested" / "build.schem",
+            data_version=DATA_VERSION,
+        )
+
+        self.assertTrue(path.exists())
+
     def test_palette_keys_carry_properties_in_sorted_order(self) -> None:
         state = BlockState.create("minecraft:rail", {"waterlogged": "false", "shape": "north_south"})
 

@@ -105,6 +105,19 @@ class BlockRegistry:
         return len(self._palette)
 
     def _sync(self) -> None:
-        missing = len(self._palette) - len(self._info)
-        if missing > 0:
-            self._info.extend([self._default_info] * missing)
+        # Blocks reach a palette without being registered -- a field writes
+        # straight into it -- so the provider is asked for anything that
+        # turned up that way. Without this a rail read out of a schematic is
+        # an anonymous block, and nothing it should connect to knows it.
+        for block_id in range(len(self._info), len(self._palette)):
+            self._info.append(self._provided(self._palette.get_state(block_id)))
+
+    def _provided(self, state: BlockState) -> BlockInfo:
+        if self._info_provider is None:
+            return self._default_info
+        try:
+            return self._info_provider(state)
+        except KeyError:
+            # A block the catalog has never heard of is whatever the default
+            # says it is, rather than a failure to build at all.
+            return self._default_info

@@ -54,11 +54,24 @@ def boundary_at(
 def path_bounds(path: Path, orientation: Orientation = orthogonal) -> PathBounds:
     # The columns the path proper owns: from the plane at its first point to
     # the plane at its last, so padding falls outside at either end.
+    #
+    # A frame holds the columns at or after its first plane and before its
+    # second, which is what stops two frames claiming one column. The first
+    # plane sits on the path's first point, which is therefore inside; the
+    # last is a block past its last point, so that one is inside too. On the
+    # point itself it would not be, and the build would stop a column short
+    # of the path it was given.
+    #
+    # The end is not a plane at a path point and does not claim to be: it
+    # carries no index, so the frame checks take it as given rather than
+    # holding it to the point its frame stops at.
     if not path.path_points:
         raise ValueError("An empty path has no bounds")
+    last = path.path_points[path.last_index].position
+    facing = orientation(path, path.last_index)
     return PathBounds(
         boundary_at(path, path.first_index, orientation),
-        boundary_at(path, path.last_index, orientation),
+        Boundary.from_direction((last.x + facing.x, last.z + facing.z), facing),
     )
 
 

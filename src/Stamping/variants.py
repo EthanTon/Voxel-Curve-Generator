@@ -77,8 +77,32 @@ def authored_turn(
 
 def authored_headings(resolution: float = DEFAULT_RESOLUTION) -> tuple[Heading, ...]:
     # Every heading a set must be authored for: 0 and 45 at a resolution of
-    # 45; 0, 22.5, 45 and 67.5 at 22.5. Each covers three more by rotation.
-    return tuple(step * resolution for step in range(steps_per_quarter(resolution)))
+    # 45; 0, 22.5 and 45 at 22.5.
+    #
+    # The first octant, not the first quadrant. Rotation carries a variant
+    # into the other three quadrants, and a mirror carries it across the
+    # diagonal to the other half of its own -- 67.5 is 22.5 mirrored, and
+    # authoring it as well is authoring the same shape twice.
+    return tuple(
+        step * resolution for step in range(mirrored_step(resolution) + 1)
+    )
+
+
+def mirrored_step(resolution: float = DEFAULT_RESOLUTION) -> int:
+    # The step a quadrant's variants are mirrored about: the diagonal. Steps
+    # past it are the ones below it seen the other way round.
+    return steps_per_quarter(resolution) // 2
+
+
+def authored_for(step: int, resolution: float = DEFAULT_RESOLUTION) -> tuple[int, bool]:
+    # The variant a step within a quadrant is stamped from, and whether it is
+    # mirrored to get there. Steps up to the diagonal are authored; the rest
+    # are their reflections, as far past it as the authored one is short of
+    # it.
+    per_quarter = steps_per_quarter(resolution)
+    if step <= mirrored_step(resolution):
+        return step, False
+    return per_quarter - step, True
 
 
 def by_authored(
@@ -87,7 +111,9 @@ def by_authored(
 ) -> dict[int, Variant]:
     # Authored variants indexed by step within a quarter, one required each.
     # A heading past the first quadrant is refused: it is another one turned
-    # round, and authoring both leaves two answers for one rotation.
+    # round, and one past the diagonal is refused too, since it is another
+    # one mirrored. Either way authoring both leaves two answers for one
+    # shape.
     per_quarter = steps_per_quarter(resolution)
     found: dict[int, Variant] = {}
     for heading, variant in variants.items():
@@ -96,6 +122,11 @@ def by_authored(
             raise ValueError(
                 f"Heading {heading} is not a variant: it is "
                 f"{authored_turn(heading, resolution)[0]} turned round"
+            )
+        if step > mirrored_step(resolution):
+            raise ValueError(
+                f"Heading {heading} is not a variant: it is "
+                f"{(per_quarter - step) * resolution} mirrored"
             )
         found[step] = variant
     missing = [

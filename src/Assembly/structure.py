@@ -11,7 +11,6 @@ from ..Core.Feature.feature import (
     ContinuousFeature,
     Feature,
     PointFeature,
-    ProfileFeature,
 )
 from ..Core.Field.block_field import BlockField
 from ..Core.Path.path import Path
@@ -159,21 +158,63 @@ def build_section(
     spec: SectionSpec, registry: BlockRegistry, domains: DomainRegistry
 ) -> CrossSection:
     # A section records where features sit, not blocks. The schematic is the
-    # swept profile, so it becomes one feature sitting on the centerline.
+    # swept profile, and it becomes a point per column of that profile rather
+    # than one point carrying the whole row.
+    #
+    # That is what makes a diagonal work. A diagonal layout is the two
+    # quarters either side of it, staggered half the section's length apart
+    # and joined at their outermost column. Joining them needs the columns to
+    # be separate points: one point carrying the whole row has nothing to
+    # split between the two halves, so the row is painted twice, once in each
+    # half, and the halves neither meet nor tile.
+    #
+    # The column on the centreline is named for the section itself. It is the
+    # one a fitting rides, so a lane or a wire sees the path rather than
+    # eleven copies of it, and it is there whether the profile paints
+    # anything on the centreline or not.
     blocks = load_field(spec.schematic, registry.palette, spec.name)
     check_extent(spec, blocks)
-    profile = ProfileFeature(
-        blocks=blocks,
-        placement_mode=placing_mode(spec, domains),
-        domain=domains.get(spec.domain),
-        offset=None,
-        # Each delivered point carries the level of the frame it landed in,
-        # so a swept profile sits at that level rather than per column.
-        elevation_mode=ElevationMode.RIGID,
-    )
+    mode = placing_mode(spec, domains)
+    domain = domains.get(spec.domain)
     return CrossSection(
-        points=PointField([FeatureAnnotation(spec.name, BlockPos(0, 0, 0), profile)])
+        points=PointField(
+            FeatureAnnotation(
+                name=spec.name if column == (0, 0) else f"{spec.name}[{column[0]},{column[1]}]",
+                position=BlockPos(column[0], 0, column[1]),
+                feature=PointFeature(
+                    blocks=stack,
+                    placement_mode=mode,
+                    domain=domain,
+                    offset=None,
+                    # Each delivered point carries the level of the frame it
+                    # landed in, so a column sits at that level.
+                    elevation_mode=ElevationMode.RIGID,
+                ),
+                step_mode=spec.steps.get(column, spec.step),
+                section=spec.name,
+            )
+            for column, stack in columns_of(blocks, registry).items()
+        )
     )
+
+
+def columns_of(
+    blocks: BlockField, registry: BlockRegistry
+) -> dict[tuple[int, int], BlockField]:
+    # The profile split into one field per column, each holding that column's
+    # blocks at its own local heights and nothing else. The centreline column
+    # is always there, empty if the profile paints nothing on it.
+    columns: dict[tuple[int, int], BlockField] = {
+        (0, 0): BlockField(registry.palette)
+    }
+    for position, block_id in blocks.iter_block_ids():
+        column = columns.setdefault(
+            (position.x, position.z), BlockField(registry.palette)
+        )
+        column.set_block(
+            BlockPos(0, position.y, 0), blocks.palette.get_state(block_id)
+        )
+    return columns
 
 
 def check_extent(spec: SectionSpec, field: BlockField) -> None:
@@ -318,7 +359,7 @@ def build_wire(
         placement_mode=placing_mode(spec, domains),
         domain=domains.get(spec.domain),
         offset=None,
-        elevation_mode=ElevationMode.DEFORMABLE,
+        elevation_mode=ElevationMode.RIGID,
     )
     for position in positions:
         for local, block_id in strand.iter_block_ids():

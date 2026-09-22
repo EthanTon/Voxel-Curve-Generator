@@ -215,7 +215,7 @@ class ElevationFromFramesTests(unittest.TestCase):
             clip=path_bounds(path),
         )
         levels = {(p.x, p.z): p.y for p in world.iter_source_positions()}
-        self.assertEqual({z for _, z in levels}, set(range(2, 21)))
+        self.assertEqual({z for _, z in levels}, set(range(2, 22)))
         for (x, z), y in levels.items():
             self.assertEqual(y, 64 if z < 12 else 65, (x, z))
 
@@ -305,12 +305,12 @@ class PastedSectionsTests(unittest.TestCase):
         self.assertIsInstance(build_frames(straight(3), 64)[0], ColumnMask)
 
     def test_every_column_on_the_path_has_one_block_at_its_frame_level(self) -> None:
-        # z 2-21 path proper; steps up at z=12.
+        # z 2-21 path proper, its last point included; steps up at z=12.
         path = straight(25, lead_in=2, lead_out=3)
         frames = build_frames(path, 64, [ElevationBreak(12, 65)], lead_in=2, lead_out=2)
         world = self.paste(path, frames, half=2, lead=2)
         flattened = {p for _, blocks in world.iter_resolved_chunks() for p in blocks}
-        expected = {(x, 64 if z < 12 else 65, z) for x in range(-2, 3) for z in range(2, 21)}
+        expected = {(x, 64 if z < 12 else 65, z) for x in range(-2, 3) for z in range(2, 22)}
         self.assertEqual(flattened, expected)
 
     def reaching_gaps(self, path: Path, frames, lead: int, half: int = 3, reach: int = 8):
@@ -371,7 +371,7 @@ class PastedSectionsTests(unittest.TestCase):
         sections = build_section_frames(path, elevation, [6, 12, 16])
         world = self.paste(path, sections, half=2, lead=2)
         flattened = {p for _, blocks in world.iter_resolved_chunks() for p in blocks}
-        expected = {(x, 64 if z < 12 else 65, z) for x in range(-2, 3) for z in range(2, 21)}
+        expected = {(x, 64 if z < 12 else 65, z) for x in range(-2, 3) for z in range(2, 22)}
         self.assertEqual(flattened, expected)
 
 

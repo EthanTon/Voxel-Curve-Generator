@@ -8,7 +8,7 @@ from ..Field.block_field import BlockBounds, BlockField
 from ..block.connectivity import ConnectivityCell, ConnectivityDomainId
 from ..block.palette import BlockId
 from ..block.registry import BlockRegistry
-from ..block.rotation import rotate_block_state
+from ..block.rotation import mirror_block_state, rotate_block_state
 from ..block.states import BlockState
 from ..constants import (
     DEFAULT_BLOCK,
@@ -50,15 +50,26 @@ class BlockTransform:
     origin: BlockPos = BlockPos(0, 0, 0)
     quarter_turns: int = 0
     y_offset: YOffset | None = None
+    # A local axis to flip before turning, or None. A reflection is not any
+    # number of turns, so a field that has to come out mirrored cannot get
+    # there by turning; the blocks are mirrored with the positions, since a
+    # stair that keeps facing the way it did is facing out of the mirror.
+    mirror: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "origin", BlockPos.coerce(self.origin))
         object.__setattr__(self, "quarter_turns", self.quarter_turns % 4)
+        if self.mirror not in (None, "x", "z"):
+            raise ValueError(f"A mirror flips x or z, not {self.mirror!r}")
 
     def _place(self, position: BlockPos) -> BlockPos:
-        # Rotation and translation only: the rigid part of the transform.
+        # Mirror, rotation and translation: the rigid part of the transform.
         position = BlockPos.coerce(position)
         x, y, z = position
+        if self.mirror == "x":
+            x = -x
+        elif self.mirror == "z":
+            z = -z
         x, z = quarter_turn(x, z, self.quarter_turns)
         return BlockPos(x + self.origin.x, y + self.origin.y, z + self.origin.z)
 
@@ -83,6 +94,11 @@ class BlockTransform:
         y -= self.origin.y
         z -= self.origin.z
         x, z = quarter_turn(x, z, -self.quarter_turns)
+        # A mirror is its own inverse, undone last because it was done first.
+        if self.mirror == "x":
+            x = -x
+        elif self.mirror == "z":
+            z = -z
         return BlockPos(x, y, z)
 
     def apply_bounds(self, bounds: BlockBounds) -> BlockBounds:
@@ -548,6 +564,7 @@ class BlockWorld:
             id(placement.field.palette),
             local_id,
             placement.transform.quarter_turns,
+            placement.transform.mirror,
         )
         cached = self._palette_translation.get(cache_key)
         if cached is not None:
@@ -558,14 +575,22 @@ class BlockWorld:
             if placement.field.palette is self.registry.palette
             else self.registry.register(state)
         )
+        # Mirrored first and turned after, the order the positions take.
+        turned = self.registry.get_state(world_id)
+        if placement.transform.mirror is not None:
+            turned = mirror_block_state(
+                turned,
+                self.registry.get_info(world_id),
+                placement.transform.mirror,
+            )
         if placement.transform.quarter_turns:
-            rotated = rotate_block_state(
-                self.registry.get_state(world_id),
+            turned = rotate_block_state(
+                turned,
                 self.registry.get_info(world_id),
                 placement.transform.quarter_turns,
             )
-            if rotated != self.registry.get_state(world_id):
-                world_id = self.registry.get_or_add_variant(world_id, rotated)
+        if turned != self.registry.get_state(world_id):
+            world_id = self.registry.get_or_add_variant(world_id, turned)
         self._palette_translation[cache_key] = world_id
         return world_id
 

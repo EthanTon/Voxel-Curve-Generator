@@ -17,6 +17,7 @@ from src.Generation.Geometry.padding import (
 )
 from src.Generation.Geometry.path_handler import PathGeometry
 from src.Generation.Geometry.reach import (
+    lateral_reach,
     feature_longitudinal_span,
     longitudinal_reach,
     required_lead,
@@ -75,14 +76,29 @@ class LongitudinalReachTests(unittest.TestCase):
         self.assertEqual(longitudinal_reach([]), 0.0)
 
     def test_a_position_ahead_reaches_that_far(self) -> None:
-        self.assertEqual(longitudinal_reach([section(((0, 0, 3), feature()))]), 3.0)
+        deep = section(((0, 0, 3), feature()))
+        self.assertEqual(longitudinal_reach([deep], 0), 3.0)
+        # A join is centred on the path point, and a section one column wide
+        # has one copy of each arm, so the two land on it and reach nothing.
+        self.assertAlmostEqual(longitudinal_reach([deep], 45), 0.0)
 
     def test_blocks_reach_where_no_position_does(self) -> None:
-        # CrossSection.reach measures positions alone, and this section's one
-        # position sits on the path point. Its blocks are what reach forward.
+        # This section's one position sits on the path point, and its blocks
+        # are what reach forward. At a quarter the positions alone are all
+        # CrossSection.reach sees, so it sees nothing; longitudinal_reach
+        # widens them by the blocks and sees two.
         blocky = section(((0, 0, 0), feature([(0, 0, -2), (0, 0, 2)])))
-        self.assertEqual(blocky.reach(), 0.0)
-        self.assertEqual(longitudinal_reach([blocky]), 2.0)
+        self.assertEqual(blocky.reach(0), 0.0)
+        self.assertEqual(blocky.reach(90), 0.0)
+        self.assertEqual(longitudinal_reach([blocky], 0), 2.0)
+
+    def test_a_section_is_as_long_as_the_blocks_it_paints(self) -> None:
+        # A whole profile carried by one annotation is still a profile, so
+        # the section measures the blocks rather than the bare position, and
+        # a diagonal has half of that to stagger by.
+        blocky = section(((0, 0, 0), feature([(0, 0, -2), (0, 0, 2)])))
+
+        self.assertEqual(blocky.long_length, 5)
 
 
 class RequiredLeadTests(unittest.TestCase):
@@ -90,19 +106,25 @@ class RequiredLeadTests(unittest.TestCase):
         self.assertEqual(required_lead(Path(*straight(6)), []), 0)
 
     def test_depth_along_the_path_sets_the_lead(self) -> None:
+        # Three deep, and no layout puts it further along travel than that,
+        # so the lead has to cover three.
         deep = section(((0, 0, 3), feature()))
         self.assertEqual(required_lead(Path(*straight(6)), [deep]), 3)
 
     def test_reach_to_the_side_sets_the_lead_when_it_is_greater(self) -> None:
         # Boundaries converge on a bend, so a section reaching further to the
-        # side than ahead still spills past them. Depth alone would say 3.
+        # side than ahead still spills past them. This one is a single column
+        # four out and one deep: a diagonal turns some of that four along
+        # travel, but never as much as the four it reaches sideways.
         wide = section(((4, 0, 0), feature()))
-        self.assertAlmostEqual(longitudinal_reach([wide]), 4 * 2 ** 0.5 / 2)
+        self.assertEqual(longitudinal_reach([wide]), 0.0)
+        self.assertEqual(lateral_reach([wide]).half_width, 4.0)
         self.assertEqual(required_lead(Path(*straight(6)), [wide]), 4)
 
     def test_the_lead_is_counted_in_points_not_blocks(self) -> None:
         # Points two blocks apart cover the same reach in half the points.
         deep = section(((0, 0, 3), feature()))
+        self.assertEqual(required_lead(Path(*straight(6)), [deep]), 3)
         self.assertEqual(required_lead(Path(*straight(6, spacing=2)), [deep]), 2)
 
 

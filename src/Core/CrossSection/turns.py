@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-from math import asin, atan2, degrees
+from math import asin, atan2, degrees, radians, sin
 from typing import NamedTuple
 
 from ..coordinates import Vec2, Vec3, quarter_turn
@@ -24,10 +24,38 @@ COUNTER_CLOCKWISE: Rotation = -1
 # turn: the path either ran straight on or doubled back.
 STRAIGHT_TOLERANCE = 1e-9
 
+def tolerance_for(degrees_off: float) -> float:
+    # A tolerance is a distance between two unit headings, which is the chord
+    # of the angle between them. This writes one as the angle it stands for.
+    return 2 * sin(radians(degrees_off) / 2)
+
+
 # How close a unit heading must be to a unit diagonal, as the distance between
 # them, to lay out 45 degrees off a quarter. Anything further snaps to the
-# nearest quarter. 0.02 is a little over one degree.
-DIAGONAL_TOLERANCE = 0.02
+# nearest quarter.
+#
+# Half of the 45-degree step from one layout to the next, so a diagonal is
+# taken whenever it is the nearest of the eight and no sooner. A smaller
+# tolerance does not make the layout more careful, it makes it wrong: a path
+# a few degrees off a diagonal is laid out at a quarter instead, 45 degrees
+# from where it is going, and a curve spends almost all of its length there.
+DIAGONAL_DEGREES = 22.5
+DIAGONAL_TOLERANCE = tolerance_for(DIAGONAL_DEGREES)
+
+# How near a diagonal a heading has to be for a walk to lay the join there.
+#
+# This is not the same question as which of the eight a heading is nearest.
+# A diagonal is stamped once, where the run of headings near it begins, and
+# from there on the quarter it hands over to is used -- so the wider the
+# band, the earlier the handover and the further round the quarter is from
+# where the path is actually going. A narrow band puts the join within a
+# degree or two of the diagonal, which is where it belongs.
+#
+# It only has to be wide enough that a point lands inside it. A path that
+# swings past a diagonal between two points has its join laid at the change
+# instead, so the band being too narrow costs nothing.
+JOIN_DEGREES = 2.0
+JOIN_TOLERANCE = tolerance_for(JOIN_DEGREES)
 
 # Forward at each quarter: west (-1, 0) turned clockwise.
 _FORWARD: dict[Turn, tuple[int, int]] = {
@@ -36,14 +64,20 @@ _FORWARD: dict[Turn, tuple[int, int]] = {
 
 
 def _quarter_layout(quarter: Turn) -> tuple[int, int, int, int]:
-    # Each quarter turn rotates the previous layout 90 degrees clockwise about
-    # the origin, then mirrors it across its long edge. Local x always lands to
-    # the right of travel; local depth follows travel at even quarters and is
-    # mirrored at odd ones.
+    # The section turned that far clockwise about the origin, and nothing
+    # else. Local x lands to the right of travel and local depth follows
+    # travel.
+    #
+    # The mirror across the long edge is not here. Every layout carries one,
+    # but the arm a join takes up carries the opposite one, and a matrix
+    # fixed per quarter cannot be both -- so the mirror is a sign passed to
+    # `orient_annotation`, which turns local depth and everything measured
+    # along travel over together. Half of it here and half of it there is
+    # what left the odd quarters with a mirrored profile and an unmirrored
+    # staircase.
     fx, fz = _FORWARD[quarter]
     rx, rz = quarter_turn(fx, fz)
-    depth = -1 if quarter // 90 % 2 == 0 else 1
-    return rx, depth * fx, rz, depth * fz
+    return rx, -fx, rz, -fz
 
 
 # Rows are (xx, xz, zx, zz):
@@ -88,9 +122,49 @@ def place(quarter: Turn, x: int, z: int) -> tuple[int, int]:
     return xx * x + xz * z, zx * x + zz * z
 
 
+def quarter_of(turn: Turn) -> Turn:
+    # The quarter a turn lays out in. A position placed by a section records
+    # the arm of a join it landed in, so it is already a quarter; a diagonal
+    # that reached here unplaced takes the quarter below it, which is what
+    # its blocks take too.
+    turn = normalize(turn)
+    return turn if is_quarter(turn) else neighbors(turn)[0]
+
+
 def forward(quarter: Turn) -> tuple[int, int]:
     # One block forward, in world axes, in a quarter layout.
     return _FORWARD[quarter]
+
+
+def step_along(turn: Turn) -> tuple[int, int]:
+    # One block forward in world axes, for a diagonal as well as a quarter.
+    # A diagonal steps one on both axes, which is the sum of the quarters
+    # either side of it.
+    turn = normalize(turn)
+    if is_quarter(turn):
+        return _FORWARD[turn]
+    lower, upper = neighbors(turn)
+    return (
+        _FORWARD[lower][0] + _FORWARD[upper][0],
+        _FORWARD[lower][1] + _FORWARD[upper][1],
+    )
+
+
+def place_along(turn: Turn, x: int, z: int) -> tuple[int, int]:
+    # A local column's world offset in any layout, quarter or diagonal.
+    #
+    # A quarter has a layout of its own. A diagonal lays the same row out
+    # along its own axes: local x runs to the right of travel, one block on
+    # each axis per column, and local z runs back along travel. An eleven
+    # wide row is then eleven blocks laid corner to corner, which is what it
+    # is at a quarter too -- not the two arms of an L, which is what joining
+    # the quarters either side of it produces and is nearly twice the deck.
+    turn = normalize(turn)
+    if is_quarter(turn):
+        return place(turn, x, z)
+    forward_x, forward_z = step_along(turn)
+    right_x, right_z = -forward_z, forward_x
+    return right_x * x - forward_x * z, right_z * x - forward_z * z
 
 
 def heading(turn: Turn) -> Vec2:
