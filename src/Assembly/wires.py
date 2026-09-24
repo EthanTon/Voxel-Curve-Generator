@@ -50,6 +50,7 @@ def lay_wire(
         placement_mode=feature.placement_mode,
         terrain_mask_mode=profile.terrain_mask_mode,
         replace=profile.replace,
+        block_replacement=profile.replacement,
         connectivity_domain=profile.domain_id,
         clip=cover(frames),
         surface_mask=(

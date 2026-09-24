@@ -5,6 +5,7 @@ from src.Core.Domain import (
     DomainInteraction,
     DomainRegistry,
     PlacementRules,
+    ReplacementRules,
     TerrainRules,
 )
 from src.Core.Field.block_field import BlockField
@@ -47,6 +48,13 @@ class DomainInheritanceTests(unittest.TestCase):
         self.assertEqual(profile.terrain_mask_mode, TerrainMaskMode.NONE)
         self.assertTrue(profile.connects_to_self)
         self.assertFalse(profile.connects_to_any)
+
+    def test_block_replacement_is_inherited(self) -> None:
+        replacement = ReplacementRules(((BlockState.create("minecraft:granite"), 1),))
+        base = self.domains.create("base", replacement=replacement)
+        child = self.domains.create("child", parents=[base])
+
+        self.assertIs(self.domains.profile(child).replacement, replacement)
 
     def test_breadth_first_lineage_puts_parents_before_grandparents(self) -> None:
         base = self.domains.create("base", properties={"tier": "base"})
@@ -293,6 +301,64 @@ class DomainWorldTests(unittest.TestCase):
             placement_mode=PlacementMode.OVERWRITE,
         )
         self.assertEqual(world.source_at((0, 0, 0)).block_id, self.dirt)
+
+    def test_domain_replacement_keeps_air_and_other_source_blocks(self) -> None:
+        air = self.registry.register(BlockState.create("minecraft:air"))
+        replacement = ReplacementRules(
+            ((BlockState.create("minecraft:granite"), 1),),
+            source_blocks=frozenset({"minecraft:stone"}),
+        )
+        self.domains.create("stone_only", replacement=replacement)
+        field = BlockField(self.registry.palette)
+        for x, block_id in enumerate((self.stone, self.dirt, air)):
+            field.set_block_id((x, 0, 0), block_id)
+        world = BlockWorld(self.registry)
+
+        self.domains.place(world, field, "stone_only")
+
+        self.assertEqual(self.state_at(world, (0, 0, 0)).name, "minecraft:granite")
+        self.assertEqual(self.state_at(world, (1, 0, 0)).name, "minecraft:dirt")
+        self.assertIsNone(world.source_at((2, 0, 0)))
+
+    def test_random_replacement_respects_amounts_and_world_coordinates(self) -> None:
+        replacement = ReplacementRules((
+            (BlockState.create("minecraft:granite"), 7),
+            (BlockState.create("minecraft:diorite"), 3),
+        ), seed=11)
+        self.domains.create("mixed", replacement=replacement)
+        world = BlockWorld(self.registry)
+        field = BlockField(self.registry.palette)
+        for x in range(100):
+            for z in range(100):
+                field.set_block_id((x, 0, z), self.stone)
+        self.domains.place(world, field, "mixed")
+        names = [self.state_at(world, (x, 0, z)).name
+                 for x in range(100) for z in range(100)]
+        self.assertTrue(6700 < names.count("minecraft:granite") < 7300)
+        another = BlockWorld(self.registry)
+        self.domains.place(another, self.field_with_id(self.stone), "mixed", (1, 0, 23))
+        self.assertEqual(names[123], self.state_at(another, (1, 0, 23)).name)
+
+    def test_noise_replacement_forms_contiguous_patches(self) -> None:
+        blocks = (
+            (BlockState.create("minecraft:granite"), 1),
+            (BlockState.create("minecraft:diorite"), 1),
+        )
+        random = ReplacementRules(blocks, seed=5)
+        noise = ReplacementRules(blocks, pattern="noise", scale=12, seed=5)
+
+        def transitions(rule: ReplacementRules) -> int:
+            return sum(
+                rule.index_at((x, 0, z)) != rule.index_at((x + 1, 0, z))
+                for x in range(80) for z in range(80)
+            )
+
+        self.assertLess(transitions(noise), transitions(random) // 3)
+        same = ReplacementRules(blocks, pattern="noise", scale=12, seed=5)
+        self.assertEqual(
+            [noise.index_at((x, 3, 11)) for x in range(-20, 20)],
+            [same.index_at((x, 3, 11)) for x in range(-20, 20)],
+        )
 
     def test_protected_domain_keeps_its_blocks(self) -> None:
         building = self.domains.create(

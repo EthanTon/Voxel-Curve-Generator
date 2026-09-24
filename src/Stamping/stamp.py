@@ -275,6 +275,7 @@ def place(
             DEFAULT_TERRAIN_MASK_MODE if profile is None else profile.terrain_mask_mode
         ),
         replace=DEFAULT_BLOCK if profile is None else profile.replace,
+        block_replacement=None if profile is None else profile.replacement,
         transform=transform,
         connectivity_domain=0 if profile is None else profile.domain_id,
         sequence_index=sequence_index,

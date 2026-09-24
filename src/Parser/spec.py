@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..Core.coordinates import BlockPos, ColumnPos, Vec3
 from ..Core.CrossSection.turns import JOIN_DEGREES
-from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
+from ..Core.Domain import ConnectivityRules, PlacementRules, ReplacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionOverride
 from ..Core.modes import ElevationMode, PlacementMode, StepMode
 from ..Stamping import Heading
@@ -95,6 +95,7 @@ class DomainSpec:
     connectivity: ConnectivityRules = ConnectivityRules()
     placement: PlacementRules = PlacementRules()
     terrain: TerrainRules = TerrainRules()
+    replacement: ReplacementRules | None = None
 
 
 @dataclass(frozen=True, slots=True)

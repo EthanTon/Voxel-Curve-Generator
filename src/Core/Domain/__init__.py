@@ -7,6 +7,7 @@ from .policy import (
     DomainProfile,
 )
 from .registry import DomainRegistry
+from .replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "DomainRef",
     "DomainRegistry",
     "PlacementRules",
+    "ReplacementRules",
     "TerrainRules",
 ]

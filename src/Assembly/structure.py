@@ -49,6 +49,7 @@ def build_domains(spec: BuildSpec) -> DomainRegistry:
             connectivity=each.connectivity,
             placement=each.placement,
             terrain=each.terrain,
+            replacement=each.replacement,
         )
     for interaction in spec.interactions:
         domains.interact(

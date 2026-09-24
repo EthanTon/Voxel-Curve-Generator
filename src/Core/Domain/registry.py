@@ -8,6 +8,7 @@ from ..block.registry import BlockRegistry
 from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
 from .policy import DomainPolicy, DomainProfile
+from .replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 
@@ -73,6 +74,7 @@ class DomainRegistry(DomainLookup):
         connectivity: ConnectivityRules | None = None,
         placement: PlacementRules | None = None,
         terrain: TerrainRules | None = None,
+        replacement: ReplacementRules | None = None,
         domain_id: DomainId | None = None,
     ) -> Domain:
         if domain_id is None:
@@ -88,6 +90,7 @@ class DomainRegistry(DomainLookup):
                 connectivity=connectivity or ConnectivityRules(),
                 placement=placement or PlacementRules(),
                 terrain=terrain or TerrainRules(),
+                replacement=replacement,
             )
         )
 

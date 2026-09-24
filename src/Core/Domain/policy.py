@@ -19,6 +19,7 @@ from ..coordinates import BlockPos
 from ..modes import PlacementMode, TerrainMaskMode
 from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
+from .replacement import ReplacementRules
 
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ class DomainProfile:
     connects_to_any: bool
     placement_mode: PlacementMode
     replace: str
+    replacement: ReplacementRules | None
     protected: bool
     is_terrain: bool
     terrain_mask_mode: TerrainMaskMode
@@ -334,6 +336,7 @@ class DomainPolicy(DomainLookup):
                 else terrain_mask_mode
             ),
             profile.replace if replace is None else replace,
+            block_replacement=profile.replacement,
             quarter_turns=quarter_turns,
             transform=transform,
             connectivity_domain=profile.domain_id,
@@ -422,6 +425,7 @@ class DomainPolicy(DomainLookup):
             ),
             placement_mode=inherit(lambda d: d.placement.mode, DEFAULT_PLACEMENT_MODE),
             replace=inherit(lambda d: d.placement.replace, DEFAULT_BLOCK),
+            replacement=self._inherit(lineage, lambda d: d.replacement),
             protected=inherit(lambda d: d.placement.protected, False),
             is_terrain=inherit(lambda d: d.terrain.is_terrain, False),
             terrain_mask_mode=inherit(

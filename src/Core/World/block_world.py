@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..Field.block_field import BlockBounds, BlockField
+from ..Domain.replacement import ReplacementRules
 from ..block.connectivity import ConnectivityCell, ConnectivityDomainId
 from ..block.palette import BlockId
 from ..block.registry import BlockRegistry
@@ -124,6 +125,8 @@ class BlockPlacement:
     placement_mode: PlacementMode
     terrain_mask_mode: TerrainMaskMode
     replace: str
+    block_replacement: ReplacementRules | None
+    replacement_ids: tuple[BlockId, ...]
     connectivity_domain: int
     sequence_index: int | None
     order: int
@@ -228,6 +231,7 @@ class BlockWorld:
         terrain_mask_mode: TerrainMaskMode = DEFAULT_TERRAIN_MASK_MODE,
         replace: str = DEFAULT_BLOCK,
         *,
+        block_replacement: ReplacementRules | None = None,
         quarter_turns: int = 0,
         transform: BlockTransform | None = None,
         connectivity_domain: int = 0,
@@ -251,6 +255,14 @@ class BlockWorld:
             placement_mode=placement_mode,
             terrain_mask_mode=terrain_mask_mode,
             replace=replace,
+            block_replacement=block_replacement,
+            replacement_ids=(
+                tuple(
+                    self._replacement_id(state)
+                    for state, _ in block_replacement.blocks
+                )
+                if block_replacement is not None else ()
+            ),
             connectivity_domain=connectivity_domain,
             sequence_index=sequence_index,
             order=self._next_order,
@@ -264,6 +276,12 @@ class BlockWorld:
         self._index_placement(placement, positions)
         self._record_source_changes(before, positions)
         return placement_id
+
+    def _replacement_id(self, state: BlockState) -> BlockId:
+        try:
+            return self.registry.get_id(state)
+        except KeyError:
+            return self.registry.register(state)
 
     def refresh_surface_masks(self) -> None:
         # Re-applies masks that read the designed terrain once it is known.
@@ -521,6 +539,15 @@ class BlockWorld:
             block_id = self._world_block_id(placement, local_id)
             if not self._placement_applies(placement, position, current):
                 continue
+            replacement = placement.block_replacement
+            if replacement is not None:
+                source_name = placement.field.palette.get_state(local_id).name
+                if (
+                    source_name not in AIR_NAMES
+                    and (replacement.source_blocks is None
+                         or source_name in replacement.source_blocks)
+                ):
+                    block_id = placement.replacement_ids[replacement.index_at(position)]
             current = ConnectivityCell(
                 block_id=block_id,
                 domain=placement.connectivity_domain,

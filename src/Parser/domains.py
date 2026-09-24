@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from math import sqrt
 
-from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
+from ..Core.Domain import ConnectivityRules, PlacementRules, ReplacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionAction, ConnectionOverride
 from ..Core.modes import PlacementMode, TerrainMaskMode
+from ..Format.schematics import parse_state_key
 from .spec import DomainSpec, InteractionSpec
 from .values import read_enum, read_properties, read_set, require
 
@@ -20,6 +21,41 @@ def read_domain(data: Mapping) -> DomainSpec:
         connectivity=read_connectivity(data.get("connectivity", {}), name),
         placement=read_placement(data.get("placement", {})),
         terrain=read_terrain(data.get("terrain", {})),
+        replacement=read_replacement(data.get("replace")),
+    )
+
+
+def read_replacement(data: str | Mapping | None) -> ReplacementRules | None:
+    if data is None:
+        return None
+    if isinstance(data, str):
+        return ReplacementRules(((parse_state_key(data), 1),))
+    if not isinstance(data, Mapping):
+        raise ValueError("Domain replace must be a block name or table")
+    entries = data.get("blocks", ())
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError("Domain replace.blocks must be a list")
+    blocks = []
+    for entry in entries:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("block"), str)
+            or not entry["block"]
+        ):
+            raise ValueError("Each replacement block needs a block name")
+        blocks.append((parse_state_key(entry["block"]), entry.get("amount", 1)))
+    sources = data.get("source_blocks")
+    if sources is not None and (
+        not isinstance(sources, (list, tuple)) or
+        not all(isinstance(source, str) for source in sources)
+    ):
+        raise ValueError("Domain replace.source_blocks must be a list of block names")
+    return ReplacementRules(
+        tuple(blocks),
+        pattern=data.get("pattern", "random"),
+        scale=data.get("scale", 8),
+        seed=data.get("seed", 0),
+        source_blocks=None if sources is None else frozenset(sources),
     )
 
 

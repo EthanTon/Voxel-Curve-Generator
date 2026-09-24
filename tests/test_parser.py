@@ -48,6 +48,37 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.output.name, "build")
         self.assertEqual(spec.domain("rail").name, "rail")
 
+    def test_domain_replacement_accepts_one_block_or_weighted_noise(self) -> None:
+        data = config(domain=[
+            {"name": "solid", "replace": "minecraft:granite"},
+            {"name": "mixed", "replace": {
+                "pattern": "noise", "scale": 10, "seed": 4,
+                "source_blocks": ["minecraft:stone"],
+                "blocks": [
+                    {"block": "minecraft:granite", "amount": 70},
+                    {"block": "minecraft:diorite", "amount": 30},
+                ],
+            }},
+        ])
+
+        spec = parse(data)
+        self.assertEqual(spec.domain("solid").replacement.blocks[0][0].name,
+                         "minecraft:granite")
+        mixed = build_domains(spec).profile("mixed").replacement
+        self.assertEqual(mixed.pattern, "noise")
+        self.assertEqual(mixed.scale, 10)
+        self.assertEqual(mixed.source_blocks, {"minecraft:stone"})
+        self.assertEqual([amount for _, amount in mixed.blocks], [70, 30])
+
+    def test_domain_replacement_rejects_invalid_amounts_and_patterns(self) -> None:
+        for replacement in (
+            {"blocks": [{"block": "minecraft:stone", "amount": 0}]},
+            {"blocks": [{"block": "minecraft:stone"}], "pattern": "stripes"},
+            {"blocks": [{"block": "minecraft:stone"}], "scale": 0},
+        ):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                parse(config(domain=[{"name": "rail", "replace": replacement}]))
+
     def test_the_output_is_written_beside_the_build(self) -> None:
         # Every other path in a build is relative to the build's own file,
         # and the output is too, so it does not move with the working

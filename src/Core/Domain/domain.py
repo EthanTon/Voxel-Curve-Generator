@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from ..block.connectivity import ConnectivityDomainId
+from .replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 
@@ -54,6 +55,7 @@ class Domain:
     connectivity: ConnectivityRules = ConnectivityRules()
     placement: PlacementRules = PlacementRules()
     terrain: TerrainRules = TerrainRules()
+    replacement: ReplacementRules | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parents", tuple(self.parents))

@@ -59,6 +59,7 @@ def reshape(
             shaped.fill,
             placement_mode=PlacementMode.REPLACE_AIR_ONLY,
             connectivity_domain=profile.domain_id,
+            block_replacement=profile.replacement,
         )
     if shaped.cut:
         world.base_blocks = Excavated(world.base_blocks, shaped.cut)

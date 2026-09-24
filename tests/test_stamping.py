@@ -1,6 +1,6 @@
 import unittest
 
-from src.Core.Domain import DomainRegistry
+from src.Core.Domain import DomainRegistry, ReplacementRules
 from src.Core.Feature.feature import PointFeature
 from src.Core.Field.block_field import BlockField
 from src.Core.Feature.feature_path import FeaturePath
@@ -170,6 +170,18 @@ class StampingTestCase(unittest.TestCase):
 
 
 class FixedStampTests(StampingTestCase):
+    def test_stamping_uses_domain_block_replacement(self) -> None:
+        self.domains.update(self.rail, replacement=ReplacementRules((
+            (BlockState.create("minecraft:granite"), 1),
+        )))
+        stamp = FixedStamp(self.feature(), self.domains)
+        point = self.point()
+
+        stamp.stamp(self.world, stamp.rule(point), point, clip=UNCLIPPED)
+
+        cell = self.world.source_at(point.position)
+        self.assertEqual(self.registry.get_state(cell.block_id).name, "minecraft:granite")
+
     def test_it_is_a_stamp(self) -> None:
         self.assertIsInstance(FixedStamp(self.feature()), Stamp)
 
