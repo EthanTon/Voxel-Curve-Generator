@@ -1,3 +1,4 @@
+from ..block.replacement import ReplacementRules
 from .domain import Domain, DomainId, DomainRef
 from .interaction import DomainInteraction
 from .policy import (
@@ -7,7 +8,6 @@ from .policy import (
     DomainProfile,
 )
 from .registry import DomainRegistry
-from .replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 __all__ = [

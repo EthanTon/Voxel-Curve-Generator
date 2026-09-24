@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import erf, floor, isfinite, sqrt
 
-from ..block.states import BlockState
+from ..constants import AIR_NAMES
 from ..coordinates import BlockPos
+from .palette import BlockId
+from .registry import BlockRegistry
+from .states import BlockState
 
 
 def _random(x: int, y: int, z: int, seed: int) -> float:
@@ -83,3 +86,27 @@ class ReplacementRules:
             if threshold < 0:
                 return index
         return len(self.blocks) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class BlockReplacement:
+    rules: ReplacementRules
+    block_ids: tuple[BlockId, ...]
+
+    @classmethod
+    def create(cls, rules: ReplacementRules, registry: BlockRegistry) -> BlockReplacement:
+        block_ids = []
+        for state, _ in rules.blocks:
+            try:
+                block_ids.append(registry.get_id(state))
+            except KeyError:
+                block_ids.append(registry.register(state))
+        return cls(rules, tuple(block_ids))
+
+    def at(self, source_name: str, position: BlockPos) -> BlockId | None:
+        if source_name in AIR_NAMES or (
+            self.rules.source_blocks is not None
+            and source_name not in self.rules.source_blocks
+        ):
+            return None
+        return self.block_ids[self.rules.index_at(position)]

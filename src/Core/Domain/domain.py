@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from ..block.connectivity import ConnectivityDomainId
-from .replacement import ReplacementRules
+from ..block.replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 

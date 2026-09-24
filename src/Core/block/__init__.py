@@ -23,6 +23,7 @@ from .info import (
 )
 from .palette import BlockId, BlockPalette
 from .registry import BlockRegistry
+from .replacement import ReplacementRules
 from .states import BlockState
 from .vanilla import (
     VANILLA_VERSION,
@@ -37,6 +38,7 @@ __all__ = [
     "BlockPalette",
     "BlockPos",
     "BlockRegistry",
+    "ReplacementRules",
     "BlockState",
     "BUILTIN_DEPENDENCY_SPECS",
     "ConnectivityCell",

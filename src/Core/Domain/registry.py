@@ -8,7 +8,7 @@ from ..block.registry import BlockRegistry
 from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
 from .policy import DomainPolicy, DomainProfile
-from .replacement import ReplacementRules
+from ..block.replacement import ReplacementRules
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
 
 

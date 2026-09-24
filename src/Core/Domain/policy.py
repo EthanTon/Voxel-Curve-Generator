@@ -14,12 +14,12 @@ from ..block.connectivity_options import (
     ConnectivityOptions,
 )
 from ..block.registry import BlockRegistry
+from ..block.replacement import ReplacementRules
 from ..constants import DEFAULT_BLOCK, DEFAULT_PLACEMENT_MODE, DEFAULT_TERRAIN_MASK_MODE
 from ..coordinates import BlockPos
 from ..modes import PlacementMode, TerrainMaskMode
 from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
-from .replacement import ReplacementRules
 
 
 if TYPE_CHECKING:
