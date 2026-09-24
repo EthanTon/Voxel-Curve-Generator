@@ -17,11 +17,13 @@ from .spec import (
     LaneSpec,
     Measure,
     OutputSpec,
+    SplitSpec,
     PathSpec,
     SectionElevation,
     SectionSpec,
     SpanSpec,
     StructureSpec,
+    WireGeometry,
     WireSpec,
 )
 from ..Terraform.plan import load as load_terraform
@@ -35,11 +37,13 @@ __all__ = [
     "LaneSpec",
     "Measure",
     "OutputSpec",
+    "SplitSpec",
     "PathSpec",
     "SectionElevation",
     "SectionSpec",
     "SpanSpec",
     "StructureSpec",
+    "WireGeometry",
     "WireSpec",
     "load",
     "parse",
@@ -69,6 +73,7 @@ def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
         wires=tuple(read_wire(each, base) for each in data.get("wire", ())),
         lanes=tuple(read_lane(each, base) for each in data.get("lane", ())),
         terraform=read_terraform(data, base),
+        surface_world=read_surface_world(data.get("surface"), base),
     )
     check_references(spec)
     return spec
@@ -83,6 +88,17 @@ def read_terraform(data: Mapping, base: Path):
     raise ValueError(
         "terraforming is written in a file of its own: terraform = \"terraform.toml\""
     )
+
+
+def read_surface_world(data: Mapping | None, base: Path) -> Path | None:
+    if data is None:
+        return None
+    if not isinstance(data, Mapping) or set(data) != {"world"}:
+        raise ValueError("[surface] needs exactly one option: world")
+    world = data["world"]
+    if not isinstance(world, str) or not world:
+        raise ValueError("[surface].world must name a world save or schematic")
+    return base / world
 
 
 def check_references(spec: BuildSpec) -> None:

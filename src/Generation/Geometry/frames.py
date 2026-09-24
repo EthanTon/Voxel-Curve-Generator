@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -23,21 +24,21 @@ __all__ = [
     "check_padding",
     "elevation_breaks",
     "elevation_from_frames",
+    "level_near",
     "frames_for_index",
     "span_stations",
 ]
 
 
 class ElevationBreak(NamedTuple):
-    # The path point a level changes at, and the level it changes to. The
-    # point belongs to the frame after the break, as every boundary's does.
+    # The point where the level changes (it belongs to the frame after).
 
     path_index: int
     y_offset: int
 
 
 def check_padding(path: Path, lead_in: int = 0, lead_out: int = 0) -> None:
-    # A lead is pasted from padding, so there has to be padding to paste from.
+    # Leads are pasted from padding, so the padding must be long enough.
     if lead_in < 0 or lead_out < 0:
         raise ValueError(
             f"Leads must be non-negative, got lead_in={lead_in}, lead_out={lead_out}"
@@ -57,8 +58,7 @@ def check_padding(path: Path, lead_in: int = 0, lead_out: int = 0) -> None:
 
 
 def elevation_breaks(path: Path) -> list[ElevationBreak]:
-    # Where the path proper changes height. A change at its last point has no
-    # frame after it to belong to, so it is not a break.
+    # Where the path proper changes height, except at its last point.
     points = path.bounded_points
     breaks = []
     for offset, (before, after) in enumerate(zip(points, points[1:])):
@@ -69,9 +69,7 @@ def elevation_breaks(path: Path) -> list[ElevationBreak]:
 
 
 def span_stations(schedule: SectionSchedule, path: Path) -> list[int]:
-    # The points on the path proper where the section changes: where a span
-    # starts, and where the path runs on past one that has ended. The path's
-    # own ends are not changes, since nothing is pasted beyond them.
+    # Interior points where a span starts or the one before has ended.
     stations = set()
     for span in schedule.spans:
         stations.add(span.path_start)
@@ -94,9 +92,7 @@ def build_frames(
     lead_in: int = 0,
     lead_out: int = 0,
 ) -> list[PathFrame]:
-    # One frame per level, split wherever the path proper changes height. The
-    # outer boundaries are the path's own bounds, and each break contributes
-    # the one boundary the frames either side of it share.
+    # One frame per level, split at each break that changes the level.
     if len(path.bounded_points) < 2:
         raise ValueError("A path needs at least two points to be framed")
     check_padding(path, lead_in, lead_out)
@@ -117,8 +113,6 @@ def build_frames(
                 f"follows {previous}"
             )
         previous = each.path_index
-        # A break back to the level already held changes nothing, so it adds no
-        # boundary -- but it is still a break, and the ones after it follow it.
         if each.y_offset != level:
             kept.append(each)
             level = each.y_offset
@@ -147,12 +141,8 @@ def build_section_frames(
     half_width: float | LateralReach | None = None,
     reach: LateralReach | None = None,
 ) -> list[PathFrame]:
-    # Frames split at every station as well as at every change of level, each
-    # at the level of the elevation frame it lies in. Stations default to every
-    # point of the path proper, which is the finest a path can be cut.
-    #
-    # A boundary an elevation frame already placed is used as it is, so the two
-    # runs of frames seam in the same places.
+    # Elevation frames split further at every station (default: every
+    # interior point), reusing the elevation frames' boundaries.
     validate_frames(path, elevation_frames, _half_width(half_width, reach))
     shared = {elevation_frames[0].path_start: elevation_frames[0].start_boundary}
     for frame in elevation_frames:
@@ -196,15 +186,36 @@ def build_section_frames(
     return frames
 
 
+class LevelNear:
+    # A column's level, found by walking from the frame of the path point it
+    # belongs to across the boundaries it is past. Asking every boundary
+    # would misread columns on a loop, where far planes face the same way.
+
+    def __init__(self, frames: Sequence[PathFrame]) -> None:
+        if not frames:
+            raise ValueError("No frames to take a level from")
+        self.frames = tuple(sorted(frames, key=lambda frame: frame.path_start))
+        self._starts = [frame.path_start for frame in self.frames]
+
+    def __call__(self, x: float, z: float, index: int) -> int:
+        frames = self.frames
+        at = max(0, bisect_right(self._starts, index) - 1)
+        while at + 1 < len(frames) and frames[at + 1].start_boundary.after(x, z):
+            at += 1
+        while at > 0 and not frames[at].start_boundary.after(x, z):
+            at -= 1
+        return frames[at].y_offset
+
+
+def level_near(frames: Sequence[PathFrame]) -> LevelNear:
+    return LevelNear(frames)
+
+
 def elevation_from_frames(
     frames: Sequence[PathFrame],
 ) -> ConstantElevation | MultiElevationStep:
-    # The frames' levels as one column-wise elevation, for anything placed as
-    # a single piece across several frames. It takes the frames' boundaries as
-    # they are, so it is orthogonal exactly when the frames were built so.
-    #
-    # It has no ends: past the path it holds the first and last levels. Clip
-    # whatever uses it to the path's bounds.
+    # The frames' levels as one elevation over every column; unbounded, so
+    # clip its users to the path.
     if not frames:
         raise ValueError("No frames to take an elevation from")
     if len(frames) == 1:
@@ -219,8 +230,6 @@ def _half_width(
     half_width: float | None,
     reach: LateralReach | None,
 ) -> float | LateralReach | None:
-    # A reach is kept as it is rather than flattened to its widest side: which
-    # side a section reaches on is what decides whether a bend is too tight.
     return reach if half_width is None else half_width
 
 

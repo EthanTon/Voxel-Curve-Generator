@@ -4,13 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from ..Core.Field.block_field import BlockField
+from ..Core.block.palette import BlockPalette
 from ..Core.block.states import BlockState
 from ..Core.coordinates import BlockPos
 from . import nbt
-from .codec import decode_varints, encode_varints
-from .region import BlockRegion, SplitBudget, split_by_budget
+from .codec import decode_varints_array, encode_varints
+from .region import AIR, BlockRegion, SplitBudget, split_by_budget
 
-# Width, Height and Length are shorts, whatever the block budget allows.
+# Width, Height and Length are shorts.
 SCHEM_AXIS_MAX = 32767
 SCHEM_SUFFIX = ".schem"
 SUPPORTED_VERSIONS = (2, 3)
@@ -20,8 +22,7 @@ SUPPORTED_VERSIONS = (2, 3)
 class SchematicPiece:
     region: BlockRegion
     index: int
-    # Where the piece sits relative to the build origin, written as Offset.
-    # Paste every piece at one reference point and the build reassembles.
+    # Relative to the build origin, written as Offset.
     offset: BlockPos
     path: Path | None = None
 
@@ -52,9 +53,8 @@ def build_schematic(
     version: int = 2,
     offset: Sequence[int] = BlockPos(0, 0, 0),
     metadata: Mapping[str, str] | None = None,
+    paste_origin: Sequence[int] | None = None,
 ) -> tuple[str, nbt.CompoundTag]:
-    # data_version has no default on purpose: a stale constant here would
-    # mislabel every export.
     if version not in SUPPORTED_VERSIONS:
         raise ValueError(f"unsupported schematic version {version}")
     _require_axis_limits(region)
@@ -65,16 +65,20 @@ def build_schematic(
             for index in range(len(region.palette))
         }
     )
-    data = nbt.byte_array(encode_varints(region.iter_cells()))
+    data = nbt.byte_array(encode_varints(region.cells))
+    metadata_tags = {
+        "Name": nbt.StringTag(region.name),
+        **{key: nbt.StringTag(value) for key, value in (metadata or {}).items()},
+    }
+    if paste_origin is not None:
+        # WorldEdit recovers the paste origin from WEOffset.
+        relative_corner = BlockPos.coerce(offset) - BlockPos.coerce(paste_origin)
+        for axis, value in zip("XYZ", relative_corner):
+            metadata_tags[f"WEOffset{axis}"] = nbt.IntTag(value)
     body = {
         "Version": nbt.IntTag(version),
         "DataVersion": nbt.IntTag(data_version),
-        "Metadata": nbt.CompoundTag(
-            {
-                "Name": nbt.StringTag(region.name),
-                **{key: nbt.StringTag(value) for key, value in (metadata or {}).items()},
-            }
-        ),
+        "Metadata": nbt.CompoundTag(metadata_tags),
         "Width": nbt.ShortTag(region.size.x),
         "Height": nbt.ShortTag(region.size.y),
         "Length": nbt.ShortTag(region.size.z),
@@ -108,6 +112,7 @@ def write_schematic(
     version: int = 2,
     offset: Sequence[int] = BlockPos(0, 0, 0),
     metadata: Mapping[str, str] | None = None,
+    paste_origin: Sequence[int] | None = None,
 ) -> Path:
     name, root = build_schematic(
         region,
@@ -115,6 +120,7 @@ def write_schematic(
         version=version,
         offset=offset,
         metadata=metadata,
+        paste_origin=paste_origin,
     )
     return nbt.write(path, root, name=name)
 
@@ -129,8 +135,6 @@ def write_split(
     origin: Sequence[int] | None = None,
     manifest: bool = True,
 ) -> list[SchematicPiece]:
-    # The budget is tightened to the format's axis limit, so a piece cannot
-    # satisfy the block count and still overflow a short.
     budget = budget.capped(SCHEM_AXIS_MAX)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -165,7 +169,6 @@ def write_manifest(
     name: str,
     origin: Sequence[int],
 ) -> Path:
-    # A set of forty schematics is unusable without paste order and coordinates.
     lines = [
         f'name = "{name}"',
         f"origin = {list(BlockPos.coerce(origin).as_tuple())}",
@@ -191,8 +194,7 @@ def write_manifest(
 
 
 def load_schematic(path: Path | str, *, name: str | None = None) -> tuple[BlockRegion, BlockPos]:
-    # The region's origin is the file's Offset: a schematic knows where it
-    # sits relative to a paste point, not where it sits in a world.
+    # The region's origin is the file's Offset.
     root = nbt.read(path).compound
     body = root["Schematic"] if "Schematic" in root else root
     size = BlockPos(body["Width"].py_int, body["Height"].py_int, body["Length"].py_int)
@@ -203,19 +205,28 @@ def load_schematic(path: Path | str, *, name: str | None = None) -> tuple[BlockR
     else:
         palette_tag, data_tag = blocks["Palette"], blocks["Data"]
     states = {tag.py_int: parse_state_key(key) for key, tag in palette_tag.items()}
-    indices = decode_varints(data_tag.np_array.tobytes())
-    if len(indices) != size.x * size.y * size.z:
+    indices = decode_varints_array(data_tag.np_array.tobytes())
+    if indices.size != size.x * size.y * size.z:
         raise ValueError("block data does not match the declared volume")
     region = BlockRegion(
         name or body["Metadata"].get("Name", nbt.StringTag(Path(path).stem)).py_str,
         offset,
         size,
     )
-    for index, value in enumerate(indices):
-        region.set_state(region.position_at(index), states[value])
+    region.fill(indices, states)
     for entry in body.get("Entities", nbt.ListTag([])):
         region.add_entity(nbt.entity_from_tag(entry, offset))
     return region, offset
+
+
+def load_blocks(path: Path | str, palette: BlockPalette | None = None) -> BlockField:
+    # The schematic's non-air blocks at their schematic positions.
+    region, _ = load_schematic(path)
+    blocks = BlockField(palette)
+    for position, state in region.iter_occupied():
+        if state != AIR:
+            blocks.set_block(position, state)
+    return blocks
 
 
 def _require_axis_limits(region: BlockRegion) -> None:

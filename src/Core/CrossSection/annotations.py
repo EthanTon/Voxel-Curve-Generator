@@ -12,22 +12,16 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class FeatureAnnotation:
-    # Marks where a feature sits in a cross section. The section carries no
-    # blocks of its own: delivering it translates `position` to a path point,
-    # and the feature builds its blocks from the positions on its path later.
-    #
-    # `step_mode` picks the step rule that decides which positions the
-    # annotation delivers and how far it moves the points beyond it. See
-    # steps.py.
+    # Where a feature sits in a cross section.
 
     name: str
     position: BlockPos
     feature: Feature
     step_mode: StepMode = StepMode.MANHATTAN
-    # The section this annotation belongs to, where it is one of several
-    # standing for one thing -- a swept profile is a point per column, and
-    # every one of them is still the same section.
+    # The owning section when a profile is split into one annotation per column.
     section: str | None = None
+    # Stop at the span boundary instead of filling small gaps at a swap.
+    clip_to_span: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "position", BlockPos.coerce(self.position))

@@ -24,11 +24,14 @@ from src.Stamping import (
     heading_of,
     in_frames,
     lateral_turns,
+    mirrorable_headings,
     place,
     snap,
     stamp_along,
     unclipped,
 )
+
+from src.Stamping.variants import authored_for
 
 
 class LaidOffsetTests(unittest.TestCase):
@@ -82,9 +85,18 @@ class HeadingTests(unittest.TestCase):
         self.assertEqual(authored_headings(22.5), (0.0, 22.5, 45.0))
         self.assertEqual(authored_headings(15.0), (0.0, 15.0, 30.0, 45.0))
 
-    def test_a_heading_past_the_diagonal_is_not_a_variant(self) -> None:
-        with self.assertRaisesRegex(ValueError, "22.5 mirrored"):
-            by_authored({0.0: "a", 22.5: "b", 45.0: "c", 67.5: "d"}, 22.5)
+    def test_a_heading_past_the_diagonal_may_be_authored(self) -> None:
+        # A lopsided shape cannot be 22.5 mirrored: the mirror puts what was
+        # on the left of travel on the right.
+        self.assertEqual(mirrorable_headings(22.5), (67.5,))
+        self.assertEqual(mirrorable_headings(45.0), ())
+        found = by_authored({0.0: "a", 22.5: "b", 45.0: "c", 67.5: "d"}, 22.5)
+        self.assertEqual(found[3], "d")
+        self.assertEqual(authored_for(3, 22.5, found), (3, False))
+
+    def test_left_out_it_is_the_one_before_the_diagonal_mirrored(self) -> None:
+        found = by_authored({0.0: "a", 22.5: "b", 45.0: "c"}, 22.5)
+        self.assertEqual(authored_for(3, 22.5, found), (1, True))
 
     def test_a_heading_is_the_variant_it_is_turned_from(self) -> None:
         self.assertEqual(authored_turn(22.5, 22.5), (22.5, 0))

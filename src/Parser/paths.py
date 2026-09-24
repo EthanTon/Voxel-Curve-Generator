@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 
 from ..Core.coordinates import BlockPos, ColumnPos, Vec3
 from ..Core.CrossSection.turns import JOIN_DEGREES
-from .spec import OutputSpec, PathSpec
-from .values import read_column, require
+from .spec import OutputSpec, PathSpec, SplitSpec
+from .values import read_column, read_toml, require
 
 
 def read_path(data: Mapping, base: Path = Path(".")) -> PathSpec:
@@ -41,9 +40,7 @@ def read_diagonal(source: Mapping) -> float:
 
 
 def read_path_file(path: Path) -> Mapping:
-    if not path.exists():
-        raise ValueError(f"no path file at {path}")
-    data = tomllib.loads(path.read_text())
+    data = read_toml(path, "path")
     return data.get("path", data)
 
 
@@ -52,11 +49,31 @@ def read_markers(data: Mapping) -> dict[str, ColumnPos]:
 
 
 def read_output(data: Mapping, base: Path = Path(".")) -> OutputSpec:
-    # Written beside the build that asked for it, like every other path in
-    # the file, so where the build is run from does not move its output. An
-    # absolute path is left where it was written.
+    # Relative to the build file, like every other path in it.
+    mode = data.get("mode")
+    if mode is not None and mode not in ("absolute", "relative"):
+        raise ValueError("output mode must be 'absolute' or 'relative'")
+    path = base / require(data, "path")
     return OutputSpec(
-        path=base / require(data, "path"),
+        path=path,
         name=data.get("name", "build"),
         data_version=data.get("data_version", 3700),
+        mode=mode,
+        split=read_split(data.get("split"), path),
     )
+
+
+def read_split(data: Mapping | None, path: Path) -> SplitSpec | None:
+    # Pieces default to a folder beside the output, named after it.
+    if data is None:
+        return None
+    directory = data.get("directory")
+    split = SplitSpec(
+        directory=path.with_suffix("") if directory is None else path.parent / directory,
+        max_blocks=data.get("max_blocks", 4_000_000),
+        max_span=data.get("max_span", 128),
+        terrain=data.get("terrain", False),
+    )
+    if split.max_blocks <= 0 or split.max_span <= 0:
+        raise ValueError("a split needs a positive max_blocks and max_span")
+    return split

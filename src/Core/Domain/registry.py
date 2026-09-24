@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..block.registry import BlockRegistry
-from .domain import Domain, DomainId, DomainRef
+from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
 from .policy import DomainPolicy, DomainProfile
 from .rules import ConnectivityRules, PlacementRules, TerrainRules
@@ -18,17 +18,11 @@ if TYPE_CHECKING:
     from ..Field.block_field import BlockField
 
 
-class DomainRegistry:
-    """Mutable collection of domains and the interactions between them.
+class DomainRegistry(DomainLookup):
+    """Mutable domains and interactions, compiled on demand to a cached
+    ``DomainPolicy``. Re-``bind`` worlds and resolvers after edits.
 
-    Query and apply the rules through ``compile``, which returns a cached
-    ``DomainPolicy`` until the registry changes. Worlds and resolvers keep the
-    policy they were given, so call ``bind`` and ``resolver`` again after
-    editing domains.
-
-    Automatic ids start at 1: ``BlockWorld`` uses domain 0 for placements and
-    base blocks that were never assigned one. Register a domain with
-    ``domain_id=0`` to give that default domain rules of its own.
+    Automatic ids start at 1; domain 0 is the world's unassigned default.
     """
 
     def __init__(
@@ -59,11 +53,6 @@ class DomainRegistry:
     def interactions(self) -> tuple[DomainInteraction, ...]:
         return tuple(self._interactions)
 
-    def __contains__(self, domain: object) -> bool:
-        if isinstance(domain, str):
-            return domain in self._names
-        return domain in self._domains
-
     def __iter__(self) -> Iterator[Domain]:
         return iter(tuple(self._domains.values()))
 
@@ -73,17 +62,7 @@ class DomainRegistry:
     def id_of(self, domain: DomainRef | Domain) -> DomainId:
         if isinstance(domain, Domain):
             domain = domain.domain_id
-        if isinstance(domain, str):
-            try:
-                return self._names[domain]
-            except KeyError:
-                raise KeyError(f"Unknown domain {domain!r}") from None
-        if domain not in self._domains:
-            raise KeyError(f"Unknown domain {domain!r}")
-        return domain
-
-    def get(self, domain: DomainRef) -> Domain:
-        return self._domains[self.id_of(domain)]
+        return super().id_of(domain)
 
     def create(
         self,
@@ -146,7 +125,7 @@ class DomainRegistry:
 
         domains = dict(self._domains)
         domains[domain_id] = updated
-        # Compiling validates parents and rejects inheritance cycles.
+        # Compiling first rejects bad parents and inheritance cycles.
         policy = DomainPolicy(domains.values(), self._interactions)
 
         del self._names[current.name]

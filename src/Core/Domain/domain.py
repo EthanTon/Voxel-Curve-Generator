@@ -16,12 +16,35 @@ def _frozen_mapping(values: Mapping[str, object] | None) -> Mapping[str, object]
     return MappingProxyType(dict(values or {}))
 
 
+class DomainLookup:
+    # Resolves a domain by id or name; subclasses fill `_domains` and `_names`.
+    _domains: dict[DomainId, Domain]
+    _names: dict[str, DomainId]
+
+    def __contains__(self, domain: object) -> bool:
+        if isinstance(domain, str):
+            return domain in self._names
+        return domain in self._domains
+
+    def id_of(self, domain: DomainRef) -> DomainId:
+        if isinstance(domain, str):
+            try:
+                return self._names[domain]
+            except KeyError:
+                raise KeyError(f"Unknown domain {domain!r}") from None
+        if domain not in self._domains:
+            raise KeyError(f"Unknown domain {domain!r}")
+        return domain
+
+    def get(self, domain: DomainRef) -> Domain:
+        return self._domains[self.id_of(domain)]
+
+
 @dataclass(frozen=True, slots=True)
 class Domain:
-    """A named group of placements that share connectivity and placement rules.
+    """A named group of placements sharing connectivity and placement rules.
 
-    Domains inherit from ``parents``: any rule left as None, and any property
-    not set here, is taken from the nearest parent that defines it.
+    Rules left as None, and unset properties, come from the nearest parent.
     """
 
     domain_id: DomainId

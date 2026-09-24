@@ -8,17 +8,13 @@ from ..modes import ElevationMode, PlacementMode
 from ..coordinates import BlockPos
 from ..block.states import BlockState
 from ..Domain import Domain
+from ...Terraform.surface_mask import SurfaceMaskSpec
 
 
 @runtime_checkable
 class Feature(Protocol):
-    # What every feature provides. Implementations match this by shape rather
-    # than by subclassing, so each one is free to implement its members its
-    # own way.
-    #
-    # `elevation_mode`: DEFORMABLE blocks take the elevation of their own
-    # column. RIGID blocks ignore it and take the y_offset of the feature path
-    # point they were built from.
+    # DEFORMABLE blocks follow their own column's elevation; RIGID blocks
+    # take the y_offset of the point they were placed at.
 
     blocks: BlockField
     placement_mode: PlacementMode
@@ -27,8 +23,7 @@ class Feature(Protocol):
     elevation_mode: ElevationMode
 
 
-# Defaults for the Feature fields that have one. `offset` accepts None, which
-# becomes the zero offset.
+# An offset of None becomes the zero offset.
 _FEATURE_DEFAULTS: dict[str, object] = {
     "offset": None,
     "elevation_mode": ElevationMode.DEFORMABLE,
@@ -41,10 +36,8 @@ def _normalize_offset(self) -> None:
 
 
 def feature_class(cls: type) -> type:
-    # Make `cls` a dataclass with every Feature field, taken from the Feature
-    # interface and placed ahead of its own fields. A class keeps any field,
-    # default, or __post_init__ it declares itself. Its own fields follow the
-    # defaulted Feature fields, so they need defaults too.
+    # Makes `cls` a dataclass with the Feature fields ahead of its own, which
+    # therefore need defaults. Anything the class declares itself is kept.
     own = dict(cls.__dict__.get("__annotations__", {}))
     annotations = {}
     for name, annotation in Feature.__annotations__.items():
@@ -64,20 +57,20 @@ def feature_class(cls: type) -> type:
 
 @feature_class
 class PointFeature:
-    # A feature whose blocks sit at each point on its path.
-    pass
+    # Blocks stamped at each point of its path.
+    surface_mask: SurfaceMaskSpec | None = None
 
 
 @feature_class
 class ProfileFeature:
-    # The old physical cross section: `blocks` is the profile that is swept
-    # along this feature's path. Building the sweep is handled later.
-    pass
+    # A cross-section profile swept along its path.
+    surface_mask: SurfaceMaskSpec | None = None
 
 
 @feature_class
 class ContinuousFeature:
-    # Features like wires and tracks.
+    # One run of blocks, such as a wire.
+    surface_mask: SurfaceMaskSpec | None = None
 
     def add(self, block_position: BlockPos, block_state: BlockState) -> None:
         self.blocks.set_block(position=block_position, block=block_state)

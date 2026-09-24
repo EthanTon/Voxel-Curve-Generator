@@ -12,9 +12,7 @@ def confirm_orthogonal_ends(
     gradients: Sequence[Vec3 | Sequence[float]],
     orientation: Orientation = orthogonal,
 ) -> None:
-
-    #Determines if there exists an orthogonal end
-    
+    # Both ends need a horizontal heading to extend along.
     ends = Path(points, gradients)
     if not ends.path_points:
         raise ValueError("An empty path has no ends to pad")
@@ -34,7 +32,7 @@ def extend_ends(
     gradients: Sequence[Vec3 | Sequence[float]],
     lead: int,
 ) -> tuple[list[BlockPos], list[Vec3]]:
-    #Extends ends in a line such that there can be lead-in/lead-out
+    # Continues each end straight on for `lead` points.
     if lead < 0:
         raise ValueError(f"lead must be non-negative, got {lead}")
 
@@ -72,14 +70,12 @@ def padded_path(
     lead: int,
     orientation: Orientation = orthogonal,
 ) -> Path:
-    # A path extended by `lead` points at each end and marked as padded there.
     confirm_orthogonal_ends(points, gradients, orientation)
     positions, headings = extend_ends(points, gradients, lead)
     return Path(positions, headings, lead_in=lead, lead_out=lead)
 
 
 def _run(start: BlockPos, step: BlockPos, count: int) -> list[BlockPos]:
-    # `count` points on from `start`, a step apart, nearest first.
     run = []
     position = start
     for _ in range(count):

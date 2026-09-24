@@ -1,29 +1,19 @@
 from __future__ import annotations
 
-import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from ..Core.coordinates import ColumnPos
 from ..Core.modes import PlacementMode, StepMode
 from .spec import SectionElevation, SectionSpec, SpanSpec
-from .values import read_column, read_enum, require
+from .values import listed_entries, read_column, read_enum, read_toml, require
+from ..Terraform.surface_mask import read_surface_mask
 
 
 def read_sections(
     data: Mapping, markers: Mapping[str, ColumnPos], base: Path = Path(".")
 ) -> tuple[SectionSpec, ...]:
-    named = data.get("sections")
-    entries = data.get("section", ())
-    if named is not None and entries:
-        raise ValueError(
-            "sections are listed in the build or in a file of their own, "
-            "not both"
-        )
-    if named is not None:
-        listing = base / named
-        entries = read_toml(listing, "sections").get("section", ())
-        base = listing.parent
+    entries, base = listed_entries(data, "sections", "section", "sections", base)
     return tuple(read_section(each, markers, base) for each in entries)
 
 
@@ -32,6 +22,10 @@ def read_section(
 ) -> SectionSpec:
     name = require(data, "name")
     defined = with_definition_from_file(data, base)
+    edge_domains = read_edge_domains(defined.get("edge_domains"), name)
+    edge_from = read_edge_from(defined.get("edge_from"), name)
+    if edge_from is not None and edge_domains is None:
+        raise ValueError(f"section {name!r} edge_from requires edge_domains")
     return SectionSpec(
         name=name,
         domain=require(defined, "domain"),
@@ -44,7 +38,30 @@ def read_section(
         ),
         step=read_enum(StepMode, defined.get("step"), StepMode.CHEBYSHEV),
         steps=read_steps(defined.get("steps", {}), name),
+        edge_domains=edge_domains,
+        edge_from=edge_from,
+        surface_mask=read_surface_mask(defined.get("surface_mask")),
     )
+
+
+def read_edge_domains(data: object, name: str) -> tuple[str, str] | None:
+    if data is None:
+        return None
+    if not isinstance(data, (list, tuple)) or len(data) != 2 or not all(
+        isinstance(domain, str) and domain for domain in data
+    ):
+        raise ValueError(
+            f"section {name!r} edge_domains must name left and right domains"
+        )
+    return data[0], data[1]
+
+
+def read_edge_from(data: object, name: str) -> int | None:
+    if data is None:
+        return None
+    if not isinstance(data, int) or isinstance(data, bool) or data <= 0:
+        raise ValueError(f"section {name!r} edge_from must be a positive column")
+    return data
 
 
 def read_steps(data: Mapping, name: str) -> dict[tuple[int, int], StepMode]:
@@ -64,17 +81,11 @@ def read_steps(data: Mapping, name: str) -> dict[tuple[int, int], StepMode]:
 
 
 def with_definition_from_file(data: Mapping, base: Path) -> Mapping:
-    # What the assignment says wins, so one definition serves several uses.
+    # Keys given inline override the file's.
     if "file" not in data:
         return data
     held = read_toml(base / data["file"], "section")
     return {**held.get("section", held), **data}
-
-
-def read_toml(path: Path, kind: str) -> Mapping:
-    if not path.exists():
-        raise ValueError(f"no {kind} file at {path}")
-    return tomllib.loads(path.read_text())
 
 
 def read_span(

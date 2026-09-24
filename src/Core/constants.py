@@ -1,6 +1,7 @@
 from .modes import PlacementMode, TerrainMaskMode
 
 DEFAULT_BLOCK = "minecraft:air"
+AIR_NAMES = frozenset({"minecraft:air", "minecraft:cave_air", "minecraft:void_air"})
 DEFAULT_PLACEMENT_MODE = PlacementMode.OVERWRITE
 DEFAULT_TERRAIN_MASK_MODE = TerrainMaskMode.NONE
 
@@ -11,15 +12,13 @@ CARDINAL_DIRECTIONS = (
     "west",
 )
 
-# Which cardinal a mirror swaps for which, by the world axis it flips. A
-# mirror across the plane x = 0 turns east into west and leaves north and
-# south where they are; across z = 0, the other way round.
+# Cardinals swapped by a mirror across each world axis.
 MIRRORED_DIRECTIONS = {
     "x": {"east": "west", "west": "east"},
     "z": {"north": "south", "south": "north"},
 }
 
-# A rail's shape under the same two mirrors, for the shapes a mirror moves.
+# Rail shapes swapped by the same mirrors.
 MIRRORED_RAIL_SHAPES = {
     "x": {
         "ascending_east": "ascending_west",

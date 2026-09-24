@@ -11,16 +11,8 @@ def line(
     end: BlockPos | Sequence[int],
     mode: LineMode = LineMode.CHEBYSHEV,
 ) -> tuple[BlockPos, ...]:
-    # A straight run of blocks from one position to another, both included.
-    #
-    # CHEBYSHEV steps diagonally: one step per block of the longest axis, so
-    # the run is as short as it can be and blocks meet at edges and corners.
-    # MANHATTAN steps on one axis at a time, so every block shares a face with
-    # the next -- what a wire needs to stay connected.
-    #
-    # The ends are put in a fixed order first. Bresenham breaks its ties on
-    # the side it started from, so without that the same two ends would give
-    # different blocks depending on which way the run was drawn.
+    # The blocks from `start` to `end` inclusive (see LineMode). Drawn from
+    # the lesser end so both directions give the same blocks.
     start, end = BlockPos.coerce(start), BlockPos.coerce(end)
     if end < start:
         return line(end, start, mode)[::-1]
@@ -28,14 +20,14 @@ def line(
     if mode == LineMode.CHEBYSHEV:
         return diagonal
     if mode == LineMode.MANHATTAN:
+        return tuple(_face_connected(diagonal, split_vertical=True))
+    if mode == LineMode.RAIL:
         return tuple(_face_connected(diagonal))
     raise ValueError(f"Unknown line mode: {mode}")
 
 
 def _walk(start: BlockPos, end: BlockPos) -> Iterator[BlockPos]:
-    # Bresenham in three dimensions, driven by the longest axis: each step
-    # advances it by one and the other two whenever their error has built up
-    # enough to owe a block.
+    # 3D Bresenham driven by the longest axis.
     deltas = [end[axis] - start[axis] for axis in range(3)]
     steps = [_sign(delta) for delta in deltas]
     extents = [abs(delta) for delta in deltas]
@@ -60,22 +52,12 @@ def _walk(start: BlockPos, end: BlockPos) -> Iterator[BlockPos]:
         yield BlockPos(*position)
 
 
-def _face_connected(diagonal: Sequence[BlockPos]) -> Iterator[BlockPos]:
-    # The same run with every diagonal step broken into single-axis moves, so
-    # consecutive blocks share a face -- the stepped Bresenham the reference
-    # draws a connected line with, which on a diagonal step emits the block
-    # one along the first axis before the block that moved both.
-    #
-    # In plan only. A step that climbs keeps the climb on its last move
-    # across, so that move is one along and one up: that is a slope, and it
-    # is the only way a rail can climb. Split off as a move of its own the
-    # climb puts a block in the corner instead, which a rail cannot express
-    # -- it comes out flat and cuts into whatever it runs over.
-    #
-    # The two axes across go in their own order, x then z, rather than the
-    # longer first. A fixed order makes the staircase lean the same way the
-    # whole length of a run; picking per step by which axis has travelled
-    # furthest makes it change sides partway along.
+def _face_connected(
+    diagonal: Sequence[BlockPos], *, split_vertical: bool = False
+) -> Iterator[BlockPos]:
+    # Splits each diagonal step into moves along x then z (a fixed order, so
+    # the staircase leans one way). A climb rides the last horizontal move,
+    # as a rail slope needs, unless `split_vertical`.
     if not diagonal:
         return
     yield diagonal[0]
@@ -87,6 +69,8 @@ def _face_connected(diagonal: Sequence[BlockPos]) -> Iterator[BlockPos]:
             yield BlockPos(*position)
         if across:
             position[across[-1]] = after[across[-1]]
+        if split_vertical and across and after.y != position[1]:
+            yield BlockPos(*position)
         position[1] = after[1]
         yield BlockPos(*position)
 

@@ -9,36 +9,19 @@ from .domain import DomainId, _frozen_mapping
 
 @dataclass(frozen=True, slots=True)
 class DomainInteraction:
-    """A rule between two domains, inherited by both sides' descendants.
+    """A rule between two domains and their descendants.
 
-    When several interactions match a pair of domains, the one declared
-    closest to both domains wins, and the latest one wins a tie. A source or
-    target of a parent domain covers that parent and all of its children, so
-    ``DomainInteraction(transport, transport, connect=True)`` joins every
-    transport subdomain together.
+    The interaction declared closest to both domains wins; the latest breaks
+    ties.
 
-    ``connect``
-        Whether source blocks connect to target blocks. None defers to the
-        domains' own connectivity rules.
-    ``overwrite``
-        Whether source placements may replace target blocks. False forbids it;
-        True exempts the pair from the target's ``protected`` rule. The
-        placement mode still decides the rest. This is always directional.
-    ``overrides``
-        Block-level connection overrides scoped to this domain pair. Use the
-        override's own ``symmetric`` flag to mirror it.
-    ``set_properties``
-        Block state patch applied to source blocks that border target blocks.
-    ``properties``
-        Metadata describing the relationship, read with
-        ``DomainPolicy.interaction_properties``.
-    ``grants``
-        Properties added to the source domain's profile, and to the target's
-        when the interaction is symmetric. A domain's own properties still
-        take precedence over granted ones.
-    ``symmetric``
-        Also apply ``connect``, ``set_properties``, ``properties``, and
-        ``grants`` from the target's side.
+    ``connect``: whether source blocks connect to target blocks (None defers).
+    ``overwrite``: whether source placements may replace target blocks; always
+    directional. ``overrides``: connection overrides scoped to the pair.
+    ``set_properties``: state patch for source blocks bordering the target.
+    ``properties``: relationship metadata. ``grants``: properties added to the
+    source's profile (and the target's when symmetric), below its own.
+    ``symmetric``: also apply connect, set_properties, properties and grants
+    from the target's side.
     """
 
     source: DomainId

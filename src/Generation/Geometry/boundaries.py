@@ -8,15 +8,12 @@ from ...Core.Path.path import Path
 from ...Core.Path.path_frame import PathFrame
 from ...Core.coordinates import Vec2
 
-# How the boundary at a path point is faced. Core holds the plane; which way it
-# looks is Generation's decision, so every builder here takes one of these.
+# The direction the boundary at a path point faces.
 Orientation = Callable[[Path, int], Vec2]
 
 
 class LateralReach(NamedTuple):
-    # How far a section reaches either side of the path, in blocks. Boundaries
-    # only have to agree over the columns a section can occupy, so this is what
-    # sizes the crossing checks.
+    # Blocks a section reaches left and right of the path.
 
     left: float = 0.0
     right: float = 0.0
@@ -27,8 +24,7 @@ class LateralReach(NamedTuple):
 
 
 def orthogonal(path: Path, index: int) -> Vec2:
-    # Square across the path: the point's own heading. Grade does not tilt the
-    # plane, since a boundary is vertical whatever the path is climbing.
+    # Square across the path, along the point's heading.
     point = path.path_points[index]
     if point.is_vertical:
         raise ValueError(
@@ -42,7 +38,6 @@ def boundary_at(
     index: int,
     orientation: Orientation = orthogonal,
 ) -> Boundary:
-    # The plane through one path point, facing the way `orientation` says.
     point = path.path_points[index]
     return Boundary.from_direction(
         (point.position.x, point.position.z),
@@ -52,19 +47,9 @@ def boundary_at(
 
 
 def path_bounds(path: Path, orientation: Orientation = orthogonal) -> PathBounds:
-    # The columns the path proper owns: from the plane at its first point to
-    # the plane at its last, so padding falls outside at either end.
-    #
-    # A frame holds the columns at or after its first plane and before its
-    # second, which is what stops two frames claiming one column. The first
-    # plane sits on the path's first point, which is therefore inside; the
-    # last is a block past its last point, so that one is inside too. On the
-    # point itself it would not be, and the build would stop a column short
-    # of the path it was given.
-    #
-    # The end is not a plane at a path point and does not claim to be: it
-    # carries no index, so the frame checks take it as given rather than
-    # holding it to the point its frame stops at.
+    # From the plane at the first point to one a block past the last point,
+    # so both end points are inside and padding is outside. The end plane has
+    # no path index, so frame checks take it as given.
     if not path.path_points:
         raise ValueError("An empty path has no bounds")
     last = path.path_points[path.last_index].position
@@ -76,10 +61,8 @@ def path_bounds(path: Path, orientation: Orientation = orthogonal) -> PathBounds
 
 
 def crossing_offsets(first: Boundary, second: Boundary) -> tuple[float, float] | None:
-    # Where two planes meet, as the distance along each from its own origin,
-    # signed: a plane runs along the right of travel, so a positive offset is
-    # a meeting to the right of the path and a negative one to its left.
-    # Parallel planes never meet and have no offsets.
+    # Signed distance along each plane from its origin to where they meet
+    # (positive to the right of travel); None if parallel.
     if first.is_parallel_to(second):
         return None
     along_first = Vec2(-first.normal.z, first.normal.x)
@@ -92,7 +75,6 @@ def crossing_offsets(first: Boundary, second: Boundary) -> tuple[float, float] |
 
 
 def reach_of(width: float | LateralReach) -> LateralReach:
-    # A plain width reaches the same distance either side.
     return width if isinstance(width, LateralReach) else LateralReach(width, width)
 
 
@@ -101,12 +83,7 @@ def crosses_within(
     second: Boundary,
     half_width: float | LateralReach,
 ) -> bool:
-    # Whether two planes meet close enough to either origin to matter: a
-    # meeting further out than a section reaches is not one it can see.
-    #
-    # The planes on a bend meet on its inside, so a section is measured by the
-    # reach it has on the side the meeting is on. One reaching out over the
-    # outside of a bend never meets anything, however far it reaches.
+    # Whether two planes meet within the section's reach on that side.
     reach = reach_of(half_width)
     offsets = crossing_offsets(first, second)
     if offsets is None:
@@ -121,8 +98,7 @@ def find_crossings(
     boundaries: Sequence[Boundary],
     half_width: float | LateralReach,
 ) -> list[tuple[int, int]]:
-    # The neighbouring pairs that meet within `half_width`. Only neighbours are
-    # checked: planes further apart than that have frames between them.
+    # Neighbouring pairs that meet within `half_width`.
     return [
         (index, index + 1)
         for index, (first, second) in enumerate(zip(boundaries, boundaries[1:]))
@@ -135,14 +111,9 @@ def validate_frames(
     frames: Sequence[PathFrame],
     half_width: float | LateralReach | None = None,
 ) -> None:
-    # Everything a run of frames has to be before generation uses it: numbered
-    # in order, tiling the path proper end to end, sharing each boundary with
-    # its neighbour, and none of them empty.
-    #
-    # A boundary that came from a path point has to sit at the point its frame
-    # starts or stops at; one built any other way is taken as given. With a
-    # `half_width`, neighbouring boundaries must also stay apart over the
-    # columns a section that wide can occupy.
+    # Frames must be numbered in order, non-empty, tile the path proper and
+    # share boundaries with their neighbours; with `half_width`, neighbouring
+    # boundaries must not cross within it.
     if not frames:
         raise ValueError("A path needs at least one frame")
 

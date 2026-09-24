@@ -8,15 +8,14 @@ from pathlib import Path
 
 from ..Core.block.states import BlockState
 from . import nbt
-from .codec import bits_for, pack_longs, unpack_longs
+from .codec import bits_for, pack_long_array, unpack_longs
 from .region import SECTION_SIZE, BlockRegion
 
 SECTOR = 4096
 REGION_CHUNKS = 32
 HEADER_SECTORS = 2
 CELLS_PER_SECTION = SECTION_SIZE**3
-# Anvil floors at 4 bits and, since 1.16, pads each long rather than letting
-# an entry span two.
+# At least 4 bits per entry; since 1.16 entries never span two longs.
 MIN_BITS = 4
 STRADDLE = False
 GZIP, ZLIB, RAW = 1, 2, 3
@@ -45,8 +44,7 @@ def header_index(chunk_x: int, chunk_z: int) -> int:
 
 @dataclass(slots=True)
 class ChunkColumn:
-    # Sections sharing an (x, z), keyed by section y, which is a signed byte
-    # and routinely negative.
+    # Sections sharing an (x, z), keyed by (possibly negative) section y.
     chunk_x: int
     chunk_z: int
     sections: dict[int, BlockRegion] = field(default_factory=dict)
@@ -80,7 +78,7 @@ def encode_block_states(
     return nbt.CompoundTag(
         {
             "palette": palette,
-            "data": nbt.long_array(pack_longs(list(indices), bits, straddle=STRADDLE)),
+            "data": nbt.long_array(pack_long_array(indices, bits, straddle=STRADDLE)),
         }
     )
 
@@ -109,7 +107,7 @@ def build_section(
     return nbt.CompoundTag(
         {
             "Y": nbt.ByteTag(section_y),
-            "block_states": encode_block_states(states, list(section.iter_cells())),
+            "block_states": encode_block_states(states, section.cell_array()),
             "biomes": nbt.CompoundTag({"palette": nbt.ListTag([nbt.StringTag(biome)])}),
         }
     )
@@ -122,8 +120,7 @@ def build_chunk(
     biome: str = DEFAULT_BIOME,
     status: str = DEFAULT_STATUS,
 ) -> nbt.CompoundTag:
-    # isLightOn=0 and empty Heightmaps make the game rebuild both, which is
-    # the only honest claim an exporter can make about either.
+    # isLightOn=0 and empty Heightmaps make the game recompute both.
     return nbt.CompoundTag(
         {
             "DataVersion": nbt.IntTag(data_version),
@@ -154,8 +151,7 @@ def overlay_chunk(
     *,
     biome: str = DEFAULT_BIOME,
 ) -> nbt.CompoundTag:
-    # Only cells the region occupies are replaced, so terrain the build does
-    # not touch survives. This is why occupancy is tracked apart from air.
+    # Replaces only the cells the region occupies.
     existing = {section["Y"].py_int: section for section in chunk["sections"]}
     for section_y, section in column.iter_sections():
         current = existing.get(section_y)
@@ -181,8 +177,7 @@ def overlay_chunk(
 
 
 class RegionFile:
-    # A .mca file as a mapping of chunk column to chunk NBT, with the sector
-    # bookkeeping handled on save.
+    # A .mca file: chunk column -> chunk NBT, sectors laid out on save.
 
     __slots__ = ("position", "chunks", "timestamps")
 
@@ -246,8 +241,7 @@ def read_region_index(
     path: Path | str,
     position: RegionPos | None = None,
 ) -> dict[tuple[int, int], tuple[int, int]]:
-    # Which chunks a .mca holds, from its 4 KiB location table alone. Nothing
-    # is decompressed, so presence costs one short read rather than the file.
+    # Chunk locations from the 4 KiB header alone.
     path = Path(path)
     if position is None:
         _, region_x, region_z, _ = path.name.split(".")

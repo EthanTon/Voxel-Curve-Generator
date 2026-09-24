@@ -17,7 +17,7 @@ from ..block.registry import BlockRegistry
 from ..constants import DEFAULT_BLOCK, DEFAULT_PLACEMENT_MODE, DEFAULT_TERRAIN_MASK_MODE
 from ..coordinates import BlockPos
 from ..modes import PlacementMode, TerrainMaskMode
-from .domain import Domain, DomainId, DomainRef
+from .domain import Domain, DomainId, DomainLookup, DomainRef
 from .interaction import DomainInteraction
 
 
@@ -45,6 +45,7 @@ class DomainProfile:
     is_terrain: bool
     terrain_mask_mode: TerrainMaskMode
     properties: Mapping[str, object]
+    stairs_join_diagonals: bool = False
 
     @property
     def domain_id(self) -> DomainId:
@@ -55,13 +56,17 @@ class DomainProfile:
         return self.domain.name
 
 
-class DomainConnectionRule:
-    """``NeighborResolver.domains_can_connect`` backed by a compiled policy."""
-
+class _PolicyRule:
     __slots__ = ("policy",)
 
     def __init__(self, policy: DomainPolicy) -> None:
         self.policy = policy
+
+
+class DomainConnectionRule(_PolicyRule):
+    """``NeighborResolver.domains_can_connect`` backed by a compiled policy."""
+
+    __slots__ = ()
 
     def __call__(self, source: DomainId, neighbor: DomainId) -> bool:
         return self.policy.can_connect(source, neighbor)
@@ -71,13 +76,23 @@ class DomainConnectionRule:
         return self.policy.connection_token
 
 
-class DomainPlacementRule:
+class DomainStairRule(_PolicyRule):
+    """``NeighborResolver.stairs_join_diagonals`` backed by a compiled policy."""
+
+    __slots__ = ()
+
+    def __call__(self, domain: DomainId) -> bool:
+        return self.policy.stairs_join_diagonals(domain)
+
+    @property
+    def policy_token(self) -> tuple[object, ...]:
+        return self.policy.connection_token
+
+
+class DomainPlacementRule(_PolicyRule):
     """``BlockWorld.placement_policy`` backed by a compiled policy."""
 
-    __slots__ = ("policy",)
-
-    def __init__(self, policy: DomainPolicy) -> None:
-        self.policy = policy
+    __slots__ = ()
 
     def __call__(self, upper: DomainId, lower: DomainId) -> bool:
         return self.policy.can_overwrite(upper, lower)
@@ -87,11 +102,9 @@ class DomainPlacementRule:
         return self.policy.placement_token
 
 
-class DomainPolicy:
-    """An immutable, compiled view of a set of domains and their interactions.
-
-    Build one with ``DomainRegistry.compile``. Editing the registry afterwards
-    does not change an existing policy; compile again and rebind.
+class DomainPolicy(DomainLookup):
+    """An immutable compiled view of domains and interactions; recompile and
+    rebind after editing the registry.
     """
 
     def __init__(
@@ -137,8 +150,8 @@ class DomainPolicy:
         self.connection_rule = DomainConnectionRule(self)
         self.placement_rule = DomainPlacementRule(self)
 
-        # Tokens only cover inputs that affect each rule, so recompiling after
-        # an unrelated edit does not throw away resolved world state.
+        # Each token covers only the inputs its rule reads, so unrelated edits
+        # keep resolved world state.
         self.connection_token: tuple[object, ...] = (
             "domain-connectivity",
             tuple(
@@ -177,24 +190,6 @@ class DomainPolicy:
     def interactions(self) -> tuple[DomainInteraction, ...]:
         return self._interactions
 
-    def __contains__(self, domain: object) -> bool:
-        if isinstance(domain, str):
-            return domain in self._names
-        return domain in self._domains
-
-    def id_of(self, domain: DomainRef) -> DomainId:
-        if isinstance(domain, str):
-            try:
-                return self._names[domain]
-            except KeyError:
-                raise KeyError(f"Unknown domain {domain!r}") from None
-        if domain not in self._domains:
-            raise KeyError(f"Unknown domain {domain!r}")
-        return domain
-
-    def get(self, domain: DomainRef) -> Domain:
-        return self._domains[self.id_of(domain)]
-
     def profile(self, domain: DomainRef) -> DomainProfile:
         return self._profiles[self.id_of(domain)]
 
@@ -226,7 +221,7 @@ class DomainPolicy:
         return roots[0] if roots else None
 
     def can_connect(self, source: DomainId, neighbor: DomainId) -> bool:
-        # Unregistered ids are allowed so a world's implicit domain 0 still works.
+        # Unregistered ids are allowed for a world's implicit domain 0.
         key = (source, neighbor)
         cached = self._connect_cache.get(key)
         if cached is not None:
@@ -293,11 +288,7 @@ class DomainPolicy:
         blocks_can_connect: BlockConnectionPredicate | None = None,
         overrides: Iterable[ConnectionOverride] = (),
     ) -> NeighborResolver:
-        """A resolver that applies these domains' connectivity rules.
-
-        Extra ``overrides`` are appended after the domain overrides, so they
-        win when both match.
-        """
+        """A resolver applying these rules; extra ``overrides`` win ties."""
         combined = (
             *(() if self.options is None else self.options.overrides),
             *overrides,
@@ -306,6 +297,7 @@ class DomainPolicy:
             registry,
             domains_can_connect=self.connection_rule,
             blocks_can_connect=blocks_can_connect,
+            stairs_join_diagonals=DomainStairRule(self),
             options=ConnectivityOptions(combined) if combined else None,
         )
 
@@ -425,6 +417,9 @@ class DomainPolicy:
             lineage=lineage,
             connects_to_self=inherit(lambda d: d.connectivity.connects_to_self, True),
             connects_to_any=inherit(lambda d: d.connectivity.connects_to_any, False),
+            stairs_join_diagonals=inherit(
+                lambda d: d.connectivity.stairs_join_diagonals, False
+            ),
             placement_mode=inherit(lambda d: d.placement.mode, DEFAULT_PLACEMENT_MODE),
             replace=inherit(lambda d: d.placement.replace, DEFAULT_BLOCK),
             protected=inherit(lambda d: d.placement.protected, False),
@@ -479,14 +474,17 @@ class DomainPolicy:
                 return value
         return None
 
+    def stairs_join_diagonals(self, domain_id: DomainId) -> bool:
+        profile = self._profiles.get(domain_id)
+        return profile is not None and profile.stairs_join_diagonals
+
     def _connects_to_any(self, domain_id: DomainId) -> bool:
         profile = self._profiles.get(domain_id)
         return profile is not None and profile.connects_to_any
 
     def _compile_overrides(self) -> tuple[ConnectionOverride, ...]:
-        # ConnectivityOptions lets the last match win, so general rules go
-        # first: boundary patches, then domain overrides, then pair overrides,
-        # each ordered from shallow to deep lineages.
+        # The last match wins, so order general to specific: boundary patches,
+        # domain overrides, pair overrides, each shallow lineage first.
         patches: list[ConnectionOverride] = []
         domain_overrides: list[ConnectionOverride] = []
         pair_overrides: list[ConnectionOverride] = []

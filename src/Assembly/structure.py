@@ -19,8 +19,7 @@ from ..Core.block.palette import BlockPalette
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos, ColumnPos
 from ..Core.modes import ElevationMode, PlacementMode
-from ..Format.region import AIR
-from ..Format.schematics import load_schematic, parse_state_key
+from ..Format.schematics import load_blocks, parse_state_key
 from ..Generation.Geometry.frames import (
     build_frames,
     build_section_frames,
@@ -29,7 +28,7 @@ from ..Generation.Geometry.frames import (
 )
 from ..Generation.Geometry.padding import padded_path
 from ..Generation.Geometry.reach import lateral_reach, required_lead
-from ..Stamping import HeadingStamp
+from ..Stamping import HeadingStamp, TurnStamp
 from ..Parser.spec import (
     BuildSpec,
     LaneSpec,
@@ -85,10 +84,13 @@ def build_path(spec: BuildSpec) -> Path:
 
 
 def resolve_spans(spec: BuildSpec, path: Path) -> dict[str, tuple[tuple[int, int], ...]]:
-    # Sections may cover the same stretch as each other -- they stack -- but a
-    # section may not cover its own twice, which is what SectionSchedule refuses.
+    # Each section's merged path-index spans.
+    starts = {
+        (assignment.span.start.x, assignment.span.start.z)
+        for assignment in spec.assignments
+    }
     return {
-        name: section_spans(spec.section(name), spans, path)
+        name: section_spans(spec.section(name), spans, path, starts)
         for name, spans in stretches_by_section(spec).items()
     }
 
@@ -102,24 +104,33 @@ def stretches_by_section(spec: BuildSpec) -> dict[str, list[SpanSpec]]:
 
 
 def section_spans(
-    section: SectionSpec, spans: Sequence[SpanSpec], path: Path
+    section: SectionSpec, spans: Sequence[SpanSpec], path: Path,
+    starts: set[tuple[int, int]] | None = None,
 ) -> tuple[tuple[int, int], ...]:
-    # Stretches that meet or overlap become one. Assignments are written
-    # stretch by stretch, so a section carried along several in a row is one
-    # sweep, and a schedule takes no two spans that touch.
-    ranges = sorted(span_indices(section, span, path) for span in spans)
+    # Merges stretches that meet or overlap.
+    ranges = sorted(span_indices(section, span, path, starts) for span in spans)
     merged: list[tuple[int, int]] = []
     for start, stop in ranges:
-        if merged and start <= merged[-1][1]:
+        if merged and start <= merged[-1][1] + 1:
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
         else:
             merged.append((start, stop))
     return tuple(merged)
 
 
-def span_indices(section: SectionSpec, span: SpanSpec, path: Path) -> tuple[int, int]:
+def span_indices(
+    section: SectionSpec, span: SpanSpec, path: Path,
+    starts: set[tuple[int, int]] | None = None,
+) -> tuple[int, int]:
     start = marker_index(section, span, span.start, path)
     stop = marker_index(section, span, span.stop, path)
+    # A marker shared with the next assignment belongs to that one.
+    if (
+        starts is not None
+        and (span.stop.x, span.stop.z) in starts
+        and stop < path.last_index
+    ):
+        stop -= 1
     if stop < start:
         raise ValueError(
             f"section {section.name!r} sweeps {span}, which runs backwards "
@@ -146,8 +157,7 @@ def build_sections(
     domains: DomainRegistry,
     spans: Mapping[str, object],
 ) -> dict[str, CrossSection]:
-    # Only the sections an assignment names, so a file of definitions costs
-    # nothing for the ones this build does not use.
+    # Only the sections some assignment uses.
     return {
         name: build_section(spec.section(name), registry, domains)
         for name in spans
@@ -157,53 +167,59 @@ def build_sections(
 def build_section(
     spec: SectionSpec, registry: BlockRegistry, domains: DomainRegistry
 ) -> CrossSection:
-    # A section records where features sit, not blocks. The schematic is the
-    # swept profile, and it becomes a point per column of that profile rather
-    # than one point carrying the whole row.
-    #
-    # That is what makes a diagonal work. A diagonal layout is the two
-    # quarters either side of it, staggered half the section's length apart
-    # and joined at their outermost column. Joining them needs the columns to
-    # be separate points: one point carrying the whole row has nothing to
-    # split between the two halves, so the row is painted twice, once in each
-    # half, and the halves neither meet nor tile.
-    #
-    # The column on the centreline is named for the section itself. It is the
-    # one a fitting rides, so a lane or a wire sees the path rather than
-    # eleven copies of it, and it is there whether the profile paints
-    # anything on the centreline or not.
+    # One annotation per column of the profile schematic (with every block
+    # of that column), so a diagonal join can stagger the columns. The
+    # centreline column, named after the section, is what fittings ride.
     blocks = load_field(spec.schematic, registry.palette, spec.name)
     check_extent(spec, blocks)
     mode = placing_mode(spec, domains)
     domain = domains.get(spec.domain)
-    return CrossSection(
-        points=PointField(
-            FeatureAnnotation(
-                name=spec.name if column == (0, 0) else f"{spec.name}[{column[0]},{column[1]}]",
-                position=BlockPos(column[0], 0, column[1]),
-                feature=PointFeature(
-                    blocks=stack,
-                    placement_mode=mode,
-                    domain=domain,
-                    offset=None,
-                    # Each delivered point carries the level of the frame it
-                    # landed in, so a column sits at that level.
-                    elevation_mode=ElevationMode.RIGID,
-                ),
-                step_mode=spec.steps.get(column, spec.step),
-                section=spec.name,
-            )
-            for column, stack in columns_of(blocks, registry).items()
+    annotations: list[FeatureAnnotation] = []
+    for column, stack in columns_of(blocks, registry).items():
+        edge = spec.edge_domains is not None and (
+            spec.edge_from is not None and abs(column[0]) >= spec.edge_from
+            or any(local.y > 0 for local, _ in stack.iter_block_ids())
         )
-    )
+        if edge and column[0] == 0:
+            raise ValueError(
+                f"section {spec.name!r} has a raised edge on its centreline"
+            )
+        position = BlockPos(column[0], 0, column[1])
+        step = spec.steps.get(column, spec.step)
+        if stack.bounds is None and column != (0, 0):
+            continue
+        placed_domain = (
+            domains.get(spec.edge_domains[column[0] > 0])
+            if edge else domain
+        )
+        annotations.append(FeatureAnnotation(
+            name=(
+                f"{spec.name}_edge[{column[0]},{column[1]}]" if edge
+                else spec.name if column == (0, 0)
+                else f"{spec.name}[{column[0]},{column[1]}]"
+            ),
+            position=position,
+            feature=PointFeature(
+                blocks=stack,
+                placement_mode=(
+                    spec.placement_mode
+                    or domains.profile(placed_domain).placement_mode
+                ) if edge else mode,
+                domain=placed_domain, offset=None,
+                elevation_mode=ElevationMode.RIGID,
+                surface_mask=spec.surface_mask,
+            ),
+            step_mode=step,
+            section=spec.name,
+            clip_to_span=edge,
+        ))
+    return CrossSection(points=PointField(annotations))
 
 
 def columns_of(
     blocks: BlockField, registry: BlockRegistry
 ) -> dict[tuple[int, int], BlockField]:
-    # The profile split into one field per column, each holding that column's
-    # blocks at its own local heights and nothing else. The centreline column
-    # is always there, empty if the profile paints nothing on it.
+    # One field per (x, z) column of the profile; the centreline always exists.
     columns: dict[tuple[int, int], BlockField] = {
         (0, 0): BlockField(registry.palette)
     }
@@ -236,8 +252,7 @@ def build_schedules(
     spans: dict[str, tuple[tuple[int, int], ...]],
     length: int,
 ) -> dict[str, SectionSchedule]:
-    # One schedule per section, not one for all of them. Sections stack: two
-    # may cover the same stretch, and a schedule refuses spans that overlap.
+    # One schedule per section, since sections may overlap each other.
     return {
         name: SectionSchedule(
             [SectionSpan(start, stop, sections[name]) for start, stop in ranges],
@@ -252,9 +267,7 @@ def build_path_frames(
     schedules: dict[str, SectionSchedule],
     path: Path,
 ) -> list[PathFrame]:
-    # The frames a stamp is clipped to: cut at every change of level and at
-    # every point a section starts or stops, so no frame spans two levels or
-    # two sections.
+    # Frames cut at every level change and every section start or stop.
     sections = [span.section for schedule in schedules.values() for span in schedule.spans]
     check_lead(spec, path, sections)
     elevation = build_elevation_frames(spec, path, sections)
@@ -276,8 +289,6 @@ def build_path_frames(
 def build_elevation_frames(
     spec: BuildSpec, path: Path, sections: Sequence[CrossSection]
 ) -> list[PathFrame]:
-    # One frame per level. The path's own points carry the heights, so a
-    # change between two of them is a break and nothing else declares one.
     return build_frames(
         path,
         path.bounded_points[0].position.y,
@@ -289,8 +300,6 @@ def build_elevation_frames(
 
 
 def check_lead(spec: BuildSpec, path: Path, sections: Sequence[CrossSection]) -> None:
-    # A section near a boundary reaches past it, and that reach is pasted from
-    # the lead. Too short a lead and the ends come out unfinished.
     needed = required_lead(path, sections)
     if needed > spec.path.lead:
         raise ValueError(
@@ -301,7 +310,12 @@ def check_lead(spec: BuildSpec, path: Path, sections: Sequence[CrossSection]) ->
 
 def build_structure(
     spec: StructureSpec, registry: BlockRegistry, domains: DomainRegistry
-) -> HeadingStamp:
+) -> HeadingStamp | TurnStamp:
+    if spec.turn == "layout":
+        [schematic] = spec.headings.values()
+        return TurnStamp(
+            build_structure_feature(spec, schematic, registry, domains), domains
+        )
     return HeadingStamp(
         {
             heading: build_structure_feature(spec, schematic, registry, domains)
@@ -324,6 +338,7 @@ def build_structure_feature(
         domain=domains.get(spec.domain),
         offset=spec.offset,
         elevation_mode=spec.elevation_mode,
+        surface_mask=spec.surface_mask,
     )
 
 
@@ -336,6 +351,7 @@ def build_lane(
         domain=domains.get(spec.domain),
         offset=spec.offset,
         elevation_mode=ElevationMode.RIGID,
+        surface_mask=spec.surface_mask,
     )
 
 
@@ -360,6 +376,7 @@ def build_wire(
         domain=domains.get(spec.domain),
         offset=None,
         elevation_mode=ElevationMode.RIGID,
+        surface_mask=spec.surface_mask,
     )
     for position in positions:
         for local, block_id in strand.iter_block_ids():
@@ -379,11 +396,7 @@ def placing_mode(
 def load_field(path: FilePath, palette: BlockPalette, section: str) -> BlockField:
     if not path.exists():
         raise ValueError(f"section {section!r} has no schematic at {path}")
-    region, _ = load_schematic(path)
-    field = BlockField(palette)
-    for position, state in region.iter_occupied():
-        if state != AIR:
-            field.set_block(position, state)
+    field = load_blocks(path, palette)
     if field.bounds is None:
         raise ValueError(f"section {section!r} has an empty schematic at {path}")
     return field

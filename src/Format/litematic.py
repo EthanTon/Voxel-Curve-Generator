@@ -6,13 +6,13 @@ from pathlib import Path
 
 from ..Core.coordinates import BlockPos
 from . import nbt
-from .codec import bits_for, pack_longs, unpack_longs
+from .codec import bits_for, pack_long_array, unpack_long_array
 from .region import BlockRegion, SplitBudget, enclosing_bounds, split_by_budget
 
 LITEMATIC_VERSION = 6
 LITEMATIC_SUB_VERSION = 1
 LITEMATIC_SUFFIX = ".litematic"
-# Litematica floors at 2 bits and packs the pre-1.16 way, spanning longs.
+# At least 2 bits per entry, which may span two longs (pre-1.16 packing).
 MIN_BITS = 2
 STRADDLE = True
 
@@ -27,8 +27,6 @@ def build_litematic(
     origin: Sequence[int] | None = None,
     created: int | None = None,
 ) -> nbt.CompoundTag:
-    # One file holds several named regions, so a split build need not become
-    # a pile of separate files.
     if not regions:
         raise ValueError("a litematic holds at least one region")
     names = [region.name for region in regions]
@@ -98,8 +96,7 @@ def write_split_litematic(
     author: str = "",
     description: str = "",
 ) -> tuple[Path, list[BlockRegion]]:
-    # Pieces become named regions of one schematic, positioned relative to
-    # each other, rather than one file each.
+    # The pieces as named regions of one file.
     pieces = split_by_budget(region, budget)
     if not pieces:
         raise ValueError(f"{region.name} has nothing to write")
@@ -121,15 +118,14 @@ def load_litematic(path: Path | str) -> list[BlockRegion]:
         position = _read_vector(entry_tag["Position"])
         size = _read_vector(entry_tag["Size"])
         states = [nbt.block_state_from_tag(tag) for tag in entry_tag["BlockStatePalette"]]
-        indices = unpack_longs(
+        indices = unpack_long_array(
             entry_tag["BlockStates"].np_array,
             bits_for(len(states), minimum=MIN_BITS),
             size.x * size.y * size.z,
             straddle=STRADDLE,
         )
         region = BlockRegion(name, position, size)
-        for index, value in enumerate(indices):
-            region.set_state(region.position_at(index), states[value])
+        region.fill(indices, states)
         for entry in entry_tag.get("Entities", nbt.ListTag([])):
             region.add_entity(nbt.entity_from_tag(entry, position))
         regions.append(region)
@@ -137,8 +133,7 @@ def load_litematic(path: Path | str) -> list[BlockRegion]:
 
 
 def _region_tag(region: BlockRegion, reference: BlockPos) -> nbt.CompoundTag:
-    # Litematica also allows a negative Size meaning "extends the other way";
-    # this writer always emits a positive size from the minimum corner.
+    # Always a positive size from the minimum corner.
     bits = bits_for(len(region.palette), minimum=MIN_BITS)
     return nbt.CompoundTag(
         {
@@ -151,7 +146,7 @@ def _region_tag(region: BlockRegion, reference: BlockPos) -> nbt.CompoundTag:
                 ]
             ),
             "BlockStates": nbt.long_array(
-                pack_longs(list(region.iter_cells()), bits, straddle=STRADDLE)
+                pack_long_array(region.cell_array(), bits, straddle=STRADDLE)
             ),
             "TileEntities": nbt.ListTag([]),
             "Entities": nbt.ListTag(

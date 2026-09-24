@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .boundary import Boundary
 
 
 @dataclass(frozen=True, slots=True)
 class ConstantElevation:
-    # One level everywhere: the elevation of a path with no steps.
     y: int
 
     def __call__(self, x: int, z: int) -> int:
@@ -46,6 +45,9 @@ class ElevationStep:
 class MultiElevationStep:
     y_first: int
     steps: tuple[tuple[Boundary, int], ...]
+    _columns: dict[tuple[int, int], int] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not self.steps:
@@ -53,10 +55,15 @@ class MultiElevationStep:
         object.__setattr__(self, "steps", tuple(self.steps))
 
     def __call__(self, x: int, z: int) -> int:
+        column = (x, z)
+        cached = self._columns.get(column)
+        if cached is not None:
+            return cached
         level = self.y_first
         for boundary, y_after in self.steps:
             if boundary.after(x, z):
                 level = y_after
+        self._columns[column] = level
         return level
 
     @property

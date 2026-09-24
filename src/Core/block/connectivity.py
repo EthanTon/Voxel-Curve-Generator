@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cache
 from typing import Callable, Iterable, Iterator, Mapping, MutableMapping, Protocol
 
 from .connectivity_options import (
@@ -19,6 +20,7 @@ from ..coordinates import BlockPos
 
 ConnectivityDomainId = int
 Direction = str
+_UNSEEN = object()
 
 HORIZONTAL_DIRECTIONS: tuple[Direction, ...] = (
     "north",
@@ -38,6 +40,29 @@ DIRECTION_OFFSETS: dict[Direction, BlockPos] = {
     "east": BlockPos(1, 0, 0),
     "south": BlockPos(0, 0, 1),
     "west": BlockPos(-1, 0, 0),
+}
+_NEIGHBOR_DELTAS = tuple(DIRECTION_OFFSETS[direction].as_tuple() for direction in ALL_DIRECTIONS)
+EDGE_OFFSETS: tuple[BlockPos, ...] = tuple(
+    BlockPos(x, y, z)
+    for x in (-1, 0, 1)
+    for y in (-1, 0, 1)
+    for z in (-1, 0, 1)
+    if x * x + y * y + z * z == 2
+)
+
+def _toward(offset: BlockPos, direction: Direction) -> bool:
+    axis = DIRECTION_OFFSETS[direction]
+    return offset.x * axis.x + offset.y * axis.y + offset.z * axis.z == 1
+
+
+# Each edge offset with the face directions it lies toward.
+EDGE_DIRECTIONS: tuple[tuple[BlockPos, tuple[Direction, ...]], ...] = tuple(
+    (offset, tuple(direction for direction in ALL_DIRECTIONS if _toward(offset, direction)))
+    for offset in EDGE_OFFSETS
+)
+EDGES_TOWARD: dict[Direction, tuple[BlockPos, ...]] = {
+    direction: tuple(offset for offset in EDGE_OFFSETS if _toward(offset, direction))
+    for direction in ALL_DIRECTIONS
 }
 OPPOSITE_DIRECTION: dict[Direction, Direction] = {
     "down": "up",
@@ -72,7 +97,7 @@ BlockConnectionPredicate = Callable[
 
 @dataclass(frozen=True, slots=True)
 class DependencySpec:
-    # Radius is extra invalidation beyond the six direct neighbors.
+    # How far beyond the six face neighbours a change must re-resolve.
     radius: BlockPos = BlockPos(0, 0, 0)
     horizontal_range: int = 0
     stream_halo: int | None = 1
@@ -82,34 +107,33 @@ class DependencySpec:
 
     def affected_positions(self, position: BlockPos) -> set[BlockPos]:
         position = BlockPos.coerce(position)
-        positions: set[BlockPos] = set()
-        if any(self.radius):
-            for delta_x in range(-self.radius.x, self.radius.x + 1):
-                for delta_y in range(-self.radius.y, self.radius.y + 1):
-                    for delta_z in range(-self.radius.z, self.radius.z + 1):
-                        positions.add(
-                            BlockPos(
-                                position.x + delta_x,
-                                position.y + delta_y,
-                                position.z + delta_z,
-                            )
-                        )
-        for direction in HORIZONTAL_DIRECTIONS:
-            offset = DIRECTION_OFFSETS[direction]
-            for distance in range(1, self.horizontal_range + 1):
-                positions.add(
-                    BlockPos(
-                        position.x + offset.x * distance,
-                        position.y,
-                        position.z + offset.z * distance,
-                    )
-                )
-        return positions
+        x, y, z = position.x, position.y, position.z
+        return {BlockPos(x + dx, y + dy, z + dz) for dx, dy, dz in _affected_offsets(self)}
+
+
+@cache
+def _affected_offsets(spec: DependencySpec) -> tuple[tuple[int, int, int], ...]:
+    offsets = []
+    if any(spec.radius):
+        radius = spec.radius
+        offsets.extend(
+            (dx, dy, dz)
+            for dx in range(-radius.x, radius.x + 1)
+            for dy in range(-radius.y, radius.y + 1)
+            for dz in range(-radius.z, radius.z + 1)
+        )
+    for direction in HORIZONTAL_DIRECTIONS:
+        offset = DIRECTION_OFFSETS[direction]
+        for distance in range(1, spec.horizontal_range + 1):
+            offsets.append((offset.x * distance, 0, offset.z * distance))
+    return tuple(offsets)
 
 
 DEFAULT_DEPENDENCY_SPEC = DependencySpec()
 BUILTIN_DEPENDENCY_SPECS: dict[NeighborRule, DependencySpec] = {
     NeighborRule.REDSTONE: DependencySpec(radius=BlockPos(1, 1, 1)),
+    # Stairs can take their shape from a diagonal neighbour.
+    NeighborRule.STAIR: DependencySpec(radius=BlockPos(1, 0, 1)),
     NeighborRule.MOSS_CARPET: DependencySpec(radius=BlockPos(1, 1, 1)),
     NeighborRule.RAIL: DependencySpec(radius=BlockPos(2, 2, 2), stream_halo=2),
     NeighborRule.TRIPWIRE: DependencySpec(horizontal_range=42, stream_halo=42),
@@ -151,7 +175,7 @@ class ConnectivityView(Protocol):
 
 
 class _MappingConnectivityView:
-    # This adapter preserves the original dictionary-based public API.
+    # Adapts plain position -> block id mappings to ConnectivityView.
     def __init__(
         self,
         blocks: Mapping[BlockPos, BlockId],
@@ -193,38 +217,17 @@ class _MappingConnectivityView:
         return (BlockPos.coerce(position) for position in self.blocks)
 
 
-class _EffectiveBlockMapping(Mapping[BlockPos, BlockId]):
-    # Lazy compatibility mapping for custom handlers written for the old API.
-    def __init__(self, view: ConnectivityView) -> None:
+class _EffectiveMapping(Mapping[BlockPos, int]):
+    # One field of each effective cell, for handlers written against mappings.
+    def __init__(self, view: ConnectivityView, field_name: str) -> None:
         self.view = view
+        self.field_name = field_name
 
-    def __getitem__(self, position: BlockPos) -> BlockId:
+    def __getitem__(self, position: BlockPos) -> int:
         cell = self.view.effective_at(position)
         if cell is None:
             raise KeyError(position)
-        return cell.block_id
-
-    def __iter__(self) -> Iterator[BlockPos]:
-        return (
-            position
-            for position in self.view.iter_source_positions()
-            if self.view.effective_at(position) is not None
-        )
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
-
-
-class _EffectiveDomainMapping(Mapping[BlockPos, ConnectivityDomainId]):
-    # Domain values are derived from effective cells instead of a second dictionary.
-    def __init__(self, view: ConnectivityView) -> None:
-        self.view = view
-
-    def __getitem__(self, position: BlockPos) -> ConnectivityDomainId:
-        cell = self.view.effective_at(position)
-        if cell is None:
-            raise KeyError(position)
-        return cell.domain
+        return getattr(cell, self.field_name)
 
     def __iter__(self) -> Iterator[BlockPos]:
         return (
@@ -260,6 +263,9 @@ class NeighborContext:
     info: BlockInfo
     source: ConnectivityCell
     view: ConnectivityView
+    _blocks: dict[BlockPos, NeighborBlock | None] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def domain(self) -> ConnectivityDomainId:
@@ -275,20 +281,25 @@ class NeighborContext:
 
     @property
     def blocks(self) -> Mapping[BlockPos, BlockId]:
-        return _EffectiveBlockMapping(self.view)
+        return _EffectiveMapping(self.view, "block_id")
 
     @property
     def domains(self) -> Mapping[BlockPos, ConnectivityDomainId]:
-        return _EffectiveDomainMapping(self.view)
+        return _EffectiveMapping(self.view, "domain")
 
     def neighbor(self, direction: Direction) -> NeighborBlock | None:
-        offset = DIRECTION_OFFSETS[direction]
-        position = _add_position(self.position, offset)
-        cell = self.view.effective_at(position)
-        if cell is None:
-            return None
+        return self.neighbor_at(DIRECTION_OFFSETS[direction])
 
-        return NeighborBlock(
+    def neighbor_at(self, offset: BlockPos) -> NeighborBlock | None:
+        return self.block_at(_add_position(self.position, offset))
+
+    def block_at(self, position: BlockPos) -> NeighborBlock | None:
+        # Memoized: the view does not change while one position resolves.
+        found = self._blocks.get(position, _UNSEEN)
+        if found is not _UNSEEN:
+            return found
+        cell = self.view.effective_at(position)
+        found = None if cell is None else NeighborBlock(
             position=position,
             block_id=cell.block_id,
             state=self.resolver.registry.get_state(cell.block_id),
@@ -297,6 +308,22 @@ class NeighborContext:
             source_token=cell.source_token,
             placement_id=cell.placement_id,
             sequence_index=cell.sequence_index,
+        )
+        self._blocks[position] = found
+        return found
+
+    def connects_domain(self, other: NeighborBlock | ConnectivityCell) -> bool:
+        return self.resolver.domains_can_connect(self.domain, other.domain)
+
+    def allows(self, direction: Direction, default: Callable[[NeighborBlock], bool]) -> bool:
+        # Whether the neighbour toward `direction` counts: an override decides
+        # if one matches, otherwise `default` does.
+        neighbor = self.neighbor(direction)
+        decision = self.connection_decision(direction)
+        return bool(
+            neighbor is not None
+            and decision.action != ConnectionAction.DISCONNECT
+            and (decision.action == ConnectionAction.CONNECT or default(neighbor))
         )
 
     def connects(
@@ -308,7 +335,7 @@ class NeighborContext:
     ) -> bool:
         neighbor = self.neighbor(direction)
         if neighbor is None:
-            return False
+            return self.diagonal_decision(direction).action == ConnectionAction.CONNECT
 
         decision = self.connection_decision(direction)
         if decision.action == ConnectionAction.CONNECT:
@@ -316,7 +343,10 @@ class NeighborContext:
         if decision.action == ConnectionAction.DISCONNECT:
             return False
 
-        if not self.resolver.domains_can_connect(self.domain, neighbor.domain):
+        if self.diagonal_decision(direction).action == ConnectionAction.CONNECT:
+            return True
+
+        if not self.connects_domain(neighbor):
             return False
 
         predicate = self.resolver.blocks_can_connect
@@ -364,6 +394,7 @@ class NeighborContext:
     ) -> ConnectionDecision:
         if neighbor is None or self.resolver.options is None:
             return DEFAULT_CONNECTION_DECISION
+        offset = neighbor.position - self.position
         return self.resolver.options.decide(
             self.state,
             self.domain,
@@ -374,7 +405,18 @@ class NeighborContext:
             neighbor.info.behavior,
             self.info.tags,
             neighbor.info.tags,
+            tuple(offset),
         )
+
+    def diagonal_decision(self, direction: Direction) -> ConnectionDecision:
+        if self.resolver.options is None or not self.resolver.has_edge_overrides:
+            return DEFAULT_CONNECTION_DECISION
+        for offset in EDGES_TOWARD[direction]:
+            neighbor = self.neighbor_at(offset)
+            decision = self.connection_decision_for(neighbor, direction)
+            if decision.action != ConnectionAction.DEFAULT:
+                return decision
+        return DEFAULT_CONNECTION_DECISION
 
 
 NeighborHandler = Callable[[NeighborContext], BlockState | None]
@@ -388,11 +430,16 @@ class NeighborResolver:
         domains_can_connect: DomainPredicate | None = None,
         blocks_can_connect: BlockConnectionPredicate | None = None,
         options: ConnectivityOptions | None = None,
+        stairs_join_diagonals: Callable[[ConnectivityDomainId], bool] | None = None,
     ) -> None:
         self.registry = registry
         self.domains_can_connect = domains_can_connect or _same_domain
+        self.stairs_join_diagonals = stairs_join_diagonals
         self.blocks_can_connect = blocks_can_connect
         self.options = options
+        self.has_edge_overrides = bool(
+            options and any(override.max_distance > 1 for override in options.overrides)
+        )
         self._dependency_specs = dict(BUILTIN_DEPENDENCY_SPECS)
         self._handlers: dict[NeighborRule, NeighborHandler] = {
             NeighborRule.NONE: _unchanged,
@@ -442,10 +489,11 @@ class NeighborResolver:
 
     @property
     def policy_token(self) -> tuple[object, ...]:
-        # The world uses this token to invalidate cached states after policy changes.
+        # Changes whenever resolution rules change, invalidating cached results.
         return (
             _predicate_token(self.domains_can_connect),
             _predicate_token(self.blocks_can_connect),
+            _predicate_token(self.stairs_join_diagonals),
             repr(None if self.options is None else self.options.overrides),
             tuple(
                 sorted(
@@ -502,6 +550,15 @@ class NeighborResolver:
             decision = context.connection_decision(direction)
             if decision.set_properties:
                 updates.update(decision.set_properties)
+        if self.has_edge_overrides:
+            for offset, directions in EDGE_DIRECTIONS:
+                neighbor = context.neighbor_at(offset)
+                if neighbor is None:
+                    continue
+                for direction in directions:
+                    decision = context.connection_decision_for(neighbor, direction)
+                    if decision.set_properties:
+                        updates.update(decision.set_properties)
         return _with_properties(state, updates) if updates else state
 
     def resolve_id(
@@ -532,11 +589,14 @@ class NeighborResolver:
         initial: set[BlockPos] = set()
         for item in dirty:
             position, changed_rules = _dirty_position_and_rules(item, self.registry)
+            neighbors = neighboring_positions(position)
             initial.add(position)
-            initial.update(neighboring_positions(position))
+            initial.update(neighbors)
+            if self.has_edge_overrides:
+                initial.update(_add_position(position, offset) for offset in EDGE_OFFSETS)
             nearby_rules = {
                 self.registry.get_info(cell.block_id).neighbor_rule
-                for nearby in (position, *neighboring_positions(position))
+                for nearby in (position, *neighbors)
                 if (cell := view.source_at(nearby)) is not None
             }
             nearby_rules.update(changed_rules)
@@ -544,7 +604,7 @@ class NeighborResolver:
 
         queue = deque(
             position
-            for position in sorted(initial)
+            for position in sorted(initial, key=_position_order)
             if view.source_at(position) is not None
         )
         queued = set(queue)
@@ -569,13 +629,15 @@ class NeighborResolver:
             changed.add(position)
 
             affected = set(neighboring_positions(position))
+            if self.has_edge_overrides:
+                affected.update(_add_position(position, offset) for offset in EDGE_OFFSETS)
             new_rule = (
                 old_rule
                 if new_effective is None
                 else self.registry.get_info(new_effective.block_id).neighbor_rule
             )
             affected.update(self.dependency_positions(position, {old_rule, new_rule}))
-            for neighbor_position in sorted(affected):
+            for neighbor_position in sorted(affected, key=_position_order):
                 if (
                     view.source_at(neighbor_position) is not None
                     and neighbor_position not in queued
@@ -592,6 +654,10 @@ class NeighborResolver:
     ) -> set[BlockPos]:
         view = _as_connectivity_view(blocks, domains)
         return self.resolve_dirty(view, view.iter_source_positions())
+
+
+def _position_order(position: BlockPos) -> tuple[int, int, int]:
+    return position.x, position.y, position.z
 
 
 def _as_connectivity_view(
@@ -628,10 +694,9 @@ def _dirty_position_and_rules(
 
 
 def neighboring_positions(position: BlockPos) -> tuple[BlockPos, ...]:
-    return tuple(
-        _add_position(position, DIRECTION_OFFSETS[direction])
-        for direction in ALL_DIRECTIONS
-    )
+    position = BlockPos.coerce(position)
+    x, y, z = position.x, position.y, position.z
+    return tuple(BlockPos(x + dx, y + dy, z + dz) for dx, dy, dz in _NEIGHBOR_DELTAS)
 
 
 def _same_domain(left: ConnectivityDomainId, right: ConnectivityDomainId) -> bool:
@@ -645,7 +710,8 @@ def _predicate_token(predicate: object) -> object:
 
 
 def _add_position(left: BlockPos, right: BlockPos) -> BlockPos:
-    return BlockPos.coerce(left) + BlockPos.coerce(right)
+    left, right = BlockPos.coerce(left), BlockPos.coerce(right)
+    return BlockPos(left.x + right.x, left.y + right.y, left.z + right.z)
 
 
 def _with_properties(state: BlockState, updates: Mapping[str, str]) -> BlockState:
@@ -713,12 +779,12 @@ def _resolve_wall(context: NeighborContext) -> BlockState:
     )
     covered_from_above = bool(
         above is not None
-        and context.resolver.domains_can_connect(context.domain, above.domain)
+        and context.connects_domain(above)
         and above_wall_cover & WALL_POST_COVER
     )
     force_post = bool(
         above is not None
-        and context.resolver.domains_can_connect(context.domain, above.domain)
+        and context.connects_domain(above)
         and (
             "wall_post_override" in above.info.tags
             or (
@@ -727,9 +793,7 @@ def _resolve_wall(context: NeighborContext) -> BlockState:
             )
         )
     )
-    if above is not None and context.resolver.domains_can_connect(
-        context.domain, above.domain
-    ):
+    if above is not None and context.connects_domain(above):
         connected = {
             direction: (
                 "tall"
@@ -758,15 +822,20 @@ def _resolve_wall(context: NeighborContext) -> BlockState:
 def _wall_connection(context: NeighborContext, direction: Direction) -> str:
     neighbor = context.neighbor(direction)
     if neighbor is None:
-        return "none"
+        diagonal = context.diagonal_decision(direction)
+        return _wall_height(diagonal) if diagonal.action == ConnectionAction.CONNECT else "none"
 
     decision = context.connection_decision(direction)
     if decision.action == ConnectionAction.DISCONNECT:
         return "none"
     if decision.action == ConnectionAction.CONNECT:
-        return decision.value if decision.value in ("low", "tall") else "low"
+        return _wall_height(decision)
 
-    if not context.resolver.domains_can_connect(context.domain, neighbor.domain):
+    diagonal = context.diagonal_decision(direction)
+    if diagonal.action == ConnectionAction.CONNECT:
+        return _wall_height(diagonal)
+
+    if not context.connects_domain(neighbor):
         return "none"
 
     predicate = context.resolver.blocks_can_connect
@@ -803,6 +872,10 @@ def _wall_connection(context: NeighborContext, direction: Direction) -> str:
     return "none"
 
 
+def _wall_height(decision: ConnectionDecision) -> str:
+    return decision.value if decision.value in ("low", "tall") else "low"
+
+
 def _resolve_fence_gate(context: NeighborContext) -> BlockState:
     facing = context.state.get("facing")
     if facing in ("north", "south"):
@@ -829,7 +902,7 @@ def _resolve_stair(context: NeighborContext) -> BlockState:
     if facing not in HORIZONTAL_DIRECTIONS:
         return context.state
 
-    left = HORIZONTAL_DIRECTIONS[(HORIZONTAL_DIRECTIONS.index(facing) - 1) % 4]
+    left = _counter_clockwise(facing)
     front = context.neighbor(facing)
     if _matching_stair(context, front, half, facing):
         neighbor_facing = front.state.get("facing")
@@ -855,7 +928,83 @@ def _resolve_stair(context: NeighborContext) -> BlockState:
             shape = "inner_left" if neighbor_facing == left else "inner_right"
             return _with_properties(context.state, {"shape": shape})
 
+    diagonal = _diagonal_stair_shape(context, facing, left, half)
+    if diagonal is not None:
+        return _with_properties(context.state, {"shape": diagonal})
+    joined = _stray_in_diagonal_run(context, facing, half)
+    if joined is not None:
+        return _with_properties(context.state, joined)
     return _with_properties(context.state, {"shape": "straight"})
+
+
+_DIAGONALS = (
+    (BlockPos(1, 0, 1), BlockPos(-1, 0, -1)),
+    (BlockPos(1, 0, -1), BlockPos(-1, 0, 1)),
+)
+_AROUND = tuple(
+    BlockPos(dx, 0, dz)
+    for dx in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if dx or dz
+)
+
+
+def _stray_in_diagonal_run(
+    context: NeighborContext, facing: Direction, half: str | None
+) -> dict[str, str] | None:
+    # A lone stair inside a diagonal run of another facing (left by two
+    # layouts meeting at a join) adopts the run's facing and shape.
+    rule = context.resolver.stairs_join_diagonals
+    if rule is None or not rule(context.domain):
+        return None
+    if any(_same_run_at(context, offset, facing, half) for offset in _AROUND):
+        return None
+    for first, second in _DIAGONALS:
+        for other in HORIZONTAL_DIRECTIONS:
+            if other == facing:
+                continue
+            if _same_run_at(context, first, other, half) and _same_run_at(
+                context, second, other, half
+            ):
+                left = _counter_clockwise(other)
+                shape = _diagonal_stair_shape(context, other, left, half)
+                return {"facing": other, "shape": shape or "straight"}
+    return None
+
+
+def _diagonal_stair_shape(
+    context: NeighborContext, facing: Direction, left: Direction, half: str | None
+) -> str | None:
+    # Where a run of stairs steps sideways, the stairs either side of the
+    # step touch only at a corner. The one before turns outer toward the
+    # next, the one after turns inner from the last, unless a stair beside
+    # it on that side continues the run straight.
+    rule = context.resolver.stairs_join_diagonals
+    if rule is None or not rule(context.domain):
+        return None
+    right = OPPOSITE_DIRECTION[left]
+    ahead, behind = DIRECTION_OFFSETS[facing], DIRECTION_OFFSETS[OPPOSITE_DIRECTION[facing]]
+    for turned, prefix in ((ahead, "outer"), (behind, "inner")):
+        for side, name in ((left, "left"), (right, "right")):
+            step = DIRECTION_OFFSETS[side]
+            if _same_run_at(context, step, facing, half):
+                continue
+            if _same_run_at(context, turned + step, facing, half):
+                return f"{prefix}_{name}"
+    return None
+
+
+def _same_run_at(
+    context: NeighborContext, offset: BlockPos, facing: Direction, half: str | None
+) -> bool:
+    neighbor = context.neighbor_at(offset)
+    return (
+        neighbor is not None
+        and neighbor.info.neighbor_rule == NeighborRule.STAIR
+        and neighbor.state.get("facing") == facing
+        and neighbor.state.get("half") == half
+        and context.connects_domain(neighbor)
+    )
 
 
 def _matching_stair(
@@ -871,7 +1020,7 @@ def _matching_stair(
         neighbor is not None
         and neighbor.info.neighbor_rule == NeighborRule.STAIR
         and neighbor.state.get("half") == half
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        and context.connects_domain(neighbor)
     )
 
 
@@ -881,14 +1030,7 @@ def _can_take_stair_shape(
     facing: Direction,
     half: str | None,
 ) -> bool:
-    neighbor = context.neighbor(direction)
-    return not (
-        neighbor is not None
-        and neighbor.info.neighbor_rule == NeighborRule.STAIR
-        and neighbor.state.get("facing") == facing
-        and neighbor.state.get("half") == half
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
-    )
+    return not _same_run_at(context, DIRECTION_OFFSETS[direction], facing, half)
 
 
 def _resolve_rail(context: NeighborContext) -> BlockState:
@@ -959,7 +1101,7 @@ def _selected_rail_candidates(
             (_add_position(offset_position, DIRECTION_OFFSETS["down"]), False),
         )
         for neighbor_position, ascending in locations:
-            neighbor = _block_at(context, neighbor_position)
+            neighbor = context.block_at(neighbor_position)
             allowed, forced = _rail_pair_allowed(
                 context, state, info, domain, neighbor, direction
             )
@@ -1018,22 +1160,6 @@ def _rail_pair_allowed(
         neighbor.info.neighbor_rule == NeighborRule.RAIL
         and context.resolver.domains_can_connect(source_domain, neighbor.domain),
         False,
-    )
-
-
-def _block_at(context: NeighborContext, position: BlockPos) -> NeighborBlock | None:
-    cell = context.view.effective_at(position)
-    if cell is None:
-        return None
-    return NeighborBlock(
-        position=position,
-        block_id=cell.block_id,
-        state=context.resolver.registry.get_state(cell.block_id),
-        info=context.resolver.registry.get_info(cell.block_id),
-        domain=cell.domain,
-        source_token=cell.source_token,
-        placement_id=cell.placement_id,
-        sequence_index=cell.sequence_index,
     )
 
 
@@ -1127,7 +1253,7 @@ def _redstone_connection(context: NeighborContext, direction: Direction) -> str:
     neighbor = context.neighbor(direction)
     if neighbor is None:
         return "none"
-    if not context.resolver.domains_can_connect(context.domain, neighbor.domain):
+    if not context.connects_domain(neighbor):
         return "none"
     if _is_redstone_connector(neighbor, direction):
         return "side"
@@ -1137,18 +1263,12 @@ def _redstone_connection(context: NeighborContext, direction: Direction) -> str:
         above_current.info.solid_faces & SolidFace.DOWN
     )
     if current_top_open and neighbor.info.solid_faces:
-        above_neighbor = _block_at(
-            context,
-            _add_position(neighbor.position, DIRECTION_OFFSETS["up"]),
-        )
+        above_neighbor = context.block_at(_add_position(neighbor.position, DIRECTION_OFFSETS["up"]))
         if _is_compatible_redstone(context, above_neighbor, direction):
             return "up"
 
     if not neighbor.info.solid_faces:
-        below_neighbor = _block_at(
-            context,
-            _add_position(neighbor.position, DIRECTION_OFFSETS["down"]),
-        )
+        below_neighbor = context.block_at(_add_position(neighbor.position, DIRECTION_OFFSETS["down"]))
         if _is_compatible_redstone(context, below_neighbor, direction):
             return "side"
     return "none"
@@ -1172,7 +1292,7 @@ def _is_compatible_redstone(
 ) -> bool:
     return bool(
         neighbor is not None
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        and context.connects_domain(neighbor)
         and _is_redstone_connector(neighbor, direction)
     )
 
@@ -1193,9 +1313,7 @@ def _tripwire_connects(context: NeighborContext, direction: Direction) -> bool:
     if decision.action != ConnectionAction.DEFAULT:
         return decision.action == ConnectionAction.CONNECT
     neighbor = context.neighbor(direction)
-    if neighbor is None or not context.resolver.domains_can_connect(
-        context.domain, neighbor.domain
-    ):
+    if neighbor is None or not context.connects_domain(neighbor):
         return False
     if neighbor.info.neighbor_rule == NeighborRule.TRIPWIRE:
         return True
@@ -1210,21 +1328,10 @@ def _resolve_tripwire_hook(context: NeighborContext) -> BlockState:
     if facing not in HORIZONTAL_DIRECTIONS:
         return context.state
     support_direction = OPPOSITE_DIRECTION[facing]
-    support = context.neighbor(support_direction)
-    support_decision = context.connection_decision(support_direction)
-    if not (
-        support is not None
-        and support_decision.action != ConnectionAction.DISCONNECT
-        and (
-            support_decision.action == ConnectionAction.CONNECT
-            or (
-                context.resolver.domains_can_connect(context.domain, support.domain)
-                and _supports_face(
-                    support.info,
-                    FACE_BY_DIRECTION[OPPOSITE_DIRECTION[support_direction]],
-                )
-            )
-        )
+    if not context.allows(
+        support_direction,
+        lambda support: context.connects_domain(support)
+        and _supports_face(support.info, FACE_BY_DIRECTION[facing]),
     ):
         return None
     attached, powered = _scan_tripwire_from_hook(context, facing)
@@ -1243,10 +1350,8 @@ def _scan_tripwire_from_hook(
             context.position,
             tuple(value * distance for value in DIRECTION_OFFSETS[direction]),
         )
-        neighbor = _block_at(context, position)
-        if neighbor is None or not context.resolver.domains_can_connect(
-            context.domain, neighbor.domain
-        ):
+        neighbor = context.block_at(position)
+        if neighbor is None or not context.connects_domain(neighbor):
             return False, False
         decision = context.connection_decision_for(neighbor, direction)
         if decision.action == ConnectionAction.DISCONNECT:
@@ -1284,10 +1389,8 @@ def _scan_tripwire_endpoint(
             context.position,
             tuple(value * distance for value in DIRECTION_OFFSETS[direction]),
         )
-        neighbor = _block_at(context, position)
-        if neighbor is None or not context.resolver.domains_can_connect(
-            context.domain, neighbor.domain
-        ):
+        neighbor = context.block_at(position)
+        if neighbor is None or not context.connects_domain(neighbor):
             return False, distance, powered
         if neighbor.info.neighbor_rule == NeighborRule.TRIPWIRE:
             powered = powered or (
@@ -1316,40 +1419,18 @@ def _resolve_chorus(context: NeighborContext) -> BlockState:
 def _resolve_huge_mushroom(context: NeighborContext) -> BlockState:
     updates: dict[str, str] = {}
     for direction in ALL_DIRECTIONS:
-        neighbor = context.neighbor(direction)
-        decision = context.connection_decision(direction)
-        joined = bool(
-            neighbor is not None
-            and decision.action != ConnectionAction.DISCONNECT
-            and (
-                decision.action == ConnectionAction.CONNECT
-                or (
-                    neighbor.state.name == context.state.name
-                    and context.resolver.domains_can_connect(
-                        context.domain, neighbor.domain
-                    )
-                )
-            )
+        joined = context.allows(
+            direction,
+            lambda neighbor: neighbor.state.name == context.state.name
+            and context.connects_domain(neighbor),
         )
         updates[direction] = str(not joined).lower()
     return _with_properties(context.state, updates)
 
 
 def _resolve_snowy(context: NeighborContext) -> BlockState:
-    above = context.neighbor("up")
-    decision = context.connection_decision("up")
-    snowy = bool(
-        above is not None
-        and decision.action != ConnectionAction.DISCONNECT
-        and (
-            decision.action == ConnectionAction.CONNECT
-            or (
-                "snow" in above.info.tags
-                and context.resolver.domains_can_connect(
-                    context.domain, above.domain
-                )
-            )
-        )
+    snowy = context.allows(
+        "up", lambda above: "snow" in above.info.tags and context.connects_domain(above)
     )
     return _with_properties(context.state, {"snowy": str(snowy).lower()})
 
@@ -1392,20 +1473,10 @@ _GROWING_PLANTS: dict[str, tuple[str, str, Direction]] = {
 
 def _resolve_growing_plant(context: NeighborContext) -> BlockState:
     head, body, direction = _GROWING_PLANTS[context.state.name]
-    neighbor = context.neighbor(direction)
-    decision = context.connection_decision(direction)
-    continues = bool(
-        neighbor is not None
-        and decision.action != ConnectionAction.DISCONNECT
-        and (
-            decision.action == ConnectionAction.CONNECT
-            or (
-                neighbor.state.name in (head, body)
-                and context.resolver.domains_can_connect(
-                    context.domain, neighbor.domain
-                )
-            )
-        )
+    continues = context.allows(
+        direction,
+        lambda neighbor: neighbor.state.name in (head, body)
+        and context.connects_domain(neighbor),
     )
     target = body if continues else head
     if target == context.state.name:
@@ -1422,21 +1493,13 @@ def _resolve_growing_plant(context: NeighborContext) -> BlockState:
 
 
 def _resolve_hanging_moss(context: NeighborContext) -> BlockState | None:
-    above = context.neighbor("up")
-    decision = context.connection_decision("up")
-    supported = bool(
-        above is not None
-        and decision.action != ConnectionAction.DISCONNECT
+    supported = context.allows(
+        "up",
+        lambda above: context.connects_domain(above)
         and (
-            decision.action == ConnectionAction.CONNECT
-            or (
-                context.resolver.domains_can_connect(context.domain, above.domain)
-                and (
-                    above.state.name == context.state.name
-                    or _supports_face(above.info, SolidFace.DOWN)
-                )
-            )
-        )
+            above.state.name == context.state.name
+            or _supports_face(above.info, SolidFace.DOWN)
+        ),
     )
     if not supported:
         return None
@@ -1444,26 +1507,16 @@ def _resolve_hanging_moss(context: NeighborContext) -> BlockState | None:
     tip = not (
         below is not None
         and below.state.name == context.state.name
-        and context.resolver.domains_can_connect(context.domain, below.domain)
+        and context.connects_domain(below)
     )
     return _with_properties(context.state, {"tip": str(tip).lower()})
 
 
 def _resolve_campfire(context: NeighborContext) -> BlockState:
-    below = context.neighbor("down")
-    decision = context.connection_decision("down")
-    signal = bool(
-        below is not None
-        and decision.action != ConnectionAction.DISCONNECT
-        and (
-            decision.action == ConnectionAction.CONNECT
-            or (
-                below.state.name == "minecraft:hay_block"
-                and context.resolver.domains_can_connect(
-                    context.domain, below.domain
-                )
-            )
-        )
+    signal = context.allows(
+        "down",
+        lambda below: below.state.name == "minecraft:hay_block"
+        and context.connects_domain(below),
     )
     return _with_properties(context.state, {"signal_fire": str(signal).lower()})
 
@@ -1482,7 +1535,7 @@ def _chorus_connects(context: NeighborContext, direction: Direction) -> bool:
     if neighbor is None:
         return False
     if neighbor.info.behavior == "chorus_flower":
-        return context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        return context.connects_domain(neighbor)
     return direction == "down" and (
         "supports_chorus_plant" in neighbor.info.tags
         or neighbor.state.name == "minecraft:end_stone"
@@ -1540,7 +1593,7 @@ def _fire_connects(context: NeighborContext, direction: Direction) -> bool:
     return bool(
         neighbor is not None
         and neighbor.info.flammable
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        and context.connects_domain(neighbor)
     )
 
 
@@ -1550,7 +1603,7 @@ def _resolve_moss_carpet(context: NeighborContext) -> BlockState:
     bottom = context.state.get("bottom") == "true"
     survives = bool(
         below is not None
-        and context.resolver.domains_can_connect(context.domain, below.domain)
+        and context.connects_domain(below)
         and (
             bottom
             or (
@@ -1568,9 +1621,7 @@ def _resolve_moss_carpet(context: NeighborContext) -> BlockState:
             updates[direction] = "none"
             continue
         if decision.action == ConnectionAction.CONNECT:
-            updates[direction] = (
-                decision.value if decision.value in ("low", "tall") else "low"
-            )
+            updates[direction] = _wall_height(decision)
             continue
 
         supported = _moss_side_supported(context, context.position, direction)
@@ -1585,7 +1636,7 @@ def _resolve_moss_carpet(context: NeighborContext) -> BlockState:
             above.info.neighbor_rule == NeighborRule.MOSS_CARPET
             and above.state.get(direction) not in (None, "none")
             and above.state.get("bottom") == "false"
-            and context.resolver.domains_can_connect(context.domain, above.domain)
+            and context.connects_domain(above)
         ):
             side = "tall"
         if not bottom and below is not None and (
@@ -1605,12 +1656,10 @@ def _resolve_moss_carpet(context: NeighborContext) -> BlockState:
 def _moss_side_supported(
     context: NeighborContext, origin: BlockPos, direction: Direction
 ) -> bool:
-    neighbor = _block_at(
-        context, _add_position(origin, DIRECTION_OFFSETS[direction])
-    )
+    neighbor = context.block_at(_add_position(origin, DIRECTION_OFFSETS[direction]))
     return bool(
         neighbor is not None
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        and context.connects_domain(neighbor)
         and _supports_face(
             neighbor.info, FACE_BY_DIRECTION[OPPOSITE_DIRECTION[direction]]
         )
@@ -1624,7 +1673,7 @@ def _resolve_scaffolding(context: NeighborContext) -> BlockState | None:
         below_decision.action == ConnectionAction.CONNECT
         or (
             below_decision.action == ConnectionAction.DEFAULT
-            and context.resolver.domains_can_connect(context.domain, below.domain)
+            and context.connects_domain(below)
         )
     ):
         if below.info.neighbor_rule == NeighborRule.SCAFFOLDING:
@@ -1650,7 +1699,7 @@ def _resolve_scaffolding(context: NeighborContext) -> BlockState | None:
             and decision.action != ConnectionAction.DISCONNECT
             and (
                 decision.action == ConnectionAction.CONNECT
-                or context.resolver.domains_can_connect(context.domain, neighbor.domain)
+                or context.connects_domain(neighbor)
             )
         ):
             distance = min(
@@ -1704,7 +1753,7 @@ def _shelf_run_length(context: NeighborContext, direction: Direction) -> int:
     position = context.position
     while True:
         position = _add_position(position, DIRECTION_OFFSETS[direction])
-        neighbor = _block_at(context, position)
+        neighbor = context.block_at(position)
         if neighbor is None:
             return length
         decision = context.connection_decision_for(neighbor, direction)
@@ -1714,7 +1763,7 @@ def _shelf_run_length(context: NeighborContext, direction: Direction) -> int:
             neighbor.info.neighbor_rule == NeighborRule.SHELF
             and neighbor.state.get("powered") == "true"
             and neighbor.state.get("facing") == context.state.get("facing")
-            and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+            and context.connects_domain(neighbor)
         ):
             return length
         length += 1
@@ -1737,25 +1786,16 @@ def _resolve_pointed_dripstone(context: NeighborContext) -> BlockState:
     elif base_distance == 0:
         thickness = "base"
     elif tip_distance == 0:
-        ahead = context.neighbor(vertical_direction)
-        decision = context.connection_decision_for(ahead, vertical_direction)
-        thickness = (
-            "tip_merge"
-            if ahead is not None
-            and decision.action != ConnectionAction.DISCONNECT
-            and (
-                decision.action == ConnectionAction.CONNECT
-                or (
-                    ahead.info.neighbor_rule == NeighborRule.POINTED_DRIPSTONE
-                    and ahead.state.name == context.state.name
-                    and context.resolver.domains_can_connect(
-                        context.domain, ahead.domain
-                    )
-                )
-            )
-            and ahead.state.get("vertical_direction") == backward
-            else "tip"
+        merges = context.allows(
+            vertical_direction,
+            lambda ahead: ahead.info.neighbor_rule == NeighborRule.POINTED_DRIPSTONE
+            and ahead.state.name == context.state.name
+            and context.connects_domain(ahead),
         )
+        facing_back = merges and (
+            context.neighbor(vertical_direction).state.get("vertical_direction") == backward
+        )
+        thickness = "tip_merge" if facing_back else "tip"
     elif tip_distance == 1:
         thickness = "frustum"
     else:
@@ -1772,7 +1812,7 @@ def _dripstone_run_length(
     position = context.position
     while True:
         position = _add_position(position, DIRECTION_OFFSETS[scan_direction])
-        neighbor = _block_at(context, position)
+        neighbor = context.block_at(position)
         decision = context.connection_decision_for(neighbor, scan_direction)
         if (
             neighbor is None
@@ -1783,9 +1823,7 @@ def _dripstone_run_length(
                     neighbor.info.neighbor_rule != NeighborRule.POINTED_DRIPSTONE
                     or neighbor.state.name != context.state.name
                     or neighbor.state.get("vertical_direction") != vertical_direction
-                    or not context.resolver.domains_can_connect(
-                        context.domain, neighbor.domain
-                    )
+                    or not context.connects_domain(neighbor)
                 )
             )
         ):
@@ -1803,7 +1841,7 @@ def _resolve_leaves(context: NeighborContext) -> BlockState:
         if decision.action == ConnectionAction.DISCONNECT:
             continue
         if decision.action == ConnectionAction.DEFAULT and not (
-            context.resolver.domains_can_connect(context.domain, neighbor.domain)
+            context.connects_domain(neighbor)
             and (
                 "logs" in neighbor.info.tags
                 or neighbor.info.neighbor_rule == NeighborRule.LEAVES
@@ -1837,7 +1875,7 @@ def _chest_run_length(context: NeighborContext, direction: Direction) -> int:
     position = context.position
     while True:
         position = _add_position(position, DIRECTION_OFFSETS[direction])
-        neighbor = _block_at(context, position)
+        neighbor = context.block_at(position)
         if not _matching_chest(context, neighbor, direction):
             return length
         length += 1
@@ -1857,7 +1895,7 @@ def _matching_chest(
         neighbor.info.neighbor_rule == NeighborRule.CHEST
         and neighbor.state.name == context.state.name
         and neighbor.state.get("facing") == context.state.get("facing")
-        and context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        and context.connects_domain(neighbor)
     )
 
 
@@ -1870,24 +1908,11 @@ def _resolve_stem(context: NeighborContext) -> BlockState:
         else "minecraft:attached_pumpkin_stem"
     )
     for direction in HORIZONTAL_DIRECTIONS:
-        neighbor = context.neighbor(direction)
-        decision = context.connection_decision(direction)
-        if (
-            neighbor is not None
-            and decision.action != ConnectionAction.DISCONNECT
-            and (
-                decision.action == ConnectionAction.CONNECT
-                or (
-                    neighbor.state.name == fruit
-                    and context.resolver.domains_can_connect(
-                        context.domain, neighbor.domain
-                    )
-                )
-            )
-            and (
-                context.info.behavior == "attached_stem"
-                or context.state.get("age") == "7"
-            )
+        if context.allows(
+            direction,
+            lambda neighbor: neighbor.state.name == fruit and context.connects_domain(neighbor),
+        ) and (
+            context.info.behavior == "attached_stem" or context.state.get("age") == "7"
         ):
             return BlockState.create(attached_name, {"facing": direction})
     if context.info.behavior == "attached_stem":
@@ -1899,28 +1924,13 @@ def _resolve_stem(context: NeighborContext) -> BlockState:
 def _resolve_hanging(context: NeighborContext) -> BlockState:
     hanging = context.state.get("hanging") == "true"
     direction = "up" if hanging else "down"
-    support = context.neighbor(direction)
-    decision = context.connection_decision(direction)
-    supported = bool(
-        support is not None
-        and decision.action != ConnectionAction.DISCONNECT
+    supported = context.allows(
+        direction,
+        lambda support: context.connects_domain(support)
         and (
-            decision.action == ConnectionAction.CONNECT
-            or (
-                context.resolver.domains_can_connect(context.domain, support.domain)
-                and (
-                    _supports_face(
-                        support.info,
-                        FACE_BY_DIRECTION[OPPOSITE_DIRECTION[direction]],
-                    )
-                    or (
-                        hanging
-                        and support.info.behavior
-                        in ("chain", "weathering_copper_chain")
-                    )
-                )
-            )
-        )
+            _supports_face(support.info, FACE_BY_DIRECTION[OPPOSITE_DIRECTION[direction]])
+            or (hanging and support.info.behavior in ("chain", "weathering_copper_chain"))
+        ),
     )
     return context.state if supported else None
 
@@ -2000,7 +2010,7 @@ def _has_attachment_support(
     ):
         supported = True
     return bool(
-        context.resolver.domains_can_connect(context.domain, neighbor.domain)
+        context.connects_domain(neighbor)
         and supported
     )
 
@@ -2065,7 +2075,7 @@ def _valid_multiblock_partner(
     decision = context.connection_decision_for(partner, direction)
     return decision.action == ConnectionAction.CONNECT or (
         decision.action == ConnectionAction.DEFAULT
-        and context.resolver.domains_can_connect(context.domain, partner.domain)
+        and context.connects_domain(partner)
     )
 
 

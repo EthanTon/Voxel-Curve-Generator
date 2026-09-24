@@ -56,14 +56,14 @@ class LineTests(unittest.TestCase):
             tuple(BlockPos(n, 0, n) for n in range(5)),
         )
 
-    def test_a_manhattan_line_shares_a_face_in_plan(self) -> None:
+    def test_a_rail_line_shares_a_face_in_plan(self) -> None:
         # One block across per step, and the climb rides that step rather
         # than taking one of its own: one along and one up is a slope, which
         # is the only way a rail climbs. A block in the corner instead is a
         # step no rail can express.
         for start, end in CORNERS:
             with self.subTest(start=start, end=end):
-                run = line(start, end, LineMode.MANHATTAN)
+                run = line(start, end, LineMode.RAIL)
 
                 for across, up, along in steps(run):
                     self.assertEqual(abs(across) + abs(along), 1, (across, up, along))
@@ -71,15 +71,34 @@ class LineTests(unittest.TestCase):
 
     def test_a_climb_with_nothing_across_it_still_steps(self) -> None:
         # Straight up is the one step with nothing across to ride.
-        run = line((0, 0, 0), (0, 3, 0), LineMode.MANHATTAN)
+        run = line((0, 0, 0), (0, 3, 0), LineMode.RAIL)
 
         self.assertEqual([p.y for p in run], [0, 1, 2, 3])
 
-    def test_a_manhattan_line_is_as_long_as_its_plan(self) -> None:
-        # Its length is what it covers across, since the climb rides along.
+    def test_a_manhattan_line_shares_a_face_in_3d(self) -> None:
         for start, end in CORNERS:
             with self.subTest(start=start, end=end):
                 run = line(start, end, LineMode.MANHATTAN)
+                for step in steps(run):
+                    self.assertEqual(sum(abs(axis) for axis in step), 1)
+                self.assertEqual(
+                    len(run), 1 + sum(abs(end[i] - start[i]) for i in range(3))
+                )
+
+        self.assertEqual(
+            line((36, 73, -2), (37, 74, -2), LineMode.MANHATTAN),
+            (
+                BlockPos(36, 73, -2),
+                BlockPos(37, 73, -2),
+                BlockPos(37, 74, -2),
+            ),
+        )
+
+    def test_a_rail_line_is_as_long_as_its_plan(self) -> None:
+        # Its length is what it covers across, since the climb rides along.
+        for start, end in CORNERS:
+            with self.subTest(start=start, end=end):
+                run = line(start, end, LineMode.RAIL)
 
                 across = abs(end[0] - start[0]) + abs(end[2] - start[2])
                 self.assertEqual(len(run), across + 1)

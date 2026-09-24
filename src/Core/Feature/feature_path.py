@@ -16,43 +16,30 @@ from ..coordinates import BlockPos, Vec3
 
 @dataclass(frozen=True, slots=True)
 class FeaturePathPoint:
-    # Index of the path point this point was delivered at.
+    # The path point it was delivered at, and its index in this feature path.
     path_index: int
-    # Index of this point within its feature path.
     point_index: int
-    # World x and z, with y as the local height above the path.
+    # World x and z; y is height above the path.
     position: BlockPos
-    # Gradient of the path point, not of the feature path.
+    # The path's gradient at `path_index`.
     gradient: Vec3
-    # The turn its section was laid out at based on the path.
     turn: Turn
-    # Which way the path was turning there. A turn alone does not say: the
-    # same heading is reached by turning either way round, and the section is
-    # laid out mirrored when it was reached counter-clockwise.
     direction: Rotation
-    # The one of the eight layouts a section placed this position in. Where
-    # a point is laid out more than once, to cover the seam between a run of
-    # one layout and a run of another, it is not the turn the path point is
-    # at. None where nothing placed it in a layout at all.
+    # The layout that placed this position, which differs from `turn` where
+    # two layouts overlap at a seam. None if no layout placed it.
     layout: Turn | None = None
-    # Whether that layout is the mirrored one. The quarters alternate, so the
-    # layout alone does not say which way depth runs.
     mirrored: bool = False
-    # Elevation at this point's own column. Features that ignore per-block
-    # elevation use it as the y offset for everything built from this point.
+    # Elevation at this point's column; rigid features use it for all blocks.
     y_offset: int = 0
 
     @property
     def laid_at(self) -> Turn:
-        # The layout that placed this position, or the point's own turn where
-        # nothing placed it in one -- a lane paints onto the path.
         if self.layout is not None:
             return self.layout
         return normalize(self.turn * self.direction)
 
 
-# Decides whether a point may be appended to a path. Rules see the path as it
-# is before the point is added.
+# Whether a point may be appended, given the path before it.
 FeaturePathRule = Callable[["FeaturePath", FeaturePathPoint], bool]
 
 
@@ -75,8 +62,6 @@ DEFAULT_RULES: tuple[FeaturePathRule, ...] = (
 
 
 def either(*rules: FeaturePathRule) -> FeaturePathRule:
-    # A point any of these rules would keep. Rules are otherwise all required,
-    # so this is how a point earns its place two different ways.
     def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
         return any(each(path, point) for each in rules)
 
@@ -84,12 +69,11 @@ def either(*rules: FeaturePathRule) -> FeaturePathRule:
 
 
 def apart(spacing: float) -> FeaturePathRule:
-    # Keep a point once it is `spacing` blocks from the last one kept,
-    # measured in plan so a climb does not shorten the gap.
+    # Keeps a point `spacing` blocks in plan from the last kept.
     def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
-        if not path.points:
+        if not len(path):
             return True
-        last = path.points[-1].position
+        last = path[-1].position
         return hypot(
             point.position.x - last.x, point.position.z - last.z
         ) >= spacing
@@ -98,52 +82,33 @@ def apart(spacing: float) -> FeaturePathRule:
 
 
 def every(count: int) -> FeaturePathRule:
-    # Keep a point once `count` path points have passed since the last one
-    # kept. Counted in points rather than blocks, for a run whose points are
-    # not a block apart.
+    # Keeps a point `count` path points after the last kept.
     def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
-        if not path.points:
+        if not len(path):
             return True
-        return point.path_index - path.points[-1].path_index >= count
+        return point.path_index - path[-1].path_index >= count
 
     return rule
 
 
 def turning(angle: float) -> FeaturePathRule:
-    # Keep a point once the path's heading there is `angle` degrees off its
-    # heading at the last point kept.
-    #
-    # This is what holds a wire over the track it spans: the line between two
-    # poles is straight, so bounding how far the track turns between them
-    # bounds how far the wire strays from it. Measured between the headings
-    # rather than along the line between the poles, which on block positions
-    # is quantised to eighths of a turn and says little over a short span.
+    # Keeps a point once the heading has turned `angle` degrees since the
+    # last kept, which bounds how far a wire strays from the track.
     def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
-        if not path.points:
+        if not len(path):
             return True
-        return abs(angle_between(path.points[-1].gradient, point.gradient)) >= angle
+        return abs(angle_between(path[-1].gradient, point.gradient)) >= angle
 
     return rule
 
 
 def one_per_delivery(path: FeaturePath, point: FeaturePathPoint) -> bool:
-    # Keep the first position a path point delivered and drop the rest.
-    #
-    # A swept profile delivers more than one position at a point wherever it
-    # would otherwise leave a gap, which is what keeps a deck solid round a
-    # bend. Something painted along that run inherits the filling and comes
-    # out four-connected. Thinned to one position a point, it steps
-    # diagonally instead.
+    # Keeps only the first position each path point delivers.
     return not path.current_delivery
 
 
 def ending_at(position: BlockPos) -> FeaturePathRule:
-    # Always keep the point a run ends on. A wire is anchored at both ends,
-    # and so is whatever holds it up; without this a run whose length is not a
-    # whole number of spacings stops short of its own end.
-    #
-    # Matched on the position rather than the path point it came from: one
-    # path point delivers several positions, and only the last is the end.
+    # Keeps the run's final position regardless of spacing.
     position = BlockPos.coerce(position)
 
     def rule(path: FeaturePath, point: FeaturePathPoint) -> bool:
@@ -155,9 +120,10 @@ def ending_at(position: BlockPos) -> FeaturePathRule:
 def spacing_rules(
     spacing: float, angle: float, by_index: bool = False
 ) -> tuple[FeaturePathRule, ...]:
-    # Where something placed at intervals along a path sits: far enough
-    # along it, or far enough round from the last one. Either on its own is
-    # the whole rule; neither keeps every point.
+    # Keeps points far enough along or far enough round from the last kept.
+    # Every point by index means no rule, so a join keeps all its positions.
+    if by_index and 0 < spacing <= 1 and angle <= 0:
+        return ()
     rules = []
     if spacing > 0:
         rules.append(every(int(spacing)) if by_index else apart(spacing))
@@ -169,12 +135,8 @@ def spacing_rules(
 
 
 class FeaturePath:
-    # An ordered run of delivered points. Like a path, it may cross or loop
-    # back over itself; only the rules decide what is kept.
-    #
-    # Points added with the same path_index form one delivery. A new
-    # path_index starts the next delivery, and the last delivery that kept any
-    # points becomes the previous one.
+    # An ordered run of delivered points, filtered by rules. Points sharing a
+    # path_index form one delivery.
 
     def __init__(self, rules: Iterable[FeaturePathRule] = DEFAULT_RULES) -> None:
         self.rules = tuple(rules)
@@ -195,7 +157,6 @@ class FeaturePath:
     def current_delivery(self) -> tuple[FeaturePathPoint, ...]:
         return tuple(self._current)
 
-    # Append a point to the path. Returns None when a rule rejects it.
     def add(
         self,
         position: BlockPos | Sequence[int],
@@ -229,6 +190,25 @@ class FeaturePath:
         self._path.append(point)
         self._current.append(point)
         return point
+
+    def add_point(
+        self,
+        point: FeaturePathPoint,
+        *,
+        position: BlockPos | None = None,
+        y_offset: int | None = None,
+    ) -> FeaturePathPoint | None:
+        # Adds a point from another path, optionally moved.
+        return self.add(
+            point.position if position is None else position,
+            point.gradient,
+            point.turn,
+            point.path_index,
+            point.y_offset if y_offset is None else y_offset,
+            point.direction,
+            point.layout,
+            point.mirrored,
+        )
 
     def __iter__(self) -> Iterator[FeaturePathPoint]:
         return iter(self._path)

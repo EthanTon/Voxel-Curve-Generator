@@ -868,3 +868,165 @@ class ConnectivityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagonalStairTests(unittest.TestCase):
+    # A kerb of east-facing stairs running north (-z) that steps sideways one
+    # block. Vanilla leaves both stairs either side of the step straight; a
+    # domain that joins stairs diagonally turns them into a corner, with no
+    # block added.
+
+    def setUp(self) -> None:
+        self.registry = BlockRegistry.for_vanilla_26_2()
+
+    def stair(self):
+        return self.registry.register(BlockState.create(
+            "minecraft:stone_brick_stairs",
+            {"facing": "east", "half": "bottom", "shape": "straight", "waterlogged": "false"},
+        ))
+
+    def shapes(self, cells, joins):
+        blocks = {cell: self.stair() for cell in cells}
+        NeighborResolver(
+            self.registry, stairs_join_diagonals=(lambda domain: True) if joins else None
+        ).resolve_all(blocks)
+        return {cell: self.registry.get_state(blocks[cell]).get("shape") for cell in cells}
+
+    def test_vanilla_leaves_a_sideways_step_straight(self) -> None:
+        cells = [(0, 0, 0), (0, 0, -1), (1, 0, -2), (1, 0, -3)]
+        self.assertEqual(set(self.shapes(cells, joins=False).values()), {"straight"})
+
+    def test_a_step_outwards_is_an_outer_corner_then_an_inner_one(self) -> None:
+        # Outwards is the way the stairs face: the one before the step turns
+        # out towards the next, the one after turns in from the last.
+        shapes = self.shapes([(0, 0, 0), (0, 0, -1), (1, 0, -2), (1, 0, -3)], joins=True)
+        self.assertEqual(shapes[(0, 0, -1)], "outer_left")
+        self.assertEqual(shapes[(1, 0, -2)], "inner_right")
+        self.assertEqual(shapes[(0, 0, 0)], "straight")
+        self.assertEqual(shapes[(1, 0, -3)], "straight")
+
+    def test_a_step_inwards_is_an_inner_corner_then_an_outer_one(self) -> None:
+        shapes = self.shapes([(0, 0, 0), (0, 0, -1), (-1, 0, -2), (-1, 0, -3)], joins=True)
+        self.assertEqual(shapes[(0, 0, -1)], "inner_left")
+        self.assertEqual(shapes[(-1, 0, -2)], "outer_right")
+
+    def test_a_straight_run_stays_straight(self) -> None:
+        shapes = self.shapes([(0, 0, z) for z in range(0, -4, -1)], joins=True)
+        self.assertEqual(set(shapes.values()), {"straight"})
+
+    def test_a_stray_in_a_diagonal_run_takes_the_run_s_facing(self) -> None:
+        # A diagonal run of west-facing stairs with one south-facing stair in
+        # it, as a join leaves: the stray joins the run.
+        blocks = {}
+        for step in (-2, -1, 1, 2):
+            blocks[(step, 0, step)] = self.registry.register(BlockState.create(
+                "minecraft:stone_brick_stairs",
+                {"facing": "west", "half": "bottom", "shape": "straight", "waterlogged": "false"},
+            ))
+        blocks[(0, 0, 0)] = self.registry.register(BlockState.create(
+            "minecraft:stone_brick_stairs",
+            {"facing": "south", "half": "bottom", "shape": "straight", "waterlogged": "false"},
+        ))
+        NeighborResolver(
+            self.registry, stairs_join_diagonals=lambda domain: True
+        ).resolve_all(blocks)
+        stray = self.registry.get_state(blocks[(0, 0, 0)])
+        before = self.registry.get_state(blocks[(-1, 0, -1)])
+        self.assertEqual(stray.get("facing"), "west")
+        self.assertEqual(stray.get("shape"), before.get("shape"))
+
+
+class EdgeOverrideTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = BlockRegistry()
+        self.fence = self.registry.register(
+            BlockState.create("minecraft:oak_fence"),
+            BlockInfo(neighbor_rule=NeighborRule.FENCE),
+        )
+        self.marker = self.registry.register(BlockState.create("custom:marker"))
+
+    def test_exact_edge_offset_connects_selected_side_only(self) -> None:
+        resolver = NeighborResolver(self.registry, options=ConnectivityOptions([
+            ConnectionOverride(
+                source_blocks={"minecraft:oak_fence"},
+                neighbor_blocks={"custom:marker"},
+                directions={"east"},
+                offsets={(1, 0, -1)},
+                max_distance=2 ** 0.5,
+            ),
+        ]))
+        blocks = {(0, 0, 0): self.fence, (1, 0, -1): self.marker}
+        resolver.resolve_all(blocks)
+        state = self.registry.get_state(blocks[(0, 0, 0)])
+        self.assertEqual(state.get("east"), "true")
+        self.assertEqual(state.get("north"), "false")
+
+        blocks.pop((1, 0, -1))
+        resolver.resolve_dirty(blocks, [(1, 0, -1)])
+        self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("east"), "false")
+
+    def test_face_default_does_not_reach_edge_or_corner(self) -> None:
+        resolver = NeighborResolver(self.registry, options=ConnectivityOptions([
+            ConnectionOverride(
+                source_blocks={"minecraft:oak_fence"},
+                neighbor_blocks={"custom:marker"},
+                directions={"east"},
+            ),
+        ]))
+        for offset in ((1, 0, -1), (1, 1, 1)):
+            blocks = {(0, 0, 0): self.fence, offset: self.marker}
+            resolver.resolve_all(blocks)
+            self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("east"), "false")
+
+    def test_vertical_edge_can_patch_a_custom_state(self) -> None:
+        lamp = self.registry.register(BlockState.create("custom:lamp", {"lit": "false"}))
+        resolver = NeighborResolver(self.registry, options=ConnectivityOptions([
+            ConnectionOverride(
+                source_blocks={"custom:lamp"},
+                neighbor_blocks={"custom:marker"},
+                directions={"up"},
+                offsets={(1, 1, 0)},
+                max_distance=2 ** 0.5,
+                set_properties={"lit": "true"},
+            ),
+        ]))
+        blocks = {(0, 0, 0): lamp, (1, 1, 0): self.marker}
+        resolver.resolve_all(blocks)
+        self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("lit"), "true")
+
+    def test_invalid_offset_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "offsets"):
+            ConnectionOverride(offsets={(1, 1, 1)}, max_distance=2 ** 0.5)
+
+    def test_wall_edge_override_uses_requested_height(self) -> None:
+        wall = self.registry.register(
+            BlockState.create("minecraft:cobblestone_wall"),
+            BlockInfo(neighbor_rule=NeighborRule.WALL),
+        )
+        resolver = NeighborResolver(self.registry, options=ConnectivityOptions([
+            ConnectionOverride(
+                source_blocks={"minecraft:cobblestone_wall"},
+                neighbor_blocks={"custom:marker"},
+                directions={"east"},
+                max_distance=2 ** 0.5,
+                value="tall",
+            ),
+        ]))
+        blocks = {(0, 0, 0): wall, (1, 0, -1): self.marker}
+        resolver.resolve_all(blocks)
+        self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("east"), "tall")
+
+    def test_symmetric_edge_rule_matches_reverse_offset(self) -> None:
+        resolver = NeighborResolver(self.registry, options=ConnectivityOptions([
+            ConnectionOverride(
+                source_blocks={"custom:marker"},
+                neighbor_blocks={"minecraft:oak_fence"},
+                directions={"west"},
+                offsets={(-1, 0, 1)},
+                max_distance=2 ** 0.5,
+                symmetric=True,
+            ),
+        ]))
+        blocks = {(0, 0, 0): self.fence, (1, 0, -1): self.marker}
+        resolver.resolve_all(blocks)
+        self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("east"), "true")

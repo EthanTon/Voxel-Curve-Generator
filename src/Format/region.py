@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from math import floor
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from ..Core.Field.block_field import BlockBounds, BlockField
 from ..Core.block.palette import BlockId, BlockPalette
 from ..Core.block.states import BlockState
+from ..Core.constants import AIR_NAMES
 from ..Core.coordinates import BlockPos, ChunkPos
 
 if TYPE_CHECKING:
@@ -19,15 +22,12 @@ if TYPE_CHECKING:
 
 AIR = BlockState.create("minecraft:air")
 AIR_INDEX = 0
-AIR_NAMES = frozenset({"minecraft:air", "minecraft:cave_air", "minecraft:void_air"})
 SECTION_SIZE = 16
 
 
 @dataclass(frozen=True, slots=True)
 class RegionEntity:
-    # An entity riding along with the blocks. `data` holds the rest of the
-    # entity NBT untouched: a display entity's transformation, brightness and
-    # block_state belong to whoever authored it, not to this exporter.
+    # `data` is the rest of the entity NBT, carried through untouched.
     id: str
     pos: tuple[float, float, float]
     tags: tuple[str, ...] = ()
@@ -35,8 +35,6 @@ class RegionEntity:
 
     @property
     def block_pos(self) -> BlockPos:
-        # Entity positions are doubles. Flooring gives one rule for which
-        # cell, and so which piece, an entity belongs to.
         return BlockPos(*(floor(value) for value in self.pos))
 
     def moved(self, offset: BlockPos) -> RegionEntity:
@@ -66,14 +64,10 @@ class SplitBudget:
     count_air: bool = False
     # None picks the longest extent.
     axis: Axis | None = None
-    # None trims each piece flush to its content. A bounds tiles that
-    # footprint instead, holding every piece out to it.
+    # None trims each piece to its content; bounds tile that footprint instead.
     extent: BlockBounds | None = None
-    # Cut planes along the split axis, so a swept path can break where its
-    # stations are rather than where the bounding box says.
+    # Cut planes along the split axis.
     cuts: tuple[int, ...] = ()
-    # A count budget cannot bound the box: a sparse stretch adds almost no
-    # blocks and grows a run without limit. max_span caps every extent.
     max_span: int | None = None
     overflow: Overflow = Overflow.SUBDIVIDE
     name_template: str = "{name}_{index:03d}"
@@ -86,7 +80,6 @@ class SplitBudget:
         object.__setattr__(self, "cuts", tuple(sorted(set(self.cuts))))
 
     def capped(self, span: int) -> SplitBudget:
-        # Tighten max_span without loosening a stricter caller value.
         limit = span if self.max_span is None else min(self.max_span, span)
         return SplitBudget(
             self.max_blocks,
@@ -101,10 +94,8 @@ class SplitBudget:
 
 
 class BlockRegion:
-    # A bounded box of cells with a local palette: one litematica region, one
-    # .schem volume, or the source .mca sections are sliced from.
-    #
-    # Cells run x fastest, then z, then y, the order all three formats use.
+    # A box of cells with a local palette. Cells run x fastest, then z, then
+    # y, the order .schem, .litematic and anvil all use.
 
     __slots__ = ("name", "origin", "size", "palette", "cells", "occupancy", "entities")
 
@@ -130,7 +121,7 @@ class BlockRegion:
         self.origin = origin
         self.size = size
         self.palette = palette
-        self.cells = array("I", bytes(volume * 4))
+        self.cells = array("I", [0]) * volume
         self.occupancy = bytearray(volume)
         self.entities: list[RegionEntity] = []
 
@@ -160,8 +151,6 @@ class BlockRegion:
         bounds: BlockBounds | None = None,
         resolver: NeighborResolver | None = None,
     ) -> BlockRegion:
-        # A resolver settles dirty connectivity first; without one the world
-        # exports whatever it already settled on.
         collected: dict[BlockPos, BlockId] = {}
         for _, blocks in world.iter_resolved_chunks(resolver):
             for position, block_id in blocks.items():
@@ -186,18 +175,16 @@ class BlockRegion:
 
     @property
     def filled_count(self) -> int:
-        # Cells this region has an opinion about, air included.
+        # Occupied cells, air included.
         return sum(self.occupancy)
 
     @property
     def block_count(self) -> int:
-        # Non-air cells: litematica's TotalBlocks, and the split budget's count.
+        solid = self._occupied_mask()
         air = self._air_indices()
-        return sum(
-            1
-            for index, flag in enumerate(self.occupancy)
-            if flag and self.cells[index] not in air
-        )
+        if air:
+            solid &= ~np.isin(self.cell_array(), list(air))
+        return int(np.count_nonzero(solid))
 
     @property
     def has_content(self) -> bool:
@@ -222,6 +209,15 @@ class BlockRegion:
         self.cells[index] = self.palette.add(state)
         self.occupancy[index] = 1
 
+    def fill(self, indices: np.ndarray, states) -> None:
+        # Every cell, in cell order, from indices into `states`.
+        seen, first = np.unique(indices, return_index=True)
+        translate = np.zeros(int(seen.max()) + 1 if seen.size else 1, dtype=np.uint32)
+        for value in seen[np.argsort(first)].tolist():
+            translate[value] = self.palette.add(states[value])
+        self.cell_array()[:] = translate[indices]
+        self.occupancy[:] = b"\x01" * self.volume
+
     def state_at(self, position: Sequence[int]) -> BlockState:
         return self.palette.get_state(self.cells[self.linear_index(position)])
 
@@ -229,13 +225,12 @@ class BlockRegion:
         return bool(self.occupancy[self.linear_index(position)])
 
     def iter_cells(self) -> Iterator[int]:
-        # Untouched cells read as air, which is what a dense format wants.
+        # Untouched cells read as air.
         return iter(self.cells)
 
     def iter_occupied(self) -> Iterator[tuple[BlockPos, BlockState]]:
-        for index, flag in enumerate(self.occupancy):
-            if flag:
-                yield self.position_at(index), self.palette.get_state(self.cells[index])
+        for index in np.flatnonzero(self._occupied_mask()).tolist():
+            yield self.position_at(index), self.palette.get_state(self.cells[index])
 
     def add_entity(self, entity: RegionEntity) -> None:
         self.entities.append(entity)
@@ -251,22 +246,27 @@ class BlockRegion:
 
     def sliced(self, bounds: BlockBounds, *, name: str | None = None) -> BlockRegion:
         # Bounds may reach past this region; the overhang is untouched air.
-        # The palette is built from what lands inside, so pieces stay minimal.
+        # The palette holds only what lands inside, in first-seen cell order.
         out = BlockRegion(self.name if name is None else name, bounds.minimum, _extent_of(bounds))
-        source = self.bounds
-        for y in range(max(bounds.minimum.y, source.minimum.y), min(bounds.maximum.y, source.maximum.y) + 1):
-            for z in range(max(bounds.minimum.z, source.minimum.z), min(bounds.maximum.z, source.maximum.z) + 1):
-                for x in range(max(bounds.minimum.x, source.minimum.x), min(bounds.maximum.x, source.maximum.x) + 1):
-                    position = BlockPos(x, y, z)
-                    index = self.linear_index(position)
-                    if self.occupancy[index]:
-                        out.set_state(position, self.palette.get_state(self.cells[index]))
+        overlap = _intersect(bounds, self.bounds)
+        if all(overlap.minimum[axis] <= overlap.maximum[axis] for axis in range(3)):
+            source = self._box(overlap)
+            cells = self._grid(self.cell_array())[source]
+            occupied = self._grid(self._occupied_mask())[source]
+            ids = cells[occupied]
+            seen, first = np.unique(ids, return_index=True)
+            translate = np.zeros(int(seen.max()) + 1 if seen.size else 1, dtype=np.uint32)
+            for block_id in seen[np.argsort(first)].tolist():
+                translate[block_id] = out.palette.add(self.palette.get_state(block_id))
+            target = out._box(overlap)
+            out._grid(out.cell_array())[target][occupied] = translate[ids]
+            out._grid(np.frombuffer(out.occupancy, dtype=np.uint8))[target] = occupied
         out.entities = [e for e in self.entities if bounds.contains(e.block_pos)]
         return out
 
     def iter_sections(self) -> Iterator[tuple[ChunkPos, BlockRegion]]:
-        # World-aligned 16^3 boxes for anvil.py. Sections nothing touched are
-        # skipped; a section of explicit air is not.
+        # World-aligned 16^3 sections; untouched ones are skipped, explicit
+        # air is not.
         bounds = self.bounds
         for y in _section_range(bounds.minimum.y, bounds.maximum.y):
             for z in _section_range(bounds.minimum.z, bounds.maximum.z):
@@ -278,6 +278,21 @@ class BlockRegion:
                     )
                     if section.has_content:
                         yield ChunkPos(x, y, z), section
+
+    def cell_array(self) -> np.ndarray:
+        # A writable view of `cells`.
+        return np.frombuffer(self.cells, dtype=np.uint32)
+
+    def _occupied_mask(self) -> np.ndarray:
+        return np.frombuffer(self.occupancy, dtype=np.uint8) != 0
+
+    def _grid(self, flat: np.ndarray) -> np.ndarray:
+        return flat.reshape(self.size.y, self.size.z, self.size.x)
+
+    def _box(self, bounds: BlockBounds) -> tuple[slice, slice, slice]:
+        low = bounds.minimum - self.origin
+        high = bounds.maximum - self.origin + (1, 1, 1)
+        return slice(low.y, high.y), slice(low.z, high.z), slice(low.x, high.x)
 
     def _air_indices(self) -> frozenset[int]:
         return frozenset(
@@ -303,8 +318,8 @@ def enclosing_bounds(regions: Sequence[BlockRegion]) -> BlockBounds:
 
 
 def split_by_budget(region: BlockRegion, budget: SplitBudget) -> list[BlockRegion]:
-    # Pieces tile the split axis in ascending order, which is also paste
-    # order. A boundary only falls between slabs, so coverage is lossless.
+    # Pieces tile the split axis in ascending (paste) order, cut only
+    # between slabs.
     if budget.extent is not None:
         _require_within(region, budget.extent)
     axis = budget.axis if budget.axis is not None else _longest_axis(region.size)
@@ -339,8 +354,6 @@ class _Run:
 
 
 def _exceeds(run: _Run, budget: SplitBudget) -> bool:
-    # The box is settled before it is measured: trimming flush shrinks it, so
-    # measuring an untrimmed run would under-fill every piece.
     extents = run.extents
     blocks = extents[0] * extents[1] * extents[2] if budget.count_air else run.count
     if blocks > budget.max_blocks:
@@ -397,8 +410,7 @@ def _overflow(
 
 
 def _slabs(region: BlockRegion, axis: Axis, extent: BlockBounds | None) -> list[_Run]:
-    # One pass over the occupied cells. Bounds follow occupancy, air included,
-    # since placed air is still footprint; the count follows non-air cells.
+    # Per-slab bounds cover occupied cells, air included; counts are non-air.
     index = axis.value
     air = region._air_indices()
     runs: dict[int, _Run] = {}
@@ -426,11 +438,8 @@ def _slabs(region: BlockRegion, axis: Axis, extent: BlockBounds | None) -> list[
                 run.minimum[component] = min(run.minimum[component], components[component])
                 run.maximum[component] = max(run.maximum[component], components[component])
     if extent is None:
-        # Flush with the build: empty leading and trailing slabs never enter a
-        # run, while a gap between filled slabs still costs span.
         return [runs[key] for key in sorted(runs)]
-    # Flush with the footprint: every slab is present with the footprint's
-    # cross-section, so pieces tile it whether or not the build reaches them.
+    # With an extent every slab spans the footprint, filled or not.
     slabs = []
     for coordinate in range(extent.minimum[index], extent.maximum[index] + 1):
         minimum = list(extent.minimum.as_tuple())
@@ -479,8 +488,6 @@ def _intersect(left: BlockBounds, right: BlockBounds) -> BlockBounds:
 
 
 def _require_within(region: BlockRegion, extent: BlockBounds) -> None:
-    # Dropping blocks outside a stated footprint is found three schematics
-    # into pasting, so it is an error.
     for position, _ in region.iter_occupied():
         if not extent.contains(position):
             raise ValueError(f"{region.name} places a block at {tuple(position)}, outside the extent")

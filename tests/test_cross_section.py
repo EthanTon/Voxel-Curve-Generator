@@ -3,8 +3,12 @@ from math import cos, radians, sin
 
 from src.Core.CrossSection.annotations import FeatureAnnotation
 from src.Core.CrossSection.cross_section import (
+    MIRRORED,
+    PLAIN,
     CrossSection,
     PointField,
+    lean_of,
+    mirror_of,
     orient_annotation,
 )
 from src.Core.CrossSection.steps import (
@@ -38,7 +42,7 @@ from src.Core.Feature.feature import (
 )
 from src.Core.Feature.feature_path import DEFAULT_RULES, FeaturePath
 from src.Core.Field.block_field import BlockField
-from src.Core.coordinates import BlockPos, Vec3
+from src.Core.coordinates import BlockPos, Vec2, Vec3
 from src.Core.modes import ElevationMode, PlacementMode, StepMode
 
 NAMES = "abcodef"
@@ -490,8 +494,10 @@ class TurnsAlongTests(unittest.TestCase):
 
 class CounterClockwiseTests(unittest.TestCase):
     # A turn says how far round from the authored heading a section is laid
-    # out; the direction says which way round it was counted. Counting the
-    # other way mirrors the whole layout about the x axis, travel included.
+    # out; the direction says which way round it was counted. Counted the
+    # other way it travels the other way, and it is laid out for the way it
+    # travels -- not reflected from its clockwise twin, which put local x on
+    # the left of travel and turned the blocks for the right.
 
     def section(self, step_mode=StepMode.CHEBYSHEV):
         # a and b either side of the origin, with f one ahead of it.
@@ -506,40 +512,32 @@ class CounterClockwiseTests(unittest.TestCase):
             )
         )
 
-    def offsets(self, section, turn, direction=CLOCKWISE):
+    def offsets(self, section, turn, direction=CLOCKWISE, lean=None):
         return [
             (o.annotation.name, [(p.x, p.z) for p in o.offsets])
-            for o in section.orient(turn, direction)
+            for o in section.orient(turn, direction, lean)
         ]
 
-    def test_every_turn_is_its_clockwise_twin_mirrored_about_the_x_axis(self) -> None:
+    def test_a_quarter_is_laid_out_for_the_way_it_travels(self) -> None:
         for step_mode in (StepMode.CHEBYSHEV, StepMode.MANHATTAN):
-            for turn in range(0, 360, 45):
-                with self.subTest(step_mode=step_mode, turn=turn):
-                    section = self.section(step_mode)
-                    self.assertEqual(
-                        self.offsets(section, turn, COUNTER_CLOCKWISE),
-                        [
-                            (name, [(x, -z) for x, z in positions])
-                            for name, positions in self.offsets(section, turn)
-                        ],
-                    )
+            for turn in range(0, 360, 90):
+                for lean in (PLAIN, MIRRORED):
+                    with self.subTest(step_mode=step_mode, turn=turn, lean=lean):
+                        section = self.section(step_mode)
+                        self.assertEqual(
+                            self.offsets(section, turn, COUNTER_CLOCKWISE, lean),
+                            self.offsets(section, normalize(-turn), CLOCKWISE, lean),
+                        )
 
-    def test_the_turns_that_travel_the_same_either_way_still_mirror(self) -> None:
-        # Nothing and a half turn travel the same both ways round, but which
-        # way the path came round to them is not the same, so a direction
-        # carried into them still lays the section out mirrored.
-        for turn in (0, 180):
-            with self.subTest(turn=turn):
-                self.assertEqual(travel(turn, COUNTER_CLOCKWISE), travel(turn))
-                self.assertEqual(
-                    layout(row(), turn, COUNTER_CLOCKWISE),
-                    [(name, x, -z) for name, x, z in layout(row(), turn)],
-                )
-        self.assertEqual(layout(row(), 0), line(NAMES, (0, 3), (0, -1)))
-        self.assertEqual(
-            layout(row(), 0, COUNTER_CLOCKWISE), line(NAMES, (0, -3), (0, 1))
-        )
+    def test_local_x_is_right_of_travel_either_way_round(self) -> None:
+        for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+            for turn in range(0, 360, 90):
+                with self.subTest(direction=direction, turn=turn):
+                    going = travel(turn, direction)
+                    right = (-going.z, going.x)
+                    laid = dict(self.offsets(self.section(), turn, direction))
+                    [(x, z)] = laid["b"]
+                    self.assertEqual(x * right[0] + z * right[1], 3)
 
     def test_a_quarter_counted_the_other_way_travels_the_other_way(self) -> None:
         # 90 clockwise from west is north; counted counter-clockwise it is
@@ -551,24 +549,31 @@ class CounterClockwiseTests(unittest.TestCase):
             self.offsets(self.section(), 90, COUNTER_CLOCKWISE)[-1], ("f", [(0, -1)])
         )
 
-    def test_a_diagonal_mirrors_the_way_a_quarter_does(self) -> None:
-        # Both arms of a join mirror, and so does the quarter each was laid
-        # in. Counted the other way round, a turn of 45 still leaves the
-        # quarter it was authored at and takes up the mirror of the one it
-        # took up clockwise, so the arm in front stays the arm in front.
+    def test_a_join_either_way_round_keeps_every_column_on_its_side(self) -> None:
+        # Clockwise the path leaves the lower quarter for the upper; the
+        # other way round it leaves the upper for the lower. Either way the
+        # lower arm is plain and the upper mirrored, and in both arms a column
+        # authored left of the centreline is laid left of travel and one
+        # authored right is laid right -- which a reflection did not keep.
         section = self.section()
-        clockwise = arms(section, 45)
-        self.assertEqual(set(clockwise), {0, 90})
-        self.assertEqual(
-            arms(section, 45, COUNTER_CLOCKWISE),
-            {
-                normalize(-quarter): {
-                    name: [(x, -z) for x, z in positions]
-                    for name, positions in laid.items()
-                }
-                for quarter, laid in clockwise.items()
-            },
-        )
+        for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+            with self.subTest(direction=direction):
+                laid = section.orient(normalize(45 * direction), direction)
+                self.assertEqual(
+                    {o.layout: o.mirrored for o in laid}, {0: False, 90: True}
+                )
+                going = step_along(45)
+                right = (-going[1], going[0])
+                for quarter in (0, 90):
+                    side = {
+                        o.annotation.name: {
+                            p.x * right[0] + p.z * right[1] for p in o.offsets
+                        }
+                        for o in laid
+                        if o.layout == quarter
+                    }
+                    self.assertLess(max(side["a"]), min(side["o"]))
+                    self.assertLess(max(side["o"]), min(side["b"]))
 
     def test_each_direction_is_laid_out_and_kept_on_its_own(self) -> None:
         section = self.section()
@@ -580,16 +585,48 @@ class CounterClockwiseTests(unittest.TestCase):
             section.orient(90, COUNTER_CLOCKWISE),
         )
 
-    def test_a_mirrored_layout_reaches_the_same_distance(self) -> None:
+    def test_reach_covers_every_way_round(self) -> None:
         section = self.section(StepMode.MANHATTAN)
         for turn in range(0, 360, 45):
-            with self.subTest(turn=turn):
-                furthest = max(
-                    abs(x * travel(turn, COUNTER_CLOCKWISE).x + z * travel(turn, COUNTER_CLOCKWISE).z)
-                    for _, positions in self.offsets(section, turn, COUNTER_CLOCKWISE)
-                    for x, z in positions
-                )
-                self.assertAlmostEqual(furthest, section.reach(turn))
+            for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+                with self.subTest(turn=turn, direction=direction):
+                    going = travel(turn, direction)
+                    furthest = max(
+                        abs(x * going.x + z * going.z)
+                        for _, positions in self.offsets(section, turn, direction)
+                        for x, z in positions
+                    )
+                    self.assertLessEqual(
+                        furthest, section.reach(normalize(turn * direction)) + 1e-9
+                    )
+
+
+class LeanTests(unittest.TestCase):
+    # A quarter's staircase leans the way the path is heading off it, so the
+    # row tilts towards square across travel on both sides of every diagonal.
+
+    def test_clockwise_of_the_quarter_is_plain(self) -> None:
+        # East is 180 from west; a heading a little south of east is
+        # clockwise of it, a little north counter-clockwise.
+        self.assertEqual(lean_of(180, Vec2(1.0, 0.2)), PLAIN)
+        self.assertEqual(lean_of(180, Vec2(1.0, -0.2)), MIRRORED)
+        self.assertEqual(lean_of(270, Vec2(-0.2, 1.0)), PLAIN)
+        self.assertEqual(lean_of(270, Vec2(0.2, 1.0)), MIRRORED)
+
+    def test_dead_on_the_quarter_keeps_the_lean_it_had(self) -> None:
+        self.assertEqual(lean_of(180, Vec2(1.0, 0.0), MIRRORED), MIRRORED)
+        self.assertEqual(lean_of(180, Vec2(1.0, 0.0), PLAIN), PLAIN)
+        self.assertEqual(lean_of(90, Vec2(0.0, -1.0)), mirror_of(90))
+
+    def test_every_diagonal_leans_the_same_way(self) -> None:
+        # Either side of every diagonal the lower quarter is plain and the
+        # upper mirrored -- the leans a join gives its arms -- so no diagonal
+        # narrows the deck while another widens it.
+        for diagonal in (45, 135, 225, 315):
+            lower, upper = neighbors(diagonal)
+            with self.subTest(diagonal=diagonal):
+                self.assertEqual(lean_of(lower, heading(diagonal)), PLAIN)
+                self.assertEqual(lean_of(upper, heading(diagonal)), MIRRORED)
 
 
 class StepRuleTests(unittest.TestCase):

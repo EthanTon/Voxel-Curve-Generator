@@ -85,115 +85,58 @@ class VanillaCatalog:
             rotation |= RotationRule.RAIL_SHAPE
 
         behavior = definition.behavior
+        solid = self.solid_faces(state)
+
+        def value(key: str, states_key: str, fallback: object) -> object:
+            return self._state_value(state, definition, key, states_key, fallback)
+
         return BlockInfo(
             rotation=rotation,
             neighbor_rule=_NEIGHBOR_RULES.get(behavior, NeighborRule.NONE),
-            solid_faces=self.solid_faces(state),
-            center_faces=self._face_metadata(
-                state, definition, "center_faces", "center_face_states"
-            ),
-            rigid_faces=self._face_metadata(
-                state, definition, "rigid_faces", "rigid_face_states"
-            ),
+            solid_faces=solid,
+            center_faces=SolidFace(int(value("center_faces", "center_face_states", int(solid)))),
+            rigid_faces=SolidFace(int(value("rigid_faces", "rigid_face_states", int(solid)))),
             replaceable=behavior in _REPLACEABLE_BEHAVIORS,
             behavior=behavior,
             connection_exception=bool(
-                self._state_metadata_value(
-                    state,
-                    definition,
-                    "connection_exception",
-                    "connection_exception_states",
-                    False,
-                )
+                value("connection_exception", "connection_exception_states", False)
             ),
-            flammable=bool(
-                self._state_metadata_value(
-                    state,
-                    definition,
-                    "flammable",
-                    "flammable_states",
-                    False,
-                )
-            ),
-            signal_source=bool(
-                self._state_metadata_value(
-                    state,
-                    definition,
-                    "signal_source",
-                    "signal_source_states",
-                    False,
-                )
-            ),
-            wall_cover=int(
-                self._state_metadata_value(
-                    state,
-                    definition,
-                    "wall_cover",
-                    "wall_cover_states",
-                    0,
-                )
-            ),
+            flammable=bool(value("flammable", "flammable_states", False)),
+            signal_source=bool(value("signal_source", "signal_source_states", False)),
+            wall_cover=int(value("wall_cover", "wall_cover_states", 0)),
             tags=definition.tags,
-        )
-
-    def _face_metadata(
-        self,
-        state: BlockState,
-        definition: VanillaBlockDefinition,
-        default_key: str,
-        states_key: str,
-    ) -> SolidFace:
-        fallback = int(self.solid_faces(state))
-        return SolidFace(
-            int(
-                self._state_metadata_value(
-                    state, definition, default_key, states_key, fallback
-                )
-            )
         )
 
     def solid_faces(self, state: BlockState) -> SolidFace:
         definition = self.definition(state.name)
-        raw = self._blocks[state.name]
-        if not isinstance(raw, dict):
-            raise ValueError(f"Invalid catalog entry for {state.name!r}")
-
         fallback = (
             int(SolidFace.ALL)
             if definition.behavior in _FULL_CUBE_BEHAVIORS
             else int(SolidFace.NONE)
         )
-        mask = int(raw.get("faces", fallback))
-        face_states = raw.get("face_states", {})
-        if face_states:
-            properties = dict(definition.default_properties)
-            properties.update(dict(state.properties))
-            key = ",".join(
-                properties[name] for name in sorted(definition.properties)
-            )
-            mask = int(face_states.get(key, mask))
-        return SolidFace(mask)
+        return SolidFace(int(self._state_value(state, definition, "faces", "face_states", fallback)))
 
-    def _state_metadata_value(
+    def _state_value(
         self,
         state: BlockState,
         definition: VanillaBlockDefinition,
-        default_key: str,
+        key: str,
         states_key: str,
         fallback: object,
     ) -> object:
+        # The block's `key` value, overridden per state by `states_key`, which
+        # is keyed by the state's property values in property-name order.
         raw = self._blocks[state.name]
         if not isinstance(raw, dict):
             raise ValueError(f"Invalid catalog entry for {state.name!r}")
-        value = raw.get(default_key, fallback)
+        value = raw.get(key, fallback)
         state_values = raw.get(states_key, {})
         if state_values:
             properties = dict(definition.default_properties)
             properties.update(dict(state.properties))
-            key = ",".join(
-                properties[name] for name in sorted(definition.properties)
+            value = state_values.get(
+                ",".join(properties[name] for name in sorted(definition.properties)), value
             )
-            value = state_values.get(key, value)
         return value
 
     def validate(self, state: BlockState) -> None:
@@ -317,9 +260,7 @@ _SUPPORT_BEHAVIORS = {
 for _behavior in _SUPPORT_BEHAVIORS:
     _NEIGHBOR_RULES[_behavior] = NeighborRule.SUPPORT
 
-# Families whose default collision/support shape is a complete cube. Partial
-# blocks are deliberately conservative: callers can supply more precise faces
-# for a particular state without accidentally creating false fence/pane arms.
+# Families that are a full cube unless the catalog lists their faces.
 _FULL_CUBE_BEHAVIORS = {
     "amethyst",
     "block",

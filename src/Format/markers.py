@@ -12,15 +12,12 @@ from ..Core.modes import StepMode
 from .region import BlockRegion, RegionEntity
 
 NAMESPACE = "vcg"
-# Only the first separator in a tag splits key from value, so a value may
-# contain it: `vcg.feature-egg-egg` is feature = "egg-egg". `-` is the default
-# because `/tag @e add` takes an unquoted word and will not accept `=`.
+# Only the first separator splits key from value (`vcg.feature-egg-egg` is
+# feature = "egg-egg"); `-` because `/tag` does not accept `=`.
 SEPARATOR = "-"
 
-# A marker entity carries one bare tag naming what it is, plus any number of
-# key/value tags. `vcg.annotation` says which kind; `vcg.name-left_rail` says
-# something about it. Tags outside the namespace are ignored, so an entity
-# may also carry a pack's own tags.
+# A marker carries one kind tag (`vcg.annotation`) and any number of
+# key/value tags (`vcg.name-left_rail`); other namespaces are ignored.
 ANCHOR = "anchor"
 ANNOTATION = "annotation"
 FEATURE = "feature"
@@ -75,8 +72,7 @@ def parse_tags(
             properties[key] = value
             continue
         if not body.isidentifier():
-            # Catches a property written with the wrong separator, which
-            # would otherwise become a very strange kind.
+            # A property written with the wrong separator.
             raise ValueError(f"{tag!r} is neither a kind nor a {separator!r} property")
         if kind is not None and kind != body:
             raise ValueError(f"marker claims two kinds: {kind!r} and {body!r}")
@@ -104,8 +100,7 @@ def of_kind(found: Sequence[Marker], kind: str) -> list[Marker]:
 
 
 def anchor(found: Sequence[Marker]) -> Marker:
-    # Section-local coordinates are relative to the path point, not to the
-    # schematic corner, so exactly one anchor has to say where that is.
+    # Exactly one anchor marks the path point sections are relative to.
     anchors = of_kind(found, ANCHOR)
     if len(anchors) != 1:
         raise ValueError(f"expected exactly one {ANCHOR} marker, found {len(anchors)}")
@@ -113,7 +108,7 @@ def anchor(found: Sequence[Marker]) -> Marker:
 
 
 def rebased(found: Sequence[Marker]) -> list[Marker]:
-    # Every marker relative to the anchor, which the anchor defines as origin.
+    # Every marker relative to the anchor.
     origin = anchor(found).position
     return [marker.rebased(origin) for marker in found if marker.kind != ANCHOR]
 
@@ -125,8 +120,7 @@ def section_from_region(
     namespace: str = NAMESPACE,
     separator: str = SEPARATOR,
 ) -> CrossSection:
-    # Annotation positions stay in the region's own frame and the anchor
-    # becomes CrossSection.origin, which is what the section subtracts.
+    # Positions stay in the region's frame; the anchor becomes the origin.
     found = markers(region, namespace=namespace, separator=separator)
     base = region.origin
     points = PointField()
@@ -149,8 +143,7 @@ def section_from_region(
 
 
 def block_field(region: BlockRegion, *, origin: BlockPos | None = None) -> BlockField:
-    # The authored blocks in local coordinates. A CrossSection holds none of
-    # its own -- blocks belong to features -- so this is for building one.
+    # The region's blocks relative to `origin` (default: its minimum corner).
     base = region.origin if origin is None else BlockPos.coerce(origin)
     field = BlockField()
     for position, state in region.iter_occupied():

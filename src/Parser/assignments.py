@@ -1,26 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
 from ..Core.coordinates import ColumnPos
-from .sections import read_span, read_toml
+from .sections import read_span
 from .spec import AssignmentSpec
-from .values import require
+from .values import listed_entries, require
 
 
 def read_assignments(
     data: Mapping, markers: Mapping[str, ColumnPos], base: Path = Path(".")
 ) -> tuple[AssignmentSpec, ...]:
-    named = data.get("path_assignments")
-    entries = data.get("assignment", ())
-    if named is not None and entries:
-        raise ValueError(
-            "path assignments are listed in the build or in a file of their "
-            "own, not both"
-        )
-    if named is not None:
-        entries = read_toml(base / named, "path assignments").get("assignment", ())
+    entries, _ = listed_entries(
+        data, "path_assignments", "assignment", "path assignments", base
+    )
     return tuple(read_assignment(each, markers) for each in entries)
 
 

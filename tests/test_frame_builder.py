@@ -16,6 +16,7 @@ from src.Generation.Geometry.frames import (
     check_padding,
     elevation_from_frames,
     frames_for_index,
+    level_near,
 )
 
 
@@ -218,6 +219,54 @@ class ElevationFromFramesTests(unittest.TestCase):
         self.assertEqual({z for _, z in levels}, set(range(2, 22)))
         for (x, z), y in levels.items():
             self.assertEqual(y, 64 if z < 12 else 65, (x, z))
+
+
+class LevelNearTests(unittest.TestCase):
+    # 330 degrees of a circle, climbing at 150 and at 300. The plane the last
+    # level starts at faces back across the first quarter, so asking every
+    # boundary gives the first quarter the last level.
+
+    def setUp(self) -> None:
+        self.path = arc(40, 330, 5, lead=2)
+        self.frames = build_frames(
+            self.path, 64, [ElevationBreak(32, 65), ElevationBreak(62, 66)]
+        )
+        self.level = level_near(self.frames)
+
+    def owner(self, index: int):
+        return [f for f in self.frames if f.path_start <= index < f.path_stop][0]
+
+    def test_every_point_takes_the_level_of_its_own_frame(self) -> None:
+        for index in range(self.path.first_index, self.path.last_index):
+            position = self.path.path_points[index].position
+            self.assertEqual(
+                self.level(position.x, position.z, index),
+                self.owner(index).y_offset,
+                index,
+            )
+
+    def test_where_every_boundary_is_asked_the_first_quarter_is_wrong(self) -> None:
+        # What level_near is for: the global lookup disagrees on this path.
+        elevation = elevation_from_frames(self.frames)
+        wrong = [
+            index
+            for index in range(self.path.first_index, self.path.last_index)
+            if elevation(
+                self.path.path_points[index].position.x,
+                self.path.path_points[index].position.z,
+            ) != self.owner(index).y_offset
+        ]
+        self.assertTrue(wrong)
+
+    def test_a_column_past_the_next_boundary_takes_the_next_level(self) -> None:
+        # Just ahead of a break, a column a little further along belongs to
+        # the frame after it.
+        ahead = self.path.path_points[33].position
+        self.assertEqual(self.level(ahead.x, ahead.z, 31), 65)
+
+    def test_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            level_near([])
 
 
 class BuildSectionFramesTests(unittest.TestCase):

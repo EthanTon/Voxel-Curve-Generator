@@ -9,22 +9,16 @@ from ..Core.coordinates import BlockPos, ColumnPos, Vec3
 from ..Core.CrossSection.turns import JOIN_DEGREES
 from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionOverride
-from ..Core.modes import ElevationMode, LineMode, PlacementMode, StepMode
-from ..Stamping import DEFAULT_RESOLUTION, Heading
+from ..Core.modes import ElevationMode, PlacementMode, StepMode
+from ..Stamping import Heading
 from ..Terraform.plan import Plan as TerraformPlan
+from ..Terraform.surface_mask import SurfaceMaskSpec
 
 
 @dataclass(frozen=True, slots=True)
 class PathSpec:
-    # Positions and vectors as given. The only path work is the lead: points
-    # extended straight off either end so the ends are framed like any other.
-    #
-    # `diagonal_degrees` is how near a diagonal a heading has to be for the
-    # join between the two quarters either side of it to be laid there. The
-    # join is stamped once, where that run of headings begins, so a wide band
-    # hands the quarter over early and a narrow one puts the join on the
-    # diagonal. A path that swings past a diagonal between two points has its
-    # join laid at the change, so 0 still joins.
+    # `lead` points are added straight off each end. `diagonal_degrees` is
+    # how near a diagonal a heading must be for the join to be laid there.
     points: tuple[BlockPos, ...]
     gradients: tuple[Vec3, ...]
     lead: int = 0
@@ -32,10 +26,16 @@ class PathSpec:
 
 
 class Measure(Enum):
-    # What a spacing or a dash is counted in: blocks along the path, or the
-    # path's own points.
+    # Spacing counted in blocks along the path or in path points.
     DISTANCE = "distance"
     INDEX = "index"
+
+
+class WireGeometry(Enum):
+    # FOLLOW lies on the section column at every point, at each point's own
+    # level; LINE runs straight and rigid between anchors.
+    FOLLOW = "follow"
+    LINE = "line"
 
 
 class SectionElevation(Enum):
@@ -46,8 +46,7 @@ class SectionElevation(Enum):
 
 @dataclass(frozen=True, slots=True)
 class SpanSpec:
-    # The columns a section's stretch of path starts and stops at. The
-    # marker names are kept for the messages, not for the geometry.
+    # Marker names are kept for messages only.
     start: ColumnPos
     stop: ColumnPos
     start_marker: str | None = None
@@ -60,19 +59,8 @@ class SpanSpec:
 
 @dataclass(frozen=True, slots=True)
 class SectionSpec:
-    # `step` is how the columns of the profile reach the next point along the
-    # path, and `steps` overrides it for named columns, written "x,z".
-    #
-    # CHEBYSHEV delivers a column where it sits and nowhere else. A solid row
-    # wants this: its columns already share faces along the row, and stepping
-    # would make each one push the columns beyond it, so an eleven wide
-    # profile would come out a staircase four deep instead of a row across
-    # the path.
-    #
-    # MANHATTAN also delivers it one block along travel, and pushes whatever
-    # is further out by the same. That is for a column that has to stay
-    # face-connected along the path -- a rail, a wire, a fence in the profile
-    # -- where a diagonal step would leave it touching only at a corner.
+    # `step` applies to every column unless `steps` overrides it by "x,z".
+    # MANHATTAN keeps a column face-connected along the path (rails, fences).
     name: str
     domain: str
     schematic: Path
@@ -82,22 +70,24 @@ class SectionSpec:
     elevation: SectionElevation = SectionElevation.FOLLOW
     step: StepMode = StepMode.CHEBYSHEV
     steps: Mapping[tuple[int, int], StepMode] = field(default_factory=dict)
+    # Optional domains for raised blocks on the left and right of the deck.
+    edge_domains: tuple[str, str] | None = None
+    # Columns this far from the centre also belong to the edge at deck level.
+    edge_from: int | None = None
+    surface_mask: SurfaceMaskSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class AssignmentSpec:
-    # Which sections are swept over one stretch of the path. Sections say what
-    # they are; assignments say where they are used, so the two can be written
-    # apart and an assignment can be worked out rather than written.
+    # The sections swept over one stretch of the path.
     span: SpanSpec
     sections: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class DomainSpec:
-    # Every rule is optional, and an unset one is inherited from the parents
-    # before falling back to the world's own default. `order` is when this
-    # domain's blocks go into the world, so a later one covers an earlier.
+    # Unset rules are inherited. Higher `order` domains are laid later and
+    # cover lower ones.
     name: str
     parents: tuple[str, ...] = ()
     order: int = 0
@@ -109,7 +99,6 @@ class DomainSpec:
 
 @dataclass(frozen=True, slots=True)
 class InteractionSpec:
-    # A rule between two domains, inherited by both sides' descendants.
     source: str
     target: str
     connect: bool | None = None
@@ -123,9 +112,8 @@ class InteractionSpec:
 
 @dataclass(frozen=True, slots=True)
 class StructureSpec:
-    # One schematic per authored heading: a resolution of 90 needs one, 45
-    # needs two, 22.5 needs four. It sits every `spacing` along its sections,
-    # and wherever the path has turned `angle` since the last one.
+    # One schematic per authored heading (four at 22.5 degrees), placed every
+    # `spacing` or wherever the path has turned `angle`.
     name: str
     domain: str
     sections: tuple[str, ...]
@@ -137,36 +125,36 @@ class StructureSpec:
     offset: BlockPos = BlockPos(0, 0, 0)
     placement_mode: PlacementMode | None = None
     elevation_mode: ElevationMode = ElevationMode.RIGID
+    # "heading" picks a variant by travel direction; "layout" turns one
+    # schematic with the section's layout, for structures spanning its
+    # columns.
+    turn: str = "heading"
+    surface_mask: SurfaceMaskSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class WireSpec:
-    # A line from pole to pole, where `spacing` and `angle` put the poles.
-    # One placement per run, so connectivity sees the whole wire.
-    #
-    # `between` names two other wires instead of sections, and the line goes
-    # across from one to the other: a dropper hanging a contact wire off the
-    # messenger above it.
+    # A strand along the sections (see WireGeometry; a line's anchors are
+    # placed by `spacing` and `angle`), or with `between`, droppers across
+    # two other wires. `step` joins its blocks by faces or by corners in 3D.
     name: str
     domain: str
     schematic: Path
     sections: tuple[str, ...] = ()
     between: tuple[str, ...] = ()
     offset: BlockPos = BlockPos(0, 0, 0)
+    geometry: WireGeometry = WireGeometry.FOLLOW
     spacing: float = 0.0
     angle: float = 0.0
     measure: Measure = Measure.DISTANCE
-    # How the run between two anchors is drawn: a wire is a line between
-    # poles, not a point of a section, so this is a LineMode.
-    step: LineMode = LineMode.MANHATTAN
+    step: StepMode = StepMode.MANHATTAN
     placement_mode: PlacementMode | None = None
+    surface_mask: SurfaceMaskSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class LaneSpec:
-    # A dash of `on` path points then a gap of `off`, over and over. A
-    # stepping lane paints a block along travel as well, so its dash is a
-    # block longer than it is points.
+    # Dashes of `on` path points separated by gaps of `off`.
     name: str
     domain: str
     sections: tuple[str, ...]
@@ -176,12 +164,19 @@ class LaneSpec:
     block: str | None = None
     measure: Measure = Measure.INDEX
     offset: BlockPos = BlockPos(0, 0, 0)
-    # How the lane reaches the next path point, the same question a column
-    # of a section answers: MANHATTAN also paints a block along travel, so
-    # the line is four-connected and lands on a column stepping the same way.
-    # CHEBYSHEV paints one block a point and steps diagonally.
     step: StepMode = StepMode.MANHATTAN
     placement_mode: PlacementMode | None = None
+    surface_mask: SurfaceMaskSpec | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SplitSpec:
+    # Export pieces of at most `max_span` per axis and `max_blocks` cells.
+    # With `terrain`, pieces also carry the surrounding ground (see export.py).
+    directory: Path
+    max_blocks: int = 4_000_000
+    max_span: int = 128
+    terrain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +184,9 @@ class OutputSpec:
     path: Path
     name: str = "build"
     data_version: int = 3700
+    # "absolute", "relative", or None for each format's default.
+    mode: str | None = None
+    split: SplitSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +202,7 @@ class BuildSpec:
     wires: tuple[WireSpec, ...] = ()
     lanes: tuple[LaneSpec, ...] = ()
     terraform: TerraformPlan | None = None
+    surface_world: Path | None = None
 
     def marker(self, name: str) -> ColumnPos:
         if name not in self.markers:

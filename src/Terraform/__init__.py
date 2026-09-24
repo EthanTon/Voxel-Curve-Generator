@@ -1,32 +1,43 @@
 from .clearance import Clearance, above, open_sky
 from .grid import Grid
-from .layers import Blend, Ground, Keep, Layer, Level, Mound, Offset, Slope, shape
+from .layers import Blend, CircularPad, GaussianPad, Ground, Keep, Layer, Level, Mound, Offset, Slope, shape
 from .materialize import Earthworks, Strata
 from .plan import (
     Action,
+    CrossSection,
+    Cutting,
+    Embankment,
     Follows,
     Intensity,
     Look,
     Plan,
     Profile,
+    Smoothing,
     Span,
     Step,
+    TerrainMask,
     load,
     read,
 )
 from .surroundings import Surroundings, measure
 from .terraform import Alignment, Report, Terraforming, terraform
 from .terrain import EmptyTerrain, FieldTerrain, Terrain, load_terrain
+from .surface_mask import SurfaceMaskSpec, SurfaceReference
 
 __all__ = [
     "Action",
     "Alignment",
     "Blend",
     "Clearance",
+    "CircularPad",
+    "CrossSection",
+    "Cutting",
     "Earthworks",
+    "Embankment",
     "Follows",
     "EmptyTerrain",
     "FieldTerrain",
+    "GaussianPad",
     "Ground",
     "Grid",
     "Intensity",
@@ -39,12 +50,16 @@ __all__ = [
     "Plan",
     "Profile",
     "Report",
+    "Smoothing",
+    "SurfaceMaskSpec",
+    "SurfaceReference",
     "Slope",
     "Span",
     "Surroundings",
     "Step",
     "Strata",
     "Terrain",
+    "TerrainMask",
     "Terraforming",
     "above",
     "load",

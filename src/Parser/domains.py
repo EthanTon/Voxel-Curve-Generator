@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import sqrt
 
 from ..Core.Domain import ConnectivityRules, PlacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionAction, ConnectionOverride
@@ -26,6 +27,7 @@ def read_connectivity(data: Mapping, name: str) -> ConnectivityRules:
     return ConnectivityRules(
         connects_to_self=data.get("connects_to_self"),
         connects_to_any=data.get("connects_to_any"),
+        stairs_join_diagonals=data.get("stairs_join_diagonals"),
         overrides=tuple(
             read_override(each, f"domain {name!r}")
             for each in data.get("override", ())
@@ -87,4 +89,9 @@ def read_override(data: Mapping, where: str) -> ConnectionOverride:
         value=data.get("value"),
         set_properties=data.get("set_properties"),
         symmetric=data.get("symmetric", False),
+        max_distance=(sqrt(2) if data.get("max_distance", 1) == "sqrt2"
+                      else data.get("max_distance", 1)),
+        offsets=(None if data.get("offsets") is None else frozenset(
+            tuple(offset) for offset in data["offsets"]
+        )),
     )

@@ -11,8 +11,7 @@ class PathPoint:
 
     @property
     def heading(self) -> Vec2:
-        # Horizontal projection of the gradient: the direction of travel in
-        # plan view.
+        # The gradient in plan.
         return Vec2(self.gradient.x, self.gradient.z)
 
     @property
@@ -21,7 +20,7 @@ class PathPoint:
 
     @property
     def grade(self) -> float:
-        # Rise over horizontal run. Undefined where the gradient is vertical.
+        # Rise over run.
         run = self.heading_magnitude
         if run == 0.0:
             raise ValueError(
@@ -35,13 +34,8 @@ class PathPoint:
         return self.heading_magnitude == 0.0
 
 class Path:
-    # Points along a curve, optionally padded at either end.
-    #
-    # The first `lead_in` and last `lead_out` points lie before and after the
-    # path proper. They take part in anything computed along the path --
-    # geometry, elevation -- so the boundaries at the path's ends are held as
-    # cleanly as any boundary in the middle. They are not part of
-    # the path: whatever they produce past those boundaries is dropped.
+    # Points along a curve. The first `lead_in` and last `lead_out` are
+    # padding: they shape geometry at the ends but lie outside the path.
     def __init__(
         self,
         points: Sequence[BlockPos | Sequence[int]],
@@ -75,12 +69,10 @@ class Path:
 
     @property
     def first_index(self) -> int:
-        # Index of the first point on the path proper.
         return self.lead_in
 
     @property
     def last_index(self) -> int:
-        # Index of the last point on the path proper (inclusive).
         return len(self.path_points) - 1 - self.lead_out
 
     @property
@@ -91,7 +83,7 @@ class Path:
         return index < self.first_index or index > self.last_index
 
     def length(self) -> float:
-        # Length of the path proper; padding is not measured.
+        # Excludes padding.
         points = self.bounded_points
         if len(points) <= 1:
             return 0.0

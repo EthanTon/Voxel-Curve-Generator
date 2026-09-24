@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import sqrt
 from typing import Iterable, Mapping
 
 from .states import BlockState
@@ -9,6 +10,17 @@ from .states import BlockState
 
 ConnectivityDomainId = int
 Direction = str
+
+_OFFSETS: dict[Direction, tuple[int, int, int]] = {
+    "down": (0, -1, 0), "up": (0, 1, 0),
+    "north": (0, 0, -1), "east": (1, 0, 0),
+    "south": (0, 0, 1), "west": (-1, 0, 0),
+}
+_OPPOSITE: dict[Direction, Direction] = {
+    "down": "up", "up": "down",
+    "north": "south", "south": "north",
+    "east": "west", "west": "east",
+}
 
 
 class ConnectionAction(Enum):
@@ -60,6 +72,10 @@ class ConnectionOverride:
     source_properties: Mapping[str, frozenset[str]] | None = None
     neighbor_properties: Mapping[str, frozenset[str]] | None = None
     set_properties: Mapping[str, str] | None = None
+    # Block-center distance. 1 checks faces; sqrt(2) also checks edge neighbors.
+    max_distance: float = 1.0
+    # Optional exact relative positions, viewed from the source block.
+    offsets: frozenset[tuple[int, int, int]] | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -93,6 +109,18 @@ class ConnectionOverride:
                 )
         if self.set_properties is not None:
             object.__setattr__(self, "set_properties", dict(self.set_properties))
+        if self.max_distance not in (1, sqrt(2)):
+            raise ValueError("max_distance must be 1 or sqrt(2)")
+        if self.offsets is not None:
+            offsets = frozenset(tuple(offset) for offset in self.offsets)
+            if any(
+                len(offset) != 3
+                or any(type(component) is not int or abs(component) > 1 for component in offset)
+                or sum(component * component for component in offset) not in (1, 2)
+                for offset in offsets
+            ):
+                raise ValueError("offsets must contain face or edge neighbor [x, y, z] positions")
+            object.__setattr__(self, "offsets", offsets)
 
 
 class ConnectivityOptions:
@@ -115,7 +143,10 @@ class ConnectivityOptions:
         neighbor_behavior: str | None = None,
         source_tags: frozenset[str] = frozenset(),
         neighbor_tags: frozenset[str] = frozenset(),
+        offset: tuple[int, int, int] | None = None,
     ) -> ConnectionDecision:
+        if offset is None:
+            offset = _OFFSETS[direction]
         for override in reversed(self.overrides):
             if _matches(
                 override,
@@ -128,6 +159,7 @@ class ConnectivityOptions:
                 neighbor_behavior,
                 source_tags,
                 neighbor_tags,
+                offset,
             ):
                 return ConnectionDecision(
                     override.action, override.value, override.set_properties
@@ -143,6 +175,7 @@ class ConnectivityOptions:
                 neighbor_behavior,
                 source_tags,
                 neighbor_tags,
+                offset,
             ):
                 return ConnectionDecision(
                     override.action, override.value, override.set_properties
@@ -161,6 +194,7 @@ def _matches(
     neighbor_behavior: str | None,
     source_tags: frozenset[str],
     neighbor_tags: frozenset[str],
+    offset: tuple[int, int, int],
 ) -> bool:
     return (
         _contains(override.source_domains, source_domain)
@@ -174,6 +208,7 @@ def _matches(
         and _properties_match(source, override.source_properties)
         and _properties_match(neighbor, override.neighbor_properties)
         and _contains(override.directions, direction)
+        and _offset_matches(override, offset)
     )
 
 
@@ -188,19 +223,30 @@ def _matches_reverse(
     neighbor_behavior: str | None,
     source_tags: frozenset[str],
     neighbor_tags: frozenset[str],
+    offset: tuple[int, int, int],
 ) -> bool:
+    # The same pair seen from the neighbour.
+    return _matches(
+        override,
+        neighbor,
+        neighbor_domain,
+        source,
+        source_domain,
+        _OPPOSITE[direction],
+        neighbor_behavior,
+        source_behavior,
+        neighbor_tags,
+        source_tags,
+        tuple(-component for component in offset),
+    )
+
+
+def _offset_matches(override: ConnectionOverride, offset: tuple[int, int, int]) -> bool:
+    distance_squared = sum(component * component for component in offset)
     return (
-        _contains(override.source_domains, neighbor_domain)
-        and _contains(override.neighbor_domains, source_domain)
-        and _contains(override.source_blocks, neighbor.name)
-        and _contains(override.neighbor_blocks, source.name)
-        and _contains(override.source_behaviors, neighbor_behavior)
-        and _contains(override.neighbor_behaviors, source_behavior)
-        and _contains_all(neighbor_tags, override.source_tags)
-        and _contains_all(source_tags, override.neighbor_tags)
-        and _properties_match(neighbor, override.source_properties)
-        and _properties_match(source, override.neighbor_properties)
-        and _contains(override.directions, _opposite(direction))
+        distance_squared in (1, 2)
+        and distance_squared <= override.max_distance * override.max_distance + 1e-12
+        and (override.offsets is None or offset in override.offsets)
     )
 
 
@@ -221,14 +267,3 @@ def _properties_match(
     return required is None or all(
         state.get(key) in values for key, values in required.items()
     )
-
-
-def _opposite(direction: Direction) -> Direction:
-    return {
-        "down": "up",
-        "up": "down",
-        "north": "south",
-        "east": "west",
-        "south": "north",
-        "west": "east",
-    }[direction]

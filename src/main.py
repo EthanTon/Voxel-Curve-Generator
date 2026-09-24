@@ -4,7 +4,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from .Assembly import assemble, write
+from .Assembly import build, write
 from .Parser import load
 
 
@@ -14,7 +14,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
 
     spec = load(arguments.config)
-    written = write(assemble(spec), spec)
+    built = build(spec)
+    written = write(built.world, spec, built.terraforming)
     print(written)
     return 0
 

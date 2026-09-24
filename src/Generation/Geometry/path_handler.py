@@ -17,6 +17,8 @@ from .reach import lateral_reach, required_lead
 
 
 class PathGeometry:
+    # A padded path with its section schedule and frames. Padding defaults to
+    # the lead the sections need.
     def __init__(
         self,
         points,
@@ -26,9 +28,6 @@ class PathGeometry:
         padding: int | None = None,
         orientation: Orientation = orthogonal,
     ):
-        # The points describe the path proper. How far past them it has to be
-        # padded is not authored with them: it is what the sections pasted along
-        # it reach, which only generation knows. `padding` overrides that count.
         spans = tuple(section_spans)
         sections = tuple(span.section for span in spans)
         authored = Path(points=points, gradients=gradients)
@@ -37,11 +36,9 @@ class PathGeometry:
             required_lead(authored, sections) if padding is None else padding
         )
 
-        # Path points provided, extended into the lead each end needs
         self.path = padded_path(points, gradients, self.padding, orientation)
 
-        # Sections of the path provided. Spans are authored against the points
-        # as given, so they shift along with them.
+        # Spans are authored against the unpadded points.
         self.sections = SectionSchedule(
             (
                 SectionSpan(
@@ -54,10 +51,8 @@ class PathGeometry:
             len(self.path.path_points),
         )
 
-        # How far the sections extend either side of the path, at any turn
         self.reach = lateral_reach(sections)
 
-        # One frame per level, split wherever the path proper changes height
         start_y = self.path.path_points[self.path.first_index].position.y
         self.elevation_frames = build_frames(
             self.path,
@@ -67,7 +62,6 @@ class PathGeometry:
             reach=self.reach,
         )
 
-        # Frames split wherever the section or the level changes
         stations = sorted(
             {*span_stations(self.sections, self.path)}
             | {frame.path_start for frame in self.elevation_frames[1:]}
@@ -80,8 +74,6 @@ class PathGeometry:
             reach=self.reach,
         )
 
-        # The frames' levels, looked up by column
         self.elevation = elevation_from_frames(self.elevation_frames)
 
-        # The columns the path proper owns
         self.bounds = path_bounds(self.path, orientation)

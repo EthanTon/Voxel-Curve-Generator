@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from math import sqrt
+from operator import attrgetter
 from typing import Protocol, runtime_checkable
 
 
@@ -30,65 +31,15 @@ class Coordinate(Protocol):
     def coerce(cls, value: Sequence[int | float]) -> Coordinate: ...
 
 
-# Implementations the coordinate types share, bound by coordinate_methods. A
-# type replaces any one of them by defining that method itself. They read the
-# type's `_components`, the names of its fields in order.
-
-
 def _is_coordinate(value: object) -> bool:
     return getattr(type(value), "_components", None) is not None
 
 
-def _iter(self) -> Iterator[int | float]:
-    for component in self._components:
-        yield getattr(self, component)
-
-
-def _len(self) -> int:
-    return len(self._components)
-
-
-def _getitem(self, index: int | slice) -> int | float | tuple[int | float, ...]:
-    if isinstance(index, slice):
-        return self.as_tuple()[index]
-    if index < 0:
-        index += len(self._components)
-    if index < 0 or index >= len(self._components):
-        raise IndexError("coordinate index out of range")
-    return getattr(self, self._components[index])
-
-
-def _contains(self, value: object) -> bool:
-    return any(item == value for item in _iter(self))
-
-
-def _reversed(self) -> Iterator[int | float]:
-    for component in reversed(self._components):
-        yield getattr(self, component)
-
-
-def _index(self, value: object) -> int:
-    for index, item in enumerate(_iter(self)):
-        if item == value:
-            return index
-    raise ValueError(f"{value!r} is not in {self!r}")
-
-
-def _count(self, value: object) -> int:
-    return sum(1 for item in _iter(self) if item == value)
-
-
-def _as_tuple(self) -> tuple[int | float, ...]:
-    if len(self._components) == 2:
-        return (
-            getattr(self, self._components[0]),
-            getattr(self, self._components[1]),
-        )
-    return (
-        getattr(self, self._components[0]),
-        getattr(self, self._components[1]),
-        getattr(self, self._components[2]),
-    )
+def _tuple_getter(components: tuple[str, ...]) -> Callable[[object], tuple]:
+    if len(components) == 1:
+        name = components[0]
+        return lambda self: (getattr(self, name),)
+    return attrgetter(*components)
 
 
 def _coerce(cls, value):
@@ -97,70 +48,86 @@ def _coerce(cls, value):
     return cls(*value)
 
 
-def _eq(self, other: object) -> bool:
-    if _is_coordinate(other):
-        if type(self) is not type(other):
+def _coordinate_methods(components: tuple[str, ...]) -> dict[str, object]:
+    # Built per class so the hot dunders read the fields directly: positions
+    # are hashed and compared millions of times while resolving a build.
+    values = _tuple_getter(components)
+    size = len(components)
+
+    def as_tuple(self) -> tuple[int | float, ...]:
+        return values(self)
+
+    def __iter__(self) -> Iterator[int | float]:
+        return iter(values(self))
+
+    def __len__(self) -> int:
+        return size
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            return values(self)[index]
+        if index < 0:
+            index += size
+        if index < 0 or index >= size:
+            raise IndexError("coordinate index out of range")
+        return values(self)[index]
+
+    def __contains__(self, value: object) -> bool:
+        return any(item == value for item in values(self))
+
+    def __reversed__(self) -> Iterator[int | float]:
+        return reversed(values(self))
+
+    def index(self, value: object) -> int:
+        for position, item in enumerate(values(self)):
+            if item == value:
+                return position
+        raise ValueError(f"{value!r} is not in {self!r}")
+
+    def count(self, value: object) -> int:
+        return sum(1 for item in values(self) if item == value)
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is type(self):
+            return values(self) == values(other)
+        if _is_coordinate(other):
             return False
-        other_values: Sequence[int | float] = other
-    elif isinstance(other, tuple):
-        other_values = other
-    else:
+        if isinstance(other, tuple):
+            return values(self) == other
         return NotImplemented
-    if len(self) != len(other_values):
-        return False
-    for index, component in enumerate(self._components):
-        if getattr(self, component) != other_values[index]:
-            return False
-    return True
 
+    def __hash__(self) -> int:
+        # Equal to the tuple's hash, so tuple-keyed mappings still find it.
+        return hash(values(self))
 
-def _hash(self) -> int:
-    # Matching tuple's hash keeps legacy tuple-keyed mappings interoperable.
-    return hash(self.as_tuple())
-
-
-def _lt(self, other: object) -> bool:
-    if _is_coordinate(other):
-        if type(self) is not type(other):
+    def __lt__(self, other: object) -> bool:
+        if type(other) is type(self):
+            return values(self) < values(other)
+        if _is_coordinate(other) or not isinstance(other, tuple):
             return NotImplemented
-        other_values: Sequence[int | float] = other
-    elif isinstance(other, tuple):
-        other_values = other
-    else:
-        return NotImplemented
-    for index, component in enumerate(self._components):
-        if index >= len(other_values):
-            return False
-        left = getattr(self, component)
-        right = other_values[index]
-        if left != right:
-            return left < right
-    return len(self) < len(other_values)
+        return values(self) < other
 
-
-_COORDINATE_METHODS = {
-    "__iter__": _iter,
-    "__len__": _len,
-    "__getitem__": _getitem,
-    "__contains__": _contains,
-    "__reversed__": _reversed,
-    "index": _index,
-    "count": _count,
-    "as_tuple": _as_tuple,
-    "coerce": classmethod(_coerce),
-    "__eq__": _eq,
-    "__hash__": _hash,
-    "__lt__": _lt,
-}
+    return {
+        "__iter__": __iter__,
+        "__len__": __len__,
+        "__getitem__": __getitem__,
+        "__contains__": __contains__,
+        "__reversed__": __reversed__,
+        "index": index,
+        "count": count,
+        "as_tuple": as_tuple,
+        "coerce": classmethod(_coerce),
+        "__eq__": __eq__,
+        "__hash__": __hash__,
+        "__lt__": __lt__,
+    }
 
 
 def coordinate_methods(cls: type) -> type:
-    # Give a class with `_components` the shared coordinate methods it does not
-    # define itself, and register it as a Sequence. Apply it above
-    # @dataclass(eq=False): slotted dataclasses are rebuilt as new classes, so
-    # the binding and registration must happen to the final class. A class
-    # that defines __eq__ must also define __hash__, as Python requires.
-    for name, method in _COORDINATE_METHODS.items():
+    # Gives a class with `_components` the shared methods it does not define
+    # and registers it as a Sequence. Apply above @dataclass(eq=False), since
+    # a slotted dataclass is rebuilt as a new class.
+    for name, method in _coordinate_methods(cls._components).items():
         if name not in cls.__dict__:
             setattr(cls, name, method)
     Sequence.register(cls)
@@ -181,10 +148,6 @@ class Vector(Protocol):
     def distance_to(self, other: Sequence[float]) -> float: ...
 
     def is_close(self, other: Sequence[float], tolerance: float = 1e-9) -> bool: ...
-
-
-# Implementations the vector types share, bound by vector_methods. A type
-# replaces any one of them by defining that method itself.
 
 
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
@@ -232,8 +195,7 @@ _VECTOR_METHODS = {
 
 
 def vector_methods(cls: type) -> type:
-    # Give a coordinate class the shared vector methods it does not define
-    # itself. Apply it above @dataclass, like coordinate_methods.
+    # Apply above @dataclass, like coordinate_methods.
     for name, method in _VECTOR_METHODS.items():
         if name not in cls.__dict__:
             setattr(cls, name, method)
@@ -241,9 +203,7 @@ def vector_methods(cls: type) -> type:
 
 
 def quarter_turn(x: float, z: float, turns: int = 1) -> tuple[float, float]:
-    # Rotate a column clockwise, seen from above, by quarter turns. This is the
-    # one definition of a clockwise quarter turn: north (0, -1) becomes east
-    # (1, 0).
+    # Clockwise seen from above: north (0, -1) becomes east (1, 0).
     for _ in range(turns % 4):
         x, z = -z, x
     return x, z
@@ -259,8 +219,6 @@ class Vec2:
     z: float
 
     def cross(self, other: Vec2 | Sequence[float]) -> float:
-        # Signed area of the parallelogram the two vectors span: zero when they
-        # are parallel.
         other = Vec2.coerce(other)
         return self.x * other.z - self.z * other.x
 
@@ -277,7 +235,6 @@ class Vec3:
 
     @property
     def horizontal(self) -> Vec2:
-        # Projection onto the x-z plane.
         return Vec2(self.x, self.z)
 
 

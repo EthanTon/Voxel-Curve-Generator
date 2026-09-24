@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from collections.abc import Set
+from collections.abc import Callable, Set
 
 from ..Core.coordinates import BlockPos
 from .components import components
-from .grid import Grid
 
 
 def clearing(
     growth: Set[BlockPos],
-    grid: Grid,
-    within: Set[tuple[int, int]],
+    in_the_way: Callable[[BlockPos], bool],
+    trees: Set[BlockPos] = frozenset(),
 ) -> frozenset[BlockPos]:
-    return frozenset(
+    # A touched tree is cleared whole so nothing is left floating; other
+    # growth only where it is itself in the way.
+    whole = frozenset(
         position
-        for clump in components(growth)
-        if any(
-            grid.holds(each.x, each.z) and grid.at(each.x, each.z) in within
-            for each in clump
-        )
+        for clump in components(trees)
+        if any(in_the_way(each) for each in clump)
         for position in clump
     )
+    loose = frozenset(
+        position for position in growth if position not in trees and in_the_way(position)
+    )
+    return whole | loose

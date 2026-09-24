@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import floor, sqrt
+from math import ceil, floor, sqrt
 
 import numpy as np
 
@@ -17,9 +17,27 @@ def box(field: Field, radius: int, edge: str = "edge") -> Field:
 
 
 def gaussian(field: Field, sigma: float, edge: str = "edge") -> Field:
+    # Approximated by repeated box blurs.
     for radius in _box_radii(sigma, GAUSSIAN_PASSES):
         field = box(field, radius, edge)
     return field
+
+
+def disk(field: Field, radius: float, edge: str = "edge") -> Field:
+    # The mean over a circle; rim cells count by how much of them it covers.
+    if radius <= 0.5:
+        return field
+    reach = int(ceil(radius + 0.5))
+    offsets = np.arange(-reach, reach + 1)
+    weight = np.clip(radius + 0.5 - np.hypot(offsets[:, None], offsets[None, :]), 0.0, 1.0)
+    weight /= weight.sum()
+    padded = np.pad(field.astype(np.float64), reach, mode=edge)
+    size = (padded.shape[0] + 2 * reach, padded.shape[1] + 2 * reach)
+    spread = np.fft.irfft2(
+        np.fft.rfft2(padded, size) * np.fft.rfft2(weight, size), size
+    )
+    rows, cells = field.shape
+    return spread[2 * reach : 2 * reach + rows, 2 * reach : 2 * reach + cells]
 
 
 def weighted(field: Field, weight: Field, radius: int) -> Field:
@@ -29,6 +47,7 @@ def weighted(field: Field, weight: Field, radius: int) -> Field:
 
 
 def smooth_max(first: Field, second: Field, softness) -> Field:
+    # Polynomial smooth maximum, blending within `softness` of the crossover.
     softness = np.maximum(np.asarray(softness, dtype=np.float64), 0.0)
     safe = np.where(softness > 0, softness, 1.0)
     blend = np.clip(0.5 + 0.5 * (first - second) / safe, 0.0, 1.0)
@@ -101,6 +120,7 @@ def _span(rank: int, axis: int, start: int, stop: int) -> tuple[slice, ...]:
 
 
 def _box_radii(sigma: float, passes: int) -> list[int]:
+    # Box sizes whose `passes` repeated blurs match a Gaussian's variance.
     if sigma <= 0:
         return []
     ideal = sqrt(12 * sigma * sigma / passes + 1)

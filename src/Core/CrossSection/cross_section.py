@@ -5,12 +5,13 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import NamedTuple
 
-from ..coordinates import BlockPos
+from ..coordinates import BlockPos, Vec2
 from ..modes import StepMode
 from .annotations import FeatureAnnotation
 from .steps import STEP_RULES, StepRule, column_pushes, lead
 from .turns import (
     CLOCKWISE,
+    COUNTER_CLOCKWISE,
     Rotation,
     Turn,
     heading,
@@ -21,28 +22,33 @@ from .turns import (
     step_along,
 )
 
-# Section-local axes, as authored: x is lateral (positive to the right of
-# travel), y is height above the path, and z is depth, with forward at -z.
+# Section-local axes: x to the right of travel, y height above the path, z
+# depth with forward at -z.
 LocalPoint = BlockPos
 
-# A mirror across the section's own long edge. It turns depth over -- local z
-# and everything measured along travel, which is what the staircase of a
-# stepping column is made of -- and leaves local x alone, so a column stays on
-# its own side of the path.
+# Mirroring across the section's long edge negates depth and everything
+# measured along travel; local x is unchanged.
 MIRRORED = -1
 PLAIN = 1
 
 
 def mirror_of(quarter: Turn) -> int:
-    # Every quarter turn adds a mirror to the one before it, so the mirror
-    # alternates round the four: the authored section at 0, mirrored at 90,
-    # mirrored back at 180, mirrored again at 270.
+    # The default lean when the heading gives none: odd quarters mirrored.
     return MIRRORED if (normalize(quarter) // 90) % 2 else PLAIN
 
 
+def lean_of(quarter: Turn, travel: Vec2, previous: int | None = None) -> int:
+    # Leans a quarter's staircase with the heading so the row stays square
+    # to travel: plain when travel is clockwise of the quarter, mirrored when
+    # counter-clockwise, and `previous` when dead on it.
+    side = heading(quarter).cross(travel)
+    if abs(side) <= 1e-9:
+        return mirror_of(quarter) if previous is None else previous
+    return PLAIN if side > 0 else MIRRORED
+
+
 class PointField:
-    # The annotation counterpart of BlockField: named feature locations in
-    # local coordinates, with no blocks.
+    # Named feature annotations in local coordinates.
 
     def __init__(self, annotations: Iterable[FeatureAnnotation] = ()) -> None:
         self._annotations: dict[str, FeatureAnnotation] = {}
@@ -74,21 +80,12 @@ class PointField:
 
 
 class SectionOffset(NamedTuple):
-    # Where one annotation delivers, relative to a path point, in the order
-    # the positions belong on its feature's path. x and z are world axes; y is
-    # the local height above the path.
-    #
-    # `layout` is the one of the eight these offsets were placed in. Where a
-    # point is laid out more than once -- to cover the seam between a run of
-    # one layout and a run of another -- it is not the turn the path point is
-    # at, and whatever paints blocks here has to be told which.
+    # Where one annotation delivers relative to a path point, in path order:
+    # x and z in world axes, y as height above the path. `layout` and
+    # `mirrored` say which of the layouts placed them.
     annotation: FeatureAnnotation
     offsets: tuple[BlockPos, ...]
     layout: Turn = 0
-    # Whether that layout is the mirrored one. The quarters alternate and a
-    # join's two arms take opposite mirrors, so the layout alone does not say
-    # -- and anything that turns with a position has to know, or it turns the
-    # wrong way at half the layouts.
     mirrored: bool = False
 
 
@@ -104,15 +101,9 @@ def orient_annotation(
     shift: tuple[int, int] = (0, 0),
     depth: int = 1,
 ) -> SectionOffset:
-    # Place one annotation in a layout. `lead` is how far the rest of its
-    # section moves it, and `steps` are its own positions, both in blocks
-    # forward. `shift` is added last, in world axes.
-    #
-    # `depth` of -1 mirrors the section across its own long edge: local z
-    # changes sign and so does everything measured along travel, while local
-    # x is untouched. The layout is unchanged by that, since a mirror across
-    # the long edge moves nothing sideways -- which is what lets the arm keep
-    # its own quarter, and anything riding it land on the right side.
+    # One annotation in a layout. `lead` (how far its section pushes it) and
+    # `steps` are blocks forward; `shift` is added in world axes. A `depth` of
+    # -1 mirrors across the long edge.
     turn = normalize(turn)
     lx, ly, lz = annotation.position - origin
     fx, fz = step_along(turn)
@@ -133,17 +124,14 @@ def orient_annotation(
 
 
 class _Profile(NamedTuple):
-    # What orienting needs from a section's points, gathered once per
-    # revision: each annotation with its steps and lead, the rightmost local
-    # column, and the long length.
+    # Per-revision summary of a section's points. `entries` is (annotation,
+    # steps, lead); `pushes` is how far each column moves those outboard of it.
     entries: tuple[tuple[FeatureAnnotation, tuple[int, ...], int], ...]
     right: int
     long_length: int
     depth: int
-    # How far each column moves what is outboard of it. Kept so anything
-    # sitting beside the section can be placed the way the section would
-    # place a column there.
     pushes: Mapping[int, int] = MappingProxyType({})
+    left: int = 0
 
 
 def _profile(
@@ -172,6 +160,7 @@ def _profile(
             for annotation, column, steps in stepped
         ),
         right=max_x - origin.x,
+        left=min_x - origin.x,
         long_length=max(max_x - min_x, max_z - min_z) + 1,
         depth=max_z - min_z + 1,
         pushes=MappingProxyType(pushes),
@@ -179,13 +168,8 @@ def _profile(
 
 
 def _covered(annotation: FeatureAnnotation) -> tuple[int, int, int, int]:
-    # The local columns an annotation covers: where it sits, widened by the
-    # blocks its feature paints around it, as (left, right, back, front).
-    #
-    # A whole profile carried by one annotation is the reason this is not
-    # just the position. Measured by position alone such a section is one
-    # column wide and one long, so a diagonal has nothing to stagger and
-    # collapses onto the quarter below it.
+    # (left, right, back, front) of the annotation widened by its feature's
+    # blocks.
     position = annotation.position
     blocks = getattr(annotation.feature, "blocks", None)
     bounds = None if blocks is None else blocks.bounds
@@ -202,11 +186,7 @@ def _covered(annotation: FeatureAnnotation) -> tuple[int, int, int, int]:
 def _in_travel_order(
     section: OrientedSection, ahead: tuple[int, int]
 ) -> OrientedSection:
-    # Every annotation's positions sorted down the path. A stepping column
-    # delivers its own position and one along, and on the right of the
-    # section that one is behind -- so shift by shift the pairs come out
-    # against travel even when the shifts themselves are in order. What
-    # rides a join reads these in order, so they have to be in one.
+    # Each annotation's positions sorted along `ahead`.
     return tuple(
         SectionOffset(
             offset.annotation,
@@ -221,14 +201,7 @@ def _in_travel_order(
 
 
 def _centred(section: OrientedSection) -> OrientedSection:
-    # The join moved so the path point sits in the middle of it rather than
-    # at the end of the arm that happened to be laid first.
-    #
-    # A join is one piece covering a stretch of path either side of where it
-    # is stamped, so the point it is stamped at belongs in the middle of it.
-    # Built from the arm being left outwards, the origin lands on that arm's
-    # own row and the whole piece reaches off one way, which walks it half a
-    # section down the path from where it is meant to be.
+    # Shifts a join so the path point is at its middle.
     places = [(p.x, p.z) for offset in section for p in offset.offsets]
     if not places:
         return section
@@ -240,10 +213,7 @@ def _centred(section: OrientedSection) -> OrientedSection:
 
 
 def _repeated(section: OrientedSection, shifts: Sequence[tuple[int, int]]) -> OrientedSection:
-    # One arm: the same layout laid at every shift, gathered back into one
-    # offset per annotation so a column stays a single run rather than half a
-    # dozen one-block ones. Shift-major, so the positions come out in the
-    # order they lie along the walk.
+    # The layout laid at every shift, one offset per annotation, shift-major.
     return tuple(
         SectionOffset(
             offset.annotation,
@@ -265,9 +235,7 @@ def _onto(
     origin: LocalPoint,
     edge: int,
 ) -> tuple[int, int]:
-    # What moves `other` so that its outermost column sits on the same cell
-    # of `section`. Where the column is laid, not where it was authored: a
-    # column outboard of a stepping one is carried along travel.
+    # The shift that puts `other`'s column `edge` on `section`'s.
     here = _column(section, origin, edge)
     there = _column(other, origin, edge)
     return here.x - there.x, here.z - there.z
@@ -280,47 +248,24 @@ def _column(section: OrientedSection, origin: LocalPoint, edge: int) -> BlockPos
     raise ValueError(f"The section has no point in column {edge}")
 
 
-def _mirrored(section: OrientedSection) -> OrientedSection:
-    # A counter-clockwise turn is its clockwise twin mirrored about the x axis,
-    # the heading the section was authored along. Travel mirrors with it, and a
-    # diagonal's two halves trade places, so the stagger leans the other way
-    # without the join having to know which way round the path is turning.
-    # The quarter mirrors with the layout: reflected about the authored
-    # heading, a layout laid out for north is one laid out for south.
-    return tuple(
-        SectionOffset(
-            offset.annotation,
-            tuple(BlockPos(p.x, p.y, -p.z) for p in offset.offsets),
-            normalize(-offset.layout),
-            offset.mirrored,
-        )
-        for offset in section
-    )
-
-
 class _OrientationCache:
-    # Layouts are keyed by turn and direction together: the same turn laid out
-    # the other way round is a different layout.
+    # Layouts keyed by (turn, direction, lean).
     __slots__ = ("layouts", "profile", "revision")
 
     def __init__(self) -> None:
-        self.layouts: dict[tuple[Turn, Rotation], OrientedSection] = {}
+        self.layouts: dict[tuple[Turn, Rotation, int | None], OrientedSection] = {}
         self.profile: _Profile | None = None
         self.revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CrossSection:
-    # A virtual cross section. The physical profile, and every other set of
-    # blocks, belongs to a feature; the section only records where each
-    # feature sits. Delivering it at a path point yields those locations.
+    # Where each feature sits across the path; blocks belong to the features.
 
     points: PointField = field(default_factory=PointField)
-    # The local point that sits on the path centerline.
+    # The local point on the path centreline.
     origin: LocalPoint = BlockPos(0, 0, 0)
-    # The rule each step mode follows. See steps.py.
     step_rules: Mapping[StepMode, StepRule] = field(default_factory=lambda: STEP_RULES)
-    # Each turn is oriented once and stored until the points change.
     _orientations: _OrientationCache = field(
         default_factory=_OrientationCache,
         init=False,
@@ -333,36 +278,28 @@ class CrossSection:
 
     @property
     def depth(self) -> int:
-        # How far the section runs along travel, in blocks.
         return self._current().profile.depth
 
     @property
     def long_length(self) -> int:
-        # Chebyshev length of the section in plan: its widest horizontal extent.
+        # The widest horizontal extent.
         return self._current().profile.long_length
+
+    def step_mode_at(self, column: int) -> StepMode:
+        # MANHATTAN if any point in the column steps.
+        stepping = any(
+            annotation.step_mode is StepMode.MANHATTAN
+            for annotation, _, _ in self._current().profile.entries
+            if annotation.position.x - self.origin.x == column
+        )
+        return StepMode.MANHATTAN if stepping else StepMode.CHEBYSHEV
 
     def along(
         self, column: int, step_mode: StepMode = StepMode.CHEBYSHEV
     ) -> tuple[int, ...]:
-        # Where something at a local column belongs along travel, in blocks
-        # forward, placed the way the section places its own column there:
-        # the lead the stepping columns inboard of it push it by, plus its
-        # own step.
-        #
-        # A lane is the reason this is public. A rail two to the right of
-        # travel sits on the column two to the right of travel, and that
-        # column is not where it was authored -- it is a block along if it
-        # steps, and further still if something inboard of it steps. Placed
-        # by the authored offset alone a lane lands beside the column it
-        # belongs on, which is what put a fifth of the rails on smooth stone
-        # and left the kerb line a block off the kerb.
-        #
-        # In travel order, nearest the back first. A step rule puts the
-        # column's own position first because that is the one the rest of
-        # the section is measured from, and on the right of the section the
-        # step is backwards -- so laid in that order a run walks to the point
-        # and then back a block, which reads as a gap and gets bridged into a
-        # second line beside the first.
+        # Blocks forward, sorted back to front, where the section lays its own
+        # column at `column`: the push of stepping columns inboard of it plus
+        # its own steps. Fittings use this to ride a column.
         profile = self._current().profile
         carried = lead(column, profile.pushes)
         return tuple(
@@ -370,41 +307,40 @@ class CrossSection:
         )
 
     def reach(self, turn: Turn | None = None) -> float:
-        # How far along travel any oriented position sits from the path point,
-        # ahead or behind, at `turn` or at the worst of every turn. Generation
-        # sizes the lead a section is pasted with from this. Mirroring a layout
-        # mirrors travel with it, so a turn reaches the same either way round.
+        # The furthest any oriented position lies along travel from the path
+        # point, at `turn` or over every turn.
         turns = range(0, 360, 45) if turn is None else (turn,)
         furthest = 0.0
         for each in turns:
             direction = heading(each)
-            for offset in self.orient(each):
+            for offset in (o for laid in self.layouts(each) for o in laid):
                 for position in offset.offsets:
                     along = position.x * direction.x + position.z * direction.z
                     furthest = max(furthest, float(abs(along)))
         return furthest
 
     def orient(
-        self, turn: Turn, direction: Rotation = CLOCKWISE
+        self,
+        turn: Turn,
+        direction: Rotation = CLOCKWISE,
+        lean: int | None = None,
     ) -> OrientedSection:
-        # `turn` is how far round from the authored heading the section is laid
-        # out, and `direction` is which way round it was counted, so the same
-        # turn counted the other way travels the other way too. Every turn is
-        # counted, including the ones that travel the same either way round: a
-        # path carrying a direction through them lays them out mirrored.
+        # `turn` counted `direction` from the authored heading. `lean` (see
+        # `lean_of`) applies to quarters; a diagonal sets its arms' own.
         turn = normalize(turn)
-        key = (turn, direction)
+        key = (turn, direction, lean)
         cache = self._current()
         oriented = cache.layouts.get(key)
         if oriented is None:
-            clockwise = self._orient(turn, cache.profile)
-            oriented = (
-                clockwise
-                if direction == CLOCKWISE
-                else _mirrored(clockwise)
-            )
+            oriented = self._orient(normalize(turn * direction), direction, lean, cache.profile)
             cache.layouts[key] = oriented
         return oriented
+
+    def layouts(self, turn: Turn) -> Iterator[OrientedSection]:
+        # Every direction and lean a turn can be laid out with.
+        for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+            for lean in (PLAIN, MIRRORED):
+                yield self.orient(normalize(turn * direction), direction, lean)
 
     def _current(self) -> _OrientationCache:
         cache = self._orientations
@@ -414,57 +350,42 @@ class CrossSection:
             cache.revision = self.points.revision
         return cache
 
-    def _orient(self, turn: Turn, profile: _Profile) -> OrientedSection:
-        # A quarter is one row. A diagonal is the join between two of them,
-        # and a section with no points has neither.
+    def _orient(
+        self,
+        travelling: Turn,
+        direction: Rotation,
+        lean: int | None,
+        profile: _Profile,
+    ) -> OrientedSection:
         if not profile.entries:
             return ()
-        if is_quarter(turn):
-            return self._layout(turn, profile, (0, 0), mirror_of(turn))
-        return self._joined(turn, profile)
+        if is_quarter(travelling):
+            return self._layout(
+                travelling,
+                profile,
+                (0, 0),
+                mirror_of(travelling) if lean is None else lean,
+            )
+        return self._joined(travelling, profile, direction)
 
-    def _joined(self, diagonal: Turn, profile: _Profile) -> OrientedSection:
-        # A diagonal laid out as one piece: the quarter being left, stamped
-        # forward of the joint, and the quarter taking up, stamped back
-        # behind it, half the section's width each and a block apart along
-        # the diagonal.
-        #
-        # The two arms cross rather than meet. Each is laid through where the
-        # other's rows go, so the wedge one opens on the inside of the turn is
-        # already filled by the other, and neither run has to be widened or
-        # trimmed at its end.
-        #
-        # This is stamped once, where the diagonal begins. It reaches half a
-        # section either side of itself, so stamping it at every point that
-        # is near the diagonal would smear the join along the path and lay
-        # several times the deck.
+    def _joined(
+        self, diagonal: Turn, profile: _Profile, direction: Rotation = CLOCKWISE
+    ) -> OrientedSection:
+        # A diagonal is one join piece: the quarter being left, repeated
+        # forward, and the quarter being taken up, repeated backward, crossing
+        # each other so neither leaves a wedge on the inside of the turn. The
+        # lower quarter is laid plain and the upper mirrored, lined up on the
+        # inside edge (right when turning clockwise, else left).
         lower, upper = neighbors(diagonal)
         forward_x, forward_z = step_along(diagonal)
+        clockwise = direction == CLOCKWISE
+        leaving, taking = (lower, upper) if clockwise else (upper, lower)
+        leaving_lean, taking_lean = (PLAIN, MIRRORED) if clockwise else (MIRRORED, PLAIN)
+        inside = profile.right if clockwise else profile.left
         half = max(1, profile.long_length // 2)
-
-        # The quarter taking up is mirrored across the section's long edge
-        # first. A mirror, not a turn: turning it leaves the two rows facing
-        # the same way round the corner, and only one of the section's two
-        # edges carries on through the joint. Mirrored, both of them do --
-        # the outer kerb runs unbroken round the outside and the edge line
-        # round the inside, which is what a corner has to be.
-        # Within a join the mirror is relative, not absolute: the arm being
-        # left is taken plain and the arm taking up is mirrored against it,
-        # whichever quarters the two happen to be. Measured over every
-        # combination of the two mirrors, the two edges to line up on and the
-        # two walk directions, that one pairing is the only one that leaves
-        # both of the section's edges unbroken round the bend -- and it is
-        # the same pairing at all four joins.
-        taking_up = self._layout(upper, profile, (0, 0), MIRRORED)
-        # Then the two are lined up on that inside edge, before either is
-        # walked: the edge of the one being left on the same cell of the one
-        # taking up. That is the corner the two rows pivot about.
-        being_left = self._layout(lower, profile, (0, 0), PLAIN)
-        shift = _onto(being_left, taking_up, self.origin, profile.right)
-
-        # Both arms are laid in the order they lie along travel, rearmost
-        # first, so every annotation's positions come out down the path
-        # rather than up it. What rides a join reads them in that order.
+        taking_up = self._layout(taking, profile, (0, 0), taking_lean)
+        being_left = self._layout(leaving, profile, (0, 0), leaving_lean)
+        shift = _onto(being_left, taking_up, self.origin, inside)
         ahead = tuple((forward_x * k, forward_z * k) for k in range(half))
         behind = tuple(
             (shift[0] - forward_x * k, shift[1] - forward_z * k)
@@ -474,25 +395,6 @@ class CrossSection:
             _repeated(being_left, ahead) + _repeated(taking_up, behind),
             (forward_x, forward_z),
         ))
-
-    def _carried(
-        self,
-        quarter: Turn,
-        profile: _Profile,
-        shifts: tuple[tuple[int, int], ...],
-    ) -> OrientedSection:
-        # One arm of a join: the same quarter laid at every shift, gathered
-        # back into one offset per annotation so a column stays a single run
-        # rather than half a dozen one-block ones.
-        laid = [self._layout(quarter, profile, shift) for shift in shifts]
-        return tuple(
-            SectionOffset(
-                stamps[0].annotation,
-                tuple(dict.fromkeys(p for stamp in stamps for p in stamp.offsets)),
-                quarter,
-            )
-            for stamps in zip(*laid)
-        )
 
     def _layout(
         self,

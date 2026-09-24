@@ -13,7 +13,7 @@ from src.Core.CrossSection.turns import (
 )
 from src.Core.Domain import Domain
 from src.Core.Feature.feature import PointFeature
-from src.Core.Feature.feature_path import FeaturePath, every
+from src.Core.Feature.feature_path import FeaturePath, FeaturePathPoint, every
 from src.Core.Field.block_field import BlockField
 from src.Core.Path.boundary import Boundary
 from src.Core.Path.path import Path, PathPoint
@@ -25,6 +25,8 @@ from src.Generation.Sweep.paths import (
     along_travel,
     at_their_own_level,
     dashed,
+    face_connected,
+    deliver_paths,
     one_line,
     rewalk,
 )
@@ -38,8 +40,158 @@ from src.Generation.Geometry.frames import (
     elevation_from_frames,
     span_stations,
 )
+from src.Generation.Geometry.padding import padded_path
+from src.Generation.Geometry.silhouette import PathSilhouette
 
 NAMES = "abcodef"
+
+
+class ConnectedLaneTests(unittest.TestCase):
+    def test_join_does_not_leave_a_rail_loop(self) -> None:
+        # A diagonal handover walks out and briefly back over its bridge.
+        # The final rail must remain a single line without a square junction.
+        path = FeaturePath(rules=())
+        cells = (
+            (249, 505), (249, 506), (248, 506), (248, 507),
+            (247, 507), (247, 508), (247, 507), (248, 507),
+            (248, 506), (247, 506), (246, 507), (245, 507),
+        )
+        for index, (x, z) in enumerate(cells):
+            path.add(BlockPos(x, 0, z), Vec3(-1, 0, 1), 0, index, 0)
+
+        joined = face_connected(path, continuous=True)
+        positions = {tuple(point.position) for point in joined}
+        self.assertIn((249, 0, 505), positions)
+        self.assertIn((245, 0, 507), positions)
+        self.assertTrue(all(
+            sum((x + dx, 0, z + dz) in positions
+                for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))) <= 2
+            for x, _, z in positions
+        ))
+
+
+class SectionEdgeTests(unittest.TestCase):
+    def test_silhouette_uses_nearby_frames_on_a_returning_path(self) -> None:
+        # The first and last frame strips overlap over the outward arm.
+        # Their own path stations, rather than the unbounded planes alone,
+        # decide which arm each frame may claim.
+        points = (
+            [(x, 64, 0) for x in range(9)]
+            + [(8, 64, 1), (8, 64, 2)]
+            + [(x, 64, 2) for x in range(7, -1, -1)]
+        )
+        path = Path(
+            points,
+            [(1, 0, 0)] * 9 + [(0, 0, 1)] * 2 + [(-1, 0, 0)] * 8,
+        )
+        first = PathFrame(
+            0, 0, 8,
+            Boundary.from_direction((-1, 0), (1, 0)),
+            Boundary.from_direction((8, 1), (0, 1)), 64,
+        )
+        turn = PathFrame(
+            1, 8, 10, first.end_boundary,
+            Boundary.from_direction((7, 2), (-1, 0)), 64,
+        )
+        last = PathFrame(
+            2, 10, 18, turn.end_boundary,
+            Boundary.from_direction((-1, 2), (-1, 0)), 64,
+        )
+        silhouette = PathSilhouette(path, 3, (first, turn, last))
+        self.assertTrue(first.contains(2, 0) and last.contains(2, 0))
+        self.assertEqual(silhouette.frame_at(2, 0), first)
+        self.assertEqual(silhouette.frame_at(2, 2), last)
+        clip = silhouette.clip(FeaturePathPoint(
+            2, 0, BlockPos(2, 0, 0), Vec3(1, 0, 0), 180, 1,
+        ))
+        self.assertTrue(clip.contains(2, 0))
+        self.assertFalse(clip.contains(2, 2))
+        self.assertTrue(silhouette.for_span(SectionSpan(0, 8, row())).contains(2, 0))
+        self.assertFalse(silhouette.for_span(SectionSpan(0, 8, row())).contains(2, 2))
+
+    def test_section_points_stay_on_their_own_arm_of_a_tight_bend(self) -> None:
+        # One broad frame accepts both arms. An offset from the first arm
+        # lands exactly on the second, even without a lead. Its nearest path
+        # station belongs to the second span, so the old section must not
+        # deliver there.
+        path = Path(
+            [(0, 64, 0), (1, 64, 0), (2, 64, 0), (2, 64, 1),
+             (2, 64, 2), (1, 64, 2), (0, 64, 2)],
+            [(1, 0, 0)] * 3 + [(0, 0, 1)] * 2 + [(-1, 0, 0)] * 2,
+        )
+        old = CrossSection(PointField((FeatureAnnotation(
+            "old", BlockPos(2, 0, 0), feature(), StepMode.CHEBYSHEV,
+            section="old",
+        ),)))
+        new = CrossSection(PointField((FeatureAnnotation(
+            "new", BlockPos(0, 0, 0), feature(), StepMode.CHEBYSHEV,
+            section="new",
+        ),)))
+        schedule = SectionSchedule((
+            SectionSpan(0, 2, old), SectionSpan(3, 6, new),
+        ), len(path.path_points))
+        frame = PathFrame(
+            0, 0, 6,
+            Boundary.from_direction((-10, 0), (1, 0)),
+            Boundary.from_direction((10, 0), (1, 0)), 64,
+        )
+        silhouette = PathSilhouette(path, 3)
+        runs = deliver_paths(
+            schedule, path, (frame,), SectionOrientation().turns(path),
+            silhouette=silhouette,
+        )
+        self.assertFalse(silhouette.for_span(schedule.spans[0]).contains(1, 2))
+        self.assertTrue(silhouette.for_span(schedule.spans[1]).contains(1, 2))
+        self.assertEqual({run.annotation.name for run in runs}, {"new"})
+
+    def test_incoming_deck_and_edge_own_seam_cell(self) -> None:
+        path = padded_path(
+            [(0, 64, -i) for i in range(8)], [(0, 0, -1)] * 8, 2
+        )
+        carried = PointField((
+            FeatureAnnotation(
+                "deck", BlockPos(0, 0, 2), feature(), StepMode.CHEBYSHEV,
+                section="old",
+            ),
+            FeatureAnnotation(
+                "edge", BlockPos(0, 0, 2), feature(), StepMode.CHEBYSHEV,
+                section="old", clip_to_span=True,
+            ),
+        ))
+        old = CrossSection(carried)
+        incoming = CrossSection(PointField((
+            FeatureAnnotation(
+                "new_deck", BlockPos(0, 0, 2), feature(),
+                StepMode.CHEBYSHEV, section="new",
+            ),
+            FeatureAnnotation(
+                "new_edge", BlockPos(0, 0, 2), feature(),
+                StepMode.CHEBYSHEV, section="new", clip_to_span=True,
+            ),
+        )))
+        boundary = path.first_index + 2
+        schedule = SectionSchedule(
+            [
+                SectionSpan(path.first_index, boundary - 1, old),
+                SectionSpan(boundary, path.last_index, incoming),
+            ],
+            len(path.path_points),
+        )
+        frames = build_section_frames(
+            path, build_frames(path, 64, lead_in=2, lead_out=2),
+            [boundary],
+        )
+        runs = deliver_paths(
+            schedule, path, frames, SectionOrientation().turns(path), 2, 2
+        )
+        positions = {
+            run.annotation.name: {tuple(point.position) for point in run.path}
+            for run in runs
+        }
+        self.assertNotIn((0, 0, -2), positions["deck"])
+        self.assertIn((0, 0, -2), positions["new_deck"])
+        self.assertNotIn((0, 0, -2), positions.get("edge", set()))
+        self.assertIn((0, 0, -2), positions["new_edge"])
 
 
 def feature():
@@ -281,7 +433,9 @@ class AlongTravelTests(unittest.TestCase):
         self.assertEqual(self.laid(False), [(0, 0), (0, -1)])
 
     def test_a_mirrored_layout_steps_the_other_way(self) -> None:
-        self.assertEqual(self.laid(True), [(0, 0), (0, 1)])
+        # Behind the point rather than ahead of it, and still given back in
+        # travel order: the cell behind first.
+        self.assertEqual(self.laid(True), [(0, 1), (0, 0)])
 
     def test_the_mirror_is_carried_on(self) -> None:
         self.assertTrue(all(p.mirrored for p in along_travel(self.run_of(True), (0, 1))))
@@ -300,7 +454,7 @@ class AtTheirOwnLevelTests(unittest.TestCase):
 
     # The deck steps up from x = 2 on, which is where a lane two to the right
     # of travel lands.
-    def level(self, x, z):
+    def level(self, x, z, index):
         return 65 if x >= 2 else 64
 
     def test_a_point_takes_the_level_of_the_column_it_lands_in(self) -> None:

@@ -16,6 +16,7 @@ from .frames import (
     check_padding,
     elevation_breaks,
     elevation_from_frames,
+    level_near,
     span_stations,
 )
 from .orientation import SectionOrientation
@@ -43,6 +44,7 @@ __all__ = [
     "elevation_breaks",
     "extend_ends",
     "elevation_from_frames",
+    "level_near",
     "feature_lateral_span",
     "feature_longitudinal_span",
     "find_crossings",

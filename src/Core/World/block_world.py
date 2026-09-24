@@ -11,6 +11,7 @@ from ..block.registry import BlockRegistry
 from ..block.rotation import mirror_block_state, rotate_block_state
 from ..block.states import BlockState
 from ..constants import (
+    AIR_NAMES,
     DEFAULT_BLOCK,
     DEFAULT_PLACEMENT_MODE,
     DEFAULT_TERRAIN_MASK_MODE,
@@ -24,9 +25,9 @@ if TYPE_CHECKING:
 
 
 PlacementId = int
+_UNSEEN = object()
 TerrainMask = Callable[[BlockPos, TerrainMaskMode], bool]
-# Called with (placing domain, existing domain) before a placement replaces a
-# non-air block. Returning False keeps the existing block.
+# (placing domain, existing domain) -> whether to replace a non-air block.
 PlacementPolicy = Callable[[ConnectivityDomainId, ConnectivityDomainId], bool]
 
 
@@ -40,8 +41,7 @@ class YOffset(Protocol):
 
 @runtime_checkable
 class ColumnMask(Protocol):
-    # World columns a placement may occupy. Cells outside are dropped: never
-    # indexed, never composed, so they are not added to the world at all.
+    # The columns a placement may occupy; cells outside are never added.
     def contains(self, x: float, z: float) -> bool: ...
 
 
@@ -50,10 +50,7 @@ class BlockTransform:
     origin: BlockPos = BlockPos(0, 0, 0)
     quarter_turns: int = 0
     y_offset: YOffset | None = None
-    # A local axis to flip before turning, or None. A reflection is not any
-    # number of turns, so a field that has to come out mirrored cannot get
-    # there by turning; the blocks are mirrored with the positions, since a
-    # stair that keeps facing the way it did is facing out of the mirror.
+    # Local axis ("x" or "z") flipped before turning; block states flip too.
     mirror: str | None = None
 
     def __post_init__(self) -> None:
@@ -63,7 +60,6 @@ class BlockTransform:
             raise ValueError(f"A mirror flips x or z, not {self.mirror!r}")
 
     def _place(self, position: BlockPos) -> BlockPos:
-        # Mirror, rotation and translation: the rigid part of the transform.
         position = BlockPos.coerce(position)
         x, y, z = position
         if self.mirror == "x":
@@ -77,7 +73,7 @@ class BlockTransform:
         placed = self._place(position)
         if self.y_offset is None:
             return placed
-        # Outermost step: the offset is evaluated in world coordinates.
+        # y_offset is applied last, in world coordinates.
         return BlockPos(
             placed.x,
             placed.y + self.y_offset(placed.x, placed.z),
@@ -88,13 +84,11 @@ class BlockTransform:
         position = BlockPos.coerce(position)
         x, y, z = position
         if self.y_offset is not None:
-            # Undone first, while x and z are still world coordinates.
             y -= self.y_offset(x, z)
         x -= self.origin.x
         y -= self.origin.y
         z -= self.origin.z
         x, z = quarter_turn(x, z, -self.quarter_turns)
-        # A mirror is its own inverse, undone last because it was done first.
         if self.mirror == "x":
             x = -x
         elif self.mirror == "z":
@@ -135,13 +129,16 @@ class BlockPlacement:
     order: int
     revision: int = 0
     clip: ColumnMask | None = None
+    surface_mask: Callable[[BlockPos], bool] | None = None
 
     @property
     def offset(self) -> BlockPos:
         return self.transform.origin
 
     def occupies(self, position: BlockPos) -> bool:
-        return self.clip is None or self.clip.contains(position.x, position.z)
+        return (self.clip is None or self.clip.contains(position.x, position.z)) and (
+            self.surface_mask is None or self.surface_mask(position)
+        )
 
     @property
     def bounds(self) -> BlockBounds | None:
@@ -173,7 +170,8 @@ class _OverlayEntry:
 
 
 class BlockWorld:
-    # A mutable virtual composition of reusable block-field placements.
+    # Block fields placed by transform, composed lazily per position, with
+    # connectivity results kept as an overlay.
 
     def __init__(
         self,
@@ -184,6 +182,7 @@ class BlockWorld:
         base_domain: int = 0,
         terrain_mask: TerrainMask | None = None,
         placement_policy: PlacementPolicy | None = None,
+        surface_reference: object | None = None,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -193,11 +192,15 @@ class BlockWorld:
         self.base_domain = base_domain
         self.terrain_mask = terrain_mask
         self.placement_policy = placement_policy
+        self.surface_reference = surface_reference
         self.instances: list[BlockPlacement] = []
         self._placements: dict[PlacementId, BlockPlacement] = {}
-        self._chunks: dict[ChunkPos, set[PlacementId]] = {}
+        self._position_placements: dict[ChunkPos, dict[BlockPos, list[PlacementId]]] = {}
+        self._footprints: dict[PlacementId, tuple[BlockPos, ...]] = {}
+        self._source_snapshot: dict[BlockPos, ConnectivityCell | None] | None = None
         self._overlay: dict[ChunkPos, dict[BlockPos, _OverlayEntry]] = {}
         self._palette_translation: dict[tuple[int, BlockId, int], BlockId] = {}
+        self._air_ids: dict[BlockId, bool] = {}
         self._dirty_changes: dict[BlockPos, CellChange] = {}
         self._dirty_all = False
         self._next_placement_id = 1
@@ -230,6 +233,7 @@ class BlockWorld:
         connectivity_domain: int = 0,
         sequence_index: int | None = None,
         clip: ColumnMask | None = None,
+        surface_mask: Callable[[BlockPos], bool] | None = None,
     ) -> PlacementId:
         if placement_mode == PlacementMode.TERRAIN_MASK and self.terrain_mask is None:
             raise ValueError("TERRAIN_MASK placement requires a terrain_mask callback")
@@ -251,20 +255,30 @@ class BlockWorld:
             sequence_index=sequence_index,
             order=self._next_order,
             clip=clip,
+            surface_mask=surface_mask,
         )
         positions = tuple(self._placement_positions(placement))
-        before = {position: self.source_at(position) for position in positions}
+        before = self._sources(positions)
         self.instances.append(placement)
         self._placements[placement_id] = placement
         self._index_placement(placement, positions)
         self._record_source_changes(before, positions)
         return placement_id
 
+    def refresh_surface_masks(self) -> None:
+        # Re-applies masks that read the designed terrain once it is known.
+        for placement in tuple(self.instances):
+            if (placement.surface_mask is None or
+                    getattr(getattr(placement.surface_mask, "spec", None), "reference", None)
+                    != "designed"):
+                continue
+            self._reindex(placement, lambda: None)
+
     def remove_placement(self, placement_id: PlacementId) -> tuple[CellChange, ...]:
         placement = self._placements[placement_id]
-        positions = tuple(self._placement_positions(placement))
-        before = {position: self.source_at(position) for position in positions}
-        self._unindex_placement(placement, positions)
+        positions = self._footprints[placement_id]
+        before = self._sources(positions)
+        self._unindex_placement(placement)
         self.instances.remove(placement)
         del self._placements[placement_id]
         return self._record_source_changes(before, positions)
@@ -284,16 +298,11 @@ class BlockWorld:
             offset if offset is not None else placement.transform.origin,
             placement.transform.quarter_turns if quarter_turns is None else quarter_turns,
         )
-        old_positions = set(self._placement_positions(placement))
-        before = {position: self.source_at(position) for position in old_positions}
-        self._unindex_placement(placement, old_positions)
-        placement.transform = new_transform
-        placement.revision += 1
-        new_positions = set(self._placement_positions(placement))
-        for position in new_positions - old_positions:
-            before[position] = self.source_at(position)
-        self._index_placement(placement, new_positions)
-        return self._record_source_changes(before, old_positions | new_positions)
+
+        def move() -> None:
+            placement.transform = new_transform
+
+        return self._reindex(placement, move)
 
     def set_placement_domain(
         self,
@@ -303,10 +312,11 @@ class BlockWorld:
         placement = self._placements[placement_id]
         if placement.connectivity_domain == connectivity_domain:
             return ()
-        positions = tuple(self._placement_positions(placement))
-        before = {position: self.source_at(position) for position in positions}
+        positions = self._footprints[placement_id]
+        before = self._sources(positions)
         placement.connectivity_domain = connectivity_domain
         placement.revision += 1
+        self._source_snapshot = None
         return self._record_source_changes(before, positions)
 
     def set_base_domain(self, domain: ConnectivityDomainId) -> None:
@@ -316,8 +326,7 @@ class BlockWorld:
         self.invalidate_connectivity_policy()
 
     def set_placement_policy(self, policy: PlacementPolicy | None) -> None:
-        # Composition is not cached, but dirty tracking and the resolved
-        # overlay are, so a policy with different rules invalidates both.
+        # A policy with different rules invalidates the resolved overlay.
         previous = self.placement_policy
         self.placement_policy = policy
         if _policy_token(previous) != _policy_token(policy):
@@ -325,9 +334,16 @@ class BlockWorld:
 
     def source_at(self, position: BlockPos) -> ConnectivityCell | None:
         position = BlockPos.coerce(position)
+        snapshot = self._source_snapshot
+        if snapshot is not None:
+            cell = snapshot.get(position, _UNSEEN)
+            if cell is not _UNSEEN:
+                return cell
         cell = self._composed_cell(position)
         if cell is None or self._is_air(cell.block_id):
-            return None
+            cell = None
+        if snapshot is not None:
+            snapshot[position] = cell
         return cell
 
     def get_placement(self, placement_id: PlacementId) -> BlockPlacement:
@@ -414,31 +430,20 @@ class BlockWorld:
             del self._overlay[chunk]
 
     def invalidate_connectivity_policy(self) -> None:
+        self._source_snapshot = None
         self._policy_epoch += 1
         self._overlay.clear()
         self._dirty_changes.clear()
         self._dirty_all = True
 
     def iter_source_positions(self) -> Iterator[BlockPos]:
-        for chunk in sorted(self._chunks):
-            positions: set[BlockPos] = set()
-            for placement_id in self._chunks[chunk]:
-                placement = self._placements[placement_id]
-                for position in self._placement_positions(placement):
-                    if self._chunk_for(position) == chunk:
-                        positions.add(position)
-            for position in sorted(positions):
+        for chunk in sorted(self._position_placements):
+            for position in sorted(self._position_placements[chunk]):
                 if self.source_at(position) is not None:
                     yield position
 
     def iter_resolved_chunk(self, chunk: ChunkPos) -> Iterator[tuple[BlockPos, BlockId]]:
-        positions: set[BlockPos] = set()
-        for placement_id in self._chunks.get(chunk, ()):
-            placement = self._placements[placement_id]
-            for position in self._placement_positions(placement):
-                if self._chunk_for(position) == chunk:
-                    positions.add(position)
-        for position in sorted(positions):
+        for position in sorted(self._position_placements.get(chunk, ())):
             cell = self.effective_at(position)
             if cell is not None:
                 yield position, cell.block_id
@@ -449,7 +454,7 @@ class BlockWorld:
     ) -> Iterator[tuple[ChunkPos, dict[BlockPos, BlockId]]]:
         if resolver is not None:
             self.resolve_dirty(resolver)
-        for chunk in sorted(self._chunks):
+        for chunk in sorted(self._position_placements):
             blocks = dict(self.iter_resolved_chunk(chunk))
             if blocks:
                 yield chunk, blocks
@@ -465,7 +470,11 @@ class BlockWorld:
 
     def resolve_dirty(self, resolver: NeighborResolver) -> ResolutionDelta:
         self._prepare_resolver(resolver)
-        changed = resolver.resolve_dirty(self, self.drain_dirty_changes())
+        self._source_snapshot = {}
+        try:
+            changed = resolver.resolve_dirty(self, self.drain_dirty_changes())
+        finally:
+            self._source_snapshot = None
         return ResolutionDelta(frozenset(changed))
 
     def resolve_all(self, resolver: NeighborResolver) -> ResolutionDelta:
@@ -473,7 +482,11 @@ class BlockWorld:
         self._dirty_changes.clear()
         self._dirty_all = False
         self._overlay.clear()
-        changed = resolver.resolve_all(self)
+        self._source_snapshot = {}
+        try:
+            changed = resolver.resolve_all(self)
+        finally:
+            self._source_snapshot = None
         return ResolutionDelta(frozenset(changed))
 
     def _prepare_resolver(self, resolver: NeighborResolver) -> None:
@@ -494,11 +507,11 @@ class BlockWorld:
             placement_id=None,
             sequence_index=None,
         )
-        candidates = (
-            self._placements[placement_id]
-            for placement_id in self._chunks.get(self._chunk_for(position), ())
-        )
-        for placement in sorted(candidates, key=lambda item: item.order):
+        candidates = self._position_placements.get(self._chunk_for(position), {}).get(position, ())
+        if len(candidates) > 1:
+            candidates = sorted(candidates, key=lambda placement_id: self._placements[placement_id].order)
+        for placement_id in candidates:
+            placement = self._placements[placement_id]
             if not placement.occupies(position):
                 continue
             local_position = placement.transform.inverse(position)
@@ -575,7 +588,6 @@ class BlockWorld:
             if placement.field.palette is self.registry.palette
             else self.registry.register(state)
         )
-        # Mirrored first and turned after, the order the positions take.
         turned = self.registry.get_state(world_id)
         if placement.transform.mirror is not None:
             turned = mirror_block_state(
@@ -593,6 +605,23 @@ class BlockWorld:
             world_id = self.registry.get_or_add_variant(world_id, turned)
         self._palette_translation[cache_key] = world_id
         return world_id
+
+    def _sources(self, positions: Iterable[BlockPos]) -> dict[BlockPos, ConnectivityCell | None]:
+        return {position: self.source_at(position) for position in positions}
+
+    def _reindex(
+        self, placement: BlockPlacement, change: Callable[[], None]
+    ) -> tuple[CellChange, ...]:
+        # Re-walks a placement's footprint after `change` alters it.
+        old = set(self._footprints[placement.placement_id])
+        before = self._sources(old)
+        self._unindex_placement(placement)
+        change()
+        placement.revision += 1
+        new = set(self._placement_positions(placement))
+        before.update(self._sources(new - old))
+        self._index_placement(placement, new)
+        return self._record_source_changes(before, old | new)
 
     def _record_source_changes(
         self,
@@ -630,29 +659,31 @@ class BlockWorld:
         placement: BlockPlacement,
         positions: Iterable[BlockPos] | None = None,
     ) -> None:
-        # Callers that already walked the footprint pass it in: re-walking would
-        # evaluate the transform's y_offset a second time for every cell.
         if positions is None:
             positions = self._placement_positions(placement)
-        chunks = {self._chunk_for(position) for position in positions}
-        for chunk in chunks:
-            self._chunks.setdefault(chunk, set()).add(placement.placement_id)
+        footprint = tuple(positions)
+        self._footprints[placement.placement_id] = footprint
+        self._source_snapshot = None
+        for position in footprint:
+            chunk = self._chunk_for(position)
+            occupants = self._position_placements.setdefault(chunk, {}).setdefault(position, [])
+            occupants.append(placement.placement_id)
 
     def _unindex_placement(
         self,
         placement: BlockPlacement,
-        positions: Iterable[BlockPos] | None = None,
     ) -> None:
-        if positions is None:
-            positions = self._placement_positions(placement)
-        chunks = {self._chunk_for(position) for position in positions}
-        for chunk in chunks:
-            placements = self._chunks.get(chunk)
-            if placements is None:
-                continue
-            placements.discard(placement.placement_id)
-            if not placements:
-                del self._chunks[chunk]
+        footprint = self._footprints.pop(placement.placement_id)
+        self._source_snapshot = None
+        for position in footprint:
+            chunk = self._chunk_for(position)
+            cells = self._position_placements[chunk]
+            occupants = cells[position]
+            occupants.remove(placement.placement_id)
+            if not occupants:
+                del cells[position]
+            if not cells:
+                del self._position_placements[chunk]
 
     def _chunk_for(self, position: BlockPos) -> ChunkPos:
         position = BlockPos.coerce(position)
@@ -663,11 +694,10 @@ class BlockWorld:
         )
 
     def _is_air(self, block_id: BlockId) -> bool:
-        return self.registry.get_state(block_id).name in (
-            "minecraft:air",
-            "minecraft:cave_air",
-            "minecraft:void_air",
-        )
+        air = self._air_ids.get(block_id)
+        if air is None:
+            air = self._air_ids[block_id] = self.registry.get_state(block_id).name in AIR_NAMES
+        return air
 
 
 def _policy_token(policy: object) -> object:

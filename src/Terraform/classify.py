@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from enum import Enum
+from functools import cache
 
 from ..Core.block.states import BlockState
+from ..Core.constants import AIR_NAMES
 
 
 class BlockClass(Enum):
@@ -13,7 +15,6 @@ class BlockClass(Enum):
     STRUCTURE = "structure"
 
 
-AIR_NAMES = frozenset({"minecraft:air", "minecraft:cave_air", "minecraft:void_air"})
 FLUID_NAMES = frozenset({"minecraft:water", "minecraft:lava", "minecraft:bubble_column"})
 
 VEGETATION_SUFFIXES = (
@@ -28,6 +29,25 @@ VEGETATION_NAMES = frozenset(
         "sweet_berry_bush", "cocoa", "mushroom_stem", "nether_wart", "seagrass",
         "tall_seagrass", "kelp", "kelp_plant", "hanging_roots", "glow_lichen",
         "dandelion", "poppy", "sunflower", "lilac", "rose_bush", "peony",
+        "allium", "azure_bluet", "blue_orchid", "cornflower",
+        "lily_of_the_valley", "oxeye_daisy", "wither_rose", "torchflower",
+        "red_tulip", "orange_tulip", "white_tulip", "pink_tulip",
+        "open_eyeblossom", "closed_eyeblossom", "wildflowers",
+        "bush", "firefly_bush", "leaf_litter", "short_dry_grass", "tall_dry_grass",
+        "cactus_flower", "pink_petals", "azalea", "flowering_azalea",
+        "big_dripleaf", "big_dripleaf_stem", "small_dripleaf", "spore_blossom",
+        "pitcher_plant", "pale_moss_carpet", "pale_hanging_moss", "sea_pickle",
+        "cave_vines_plant", "pumpkin", "melon", "bee_nest",
+    )
+)
+
+# Growth that is part of a tree, which is cleared whole.
+TREE_SUFFIXES = ("_log", "_wood", "_leaves")
+TREE_NAMES = frozenset(
+    "minecraft:" + each
+    for each in (
+        "vine", "cocoa", "mushroom_stem", "mangrove_roots", "mangrove_propagule",
+        "bee_nest",
     )
 )
 
@@ -48,7 +68,11 @@ GROUND_NAMES = frozenset(
 
 
 def classify(state: BlockState) -> BlockClass:
-    name = state.name
+    return _classify_name(state.name)
+
+
+@cache
+def _classify_name(name: str) -> BlockClass:
     if name in AIR_NAMES:
         return BlockClass.AIR
     if name in FLUID_NAMES:
@@ -68,3 +92,7 @@ def is_ground(state: BlockState) -> bool:
 
 def is_vegetation(state: BlockState) -> bool:
     return classify(state) is BlockClass.VEGETATION
+
+
+def is_tree(state: BlockState) -> bool:
+    return state.name in TREE_NAMES or state.name.endswith(TREE_SUFFIXES)

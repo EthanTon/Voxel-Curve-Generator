@@ -5,16 +5,13 @@ from types import MappingProxyType
 
 from ..modes import StepMode
 
-# Given an annotation's local column (x relative to the origin), the positions
-# it delivers, as blocks forward of where it sits: the first is its own
-# position. The last also sets how far it moves every point beyond it on its
-# side.
+# Local column -> the blocks forward it delivers at, its own position first.
+# The last also sets how far it pushes every column outboard of it.
 StepRule = Callable[[int], tuple[int, ...]]
 
 
 def step_direction(column: int) -> int:
-    # Forward (1) on the left and on the origin's column, backward (-1) on the
-    # right.
+    # Forward on the left and centre, backward on the right.
     return -1 if column > 0 else 1
 
 
@@ -35,9 +32,7 @@ STEP_RULES: Mapping[StepMode, StepRule] = MappingProxyType(
 
 
 def column_pushes(steps: Iterable[tuple[int, tuple[int, ...]]]) -> dict[int, int]:
-    # How far each column moves the points beyond it, from (column, steps)
-    # pairs. Points sharing a column push together, by the largest step among
-    # them, so a column moves the points beyond it once.
+    # Each column's push: its largest last step, from (column, steps) pairs.
     pushes: dict[int, int] = {}
     for column, offsets in steps:
         push = offsets[-1]
@@ -47,13 +42,8 @@ def column_pushes(steps: Iterable[tuple[int, tuple[int, ...]]]) -> dict[int, int
 
 
 def lead(column: int, pushes: Mapping[int, int]) -> int:
-    # How far a point at `column` is moved by the columns between it and the
-    # origin on its side.
-    #
-    # Everything beyond a stepping column moves with it, whether it steps
-    # itself or not. That is what makes the row a staircase rather than a
-    # straight line with two bumps in it: the stepping column is the corner
-    # joining the segment inboard of it to the segment outboard.
+    # The total push from the columns inboard of `column` on its side, which
+    # turns a row with stepping columns into a staircase.
     return sum(
         push
         for pushing, push in pushes.items()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tomllib
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from ..Core.coordinates import BlockPos, ColumnPos
 
@@ -9,6 +11,29 @@ def require(data: Mapping, key: str):
     if key not in data:
         raise ValueError(f"missing required key {key!r}")
     return data[key]
+
+
+def read_toml(path: Path, kind: str) -> Mapping:
+    if not path.exists():
+        raise ValueError(f"no {kind} file at {path}")
+    return tomllib.loads(path.read_text())
+
+
+def listed_entries(
+    data: Mapping, file_key: str, entry_key: str, kind: str, base: Path
+) -> tuple[Sequence[Mapping], Path]:
+    # `entry_key` tables from the build, or from the file `file_key` names,
+    # with the directory their paths are relative to.
+    named = data.get(file_key)
+    entries = data.get(entry_key, ())
+    if named is not None and entries:
+        raise ValueError(
+            f"{kind} are listed in the build or in a file of their own, not both"
+        )
+    if named is None:
+        return entries, base
+    listing = base / named
+    return read_toml(listing, kind).get(entry_key, ()), listing.parent
 
 
 def read_enum(enum, value, default=None):

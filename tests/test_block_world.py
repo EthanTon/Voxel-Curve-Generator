@@ -83,6 +83,20 @@ class BlockWorldTests(unittest.TestCase):
 
         self.assertEqual(world.source_at((0, 0, 0)).block_id, stone)
 
+    def test_moving_an_older_placement_under_a_newer_one_keeps_build_order(self) -> None:
+        stone = self.registry.register(BlockState.create("minecraft:stone"))
+        dirt = self.registry.register(BlockState.create("minecraft:dirt"))
+        world = BlockWorld(self.registry)
+        lower = world.add_field(self.field_with_id(stone))
+        upper = world.add_field(self.field_with_id(dirt), (1, 0, 0))
+
+        world.move_placement(lower, (1, 0, 0))
+        self.assertEqual(world.source_at((1, 0, 0)).block_id, dirt)
+        self.assertEqual(list(world.iter_source_positions()), [(1, 0, 0)])
+
+        world.remove_placement(upper)
+        self.assertEqual(world.source_at((1, 0, 0)).block_id, stone)
+
     def test_keep_existing_does_not_replace_a_lower_block(self) -> None:
         stone = self.registry.register(BlockState.create("minecraft:stone"))
         dirt = self.registry.register(BlockState.create("minecraft:dirt"))

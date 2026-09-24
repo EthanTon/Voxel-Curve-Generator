@@ -10,7 +10,7 @@ import numpy as np
 from ..Core.Field.block_field import BlockField
 from ..Core.block.states import BlockState
 from ..Core.coordinates import BlockPos
-from .classify import BlockClass, classify
+from .classify import BlockClass, classify, is_tree
 from .grid import Field, Grid
 
 
@@ -78,6 +78,10 @@ class Survey:
     state: Mapping[tuple[int, int], BlockState]
     growth: frozenset[BlockPos]
     intruding: frozenset[BlockPos]
+    # The growth that is part of trees.
+    trees: frozenset[BlockPos] = frozenset()
+    water: Field | None = None
+    structures: Field | None = None
 
 
 def survey(
@@ -87,9 +91,12 @@ def survey(
     growth: bool = True,
 ) -> Survey:
     height = grid.filled(ABSENT, dtype=np.int32)
+    water = grid.filled(ABSENT, dtype=np.int32)
+    structures = grid.filled(False, dtype=bool)
     available = grid.filled(False, dtype=bool)
     states: dict[tuple[int, int], BlockState] = {}
     standing: set[BlockPos] = set()
+    trees: set[BlockPos] = set()
     inside: set[BlockPos] = set()
     chunks: dict[tuple[int, int], bool] = {}
     for row, cell, column in grid.by_chunk(CHUNK):
@@ -100,20 +107,29 @@ def survey(
             continue
         available[row, cell] = True
         found = False
+        highest_structure = ABSENT
         for y, state in reversed(terrain.column(column.x, column.z)):
             kind = classify(state)
+            if kind is BlockClass.STRUCTURE:
+                highest_structure = max(highest_structure, y)
+            if state.name in ("minecraft:water", "minecraft:bubble_column"):
+                water[row, cell] = max(water[row, cell], y)
             if kind is BlockClass.VEGETATION:
                 if growth:
                     standing.add(BlockPos(column.x, y, column.z))
+                    if is_tree(state):
+                        trees.add(BlockPos(column.x, y, column.z))
                 continue
-            if kind in SOLID and intrudes is not None and intrudes(row, cell, y):
+            if kind in (*SOLID, BlockClass.FLUID) and intrudes is not None and intrudes(row, cell, y):
                 inside.add(BlockPos(column.x, y, column.z))
             if kind is BlockClass.GROUND and not found:
                 height[row, cell] = y
                 states[(row, cell)] = state
                 found = True
+        structures[row, cell] = found and highest_structure >= height[row, cell]
     return Survey(
-        height, available, states, frozenset(standing), frozenset(inside)
+        height, available, states, frozenset(standing), frozenset(inside),
+        frozenset(trees), water, structures,
     )
 
 
@@ -127,13 +143,6 @@ def load_terrain(source: Path | str | None) -> Terrain:
         from .region import RegionTerrain
 
         return RegionTerrain(region_directory(source))
-    from ..Format.schematics import load_schematic
-    from ..Core.block.palette import BlockPalette
-    from ..Format.region import AIR
+    from ..Format.schematics import load_blocks
 
-    region, _ = load_schematic(source)
-    blocks = BlockField(BlockPalette())
-    for position, state in region.iter_occupied():
-        if state != AIR:
-            blocks.set_block(position, state)
-    return FieldTerrain(blocks)
+    return FieldTerrain(load_blocks(source))

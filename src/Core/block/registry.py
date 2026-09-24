@@ -51,7 +51,6 @@ class BlockRegistry:
         state: BlockState,
         info: BlockInfo | None = None,
     ) -> BlockId:
-
         if info is None:
             info = (
                 self._info_provider(state)
@@ -63,13 +62,13 @@ class BlockRegistry:
         return block_id
 
     def set_info(self, block_id: BlockId, info: BlockInfo) -> None:
-
         self._palette.get_state(block_id)
         self._sync()
         self._info[block_id] = info
 
     def get_info(self, block_id: BlockId) -> BlockInfo:
-
+        if 0 <= block_id < len(self._info):
+            return self._info[block_id]
         self._palette.get_state(block_id)
         self._sync()
         return self._info[block_id]
@@ -88,7 +87,6 @@ class BlockRegistry:
         source_id: BlockId,
         state: BlockState,
     ) -> BlockId:
-
         source_info = self.get_info(source_id)
         source_state = self.get_state(source_id)
         try:
@@ -105,10 +103,7 @@ class BlockRegistry:
         return len(self._palette)
 
     def _sync(self) -> None:
-        # Blocks reach a palette without being registered -- a field writes
-        # straight into it -- so the provider is asked for anything that
-        # turned up that way. Without this a rail read out of a schematic is
-        # an anonymous block, and nothing it should connect to knows it.
+        # Fields add states to the palette directly; give those their info.
         for block_id in range(len(self._info), len(self._palette)):
             self._info.append(self._provided(self._palette.get_state(block_id)))
 
@@ -118,6 +113,4 @@ class BlockRegistry:
         try:
             return self._info_provider(state)
         except KeyError:
-            # A block the catalog has never heard of is whatever the default
-            # says it is, rather than a failure to build at all.
             return self._default_info

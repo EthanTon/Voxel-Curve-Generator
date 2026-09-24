@@ -12,7 +12,6 @@ def resolve(
     *,
     everything: bool = False,
 ) -> ResolutionDelta:
-    # Connectivity, once every feature is in. Per stamp would resolve each
-    # feature against a world the rest had not reached yet.
+    # Run once every feature is placed.
     resolver = domains.resolver(registry)
     return world.resolve_all(resolver) if everything else world.resolve_dirty(resolver)

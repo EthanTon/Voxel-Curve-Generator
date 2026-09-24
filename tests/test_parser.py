@@ -23,6 +23,24 @@ def config(**overrides) -> dict:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_a_section_can_assign_separate_edge_domains(self) -> None:
+        data = config(
+            marker={"start": [0, 0], "end": [2, 0]},
+            section=[{
+                "name": "deck", "domain": "rail", "schematic": "deck.schem",
+                "edge_domains": ["left_edge", "right_edge"],
+                "edge_from": 5,
+            }],
+            assignment=[{"from": "start", "to": "end", "sections": ["deck"]}],
+        )
+        data["domain"].extend([{"name": "left_edge"}, {"name": "right_edge"}])
+
+        self.assertEqual(
+            parse(data).section("deck").edge_domains,
+            ("left_edge", "right_edge"),
+        )
+        self.assertEqual(parse(data).section("deck").edge_from, 5)
+
     def test_a_config_becomes_a_spec(self) -> None:
         spec = parse(config())
 
@@ -44,6 +62,37 @@ class ConfigTests(unittest.TestCase):
         spec = parse(data, Path("builds/curve"))
 
         self.assertEqual(spec.output.path, Path("/tmp/out.litematic"))
+
+    def test_output_modes_are_read_and_validated(self) -> None:
+        for mode in ("absolute", "relative"):
+            with self.subTest(mode=mode):
+                data = config(output={"path": "out.schem", "mode": mode})
+                self.assertEqual(parse(data).output.mode, mode)
+
+        data = config(output={"path": "out.schem", "mode": "nearby"})
+        with self.assertRaisesRegex(ValueError, "absolute.*relative"):
+            parse(data)
+
+    def test_a_split_output_goes_beside_the_output_named_after_it(self) -> None:
+        data = config(output={
+            "path": "out/build.schem", "split": {"max_span": 64, "terrain": True},
+        })
+
+        split = parse(data, Path("builds/curve")).output.split
+
+        self.assertEqual(split.directory, Path("builds/curve/out/build"))
+        self.assertEqual(
+            (split.max_span, split.max_blocks, split.terrain), (64, 4_000_000, True)
+        )
+
+    def test_an_output_is_not_split_unless_asked(self) -> None:
+        self.assertIsNone(parse(config()).output.split)
+
+    def test_a_split_needs_a_positive_budget(self) -> None:
+        data = config(output={"path": "out.schem", "split": {"max_span": 0}})
+
+        with self.assertRaisesRegex(ValueError, "positive"):
+            parse(data)
 
     def test_a_path_lays_the_join_close_to_the_diagonal_by_default(self) -> None:
         self.assertEqual(parse(config()).path.diagonal_degrees, 2.0)
@@ -235,6 +284,21 @@ class DomainTests(unittest.TestCase):
         )
 
         self.assertEqual(len(spec.domain("rail").connectivity.overrides), 1)
+
+    def test_an_override_can_select_an_exact_edge_neighbor(self) -> None:
+        spec = self.domained({
+            "name": "wall",
+            "connectivity": {"override": [{
+                "source_blocks": ["minecraft:cobblestone_wall"],
+                "neighbor_behaviors": ["fence"],
+                "directions": ["east"],
+                "max_distance": "sqrt2",
+                "offsets": [[1, 0, -1]],
+            }]},
+        })
+        override = spec.domain("wall").connectivity.overrides[0]
+        self.assertEqual(override.max_distance, 2 ** 0.5)
+        self.assertEqual(override.offsets, frozenset({(1, 0, -1)}))
 
     def test_an_override_may_not_scope_itself(self) -> None:
         # Where it is declared is what scopes it.

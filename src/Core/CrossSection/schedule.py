@@ -9,8 +9,7 @@ from .cross_section import CrossSection
 
 @dataclass(frozen=True, slots=True)
 class SectionSpan:
-    # The section delivered at every path point from path_start through
-    # path_stop, inclusive, the same as PathFrame.
+    # A section over path points path_start..path_stop inclusive.
     path_start: int
     path_stop: int
     section: CrossSection
@@ -28,8 +27,7 @@ class SectionSpan:
 
 
 class SectionSchedule:
-    # Section spans along a path. Spans may leave gaps, where nothing is
-    # delivered, but may not overlap.
+    # Non-overlapping section spans along a path; gaps deliver nothing.
 
     def __init__(self, spans: Iterable[SectionSpan], path_length: int) -> None:
         self._spans = tuple(sorted(spans, key=lambda span: span.path_start))
@@ -51,7 +49,6 @@ class SectionSchedule:
         return self._spans
 
     def at(self, path_index: int) -> CrossSection | None:
-        # Random access, for previews and tests.
         i = bisect_right(self._starts, path_index) - 1
         if i >= 0 and self._spans[i].contains(path_index):
             return self._spans[i].section
