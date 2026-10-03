@@ -48,6 +48,7 @@ from .structure import (
 )
 from .wires import WIRE_LINES, dependent_strand, lay_wire, line_strand, strand_of
 from .dependencies import build_feature_paths, dependent_intervals
+from .progress import Progress, report
 
 
 # How many path points from its own a fitting may land in a frame of: past
@@ -65,7 +66,9 @@ def assemble(spec: BuildSpec) -> BlockWorld:
     return build(spec).world
 
 
-def build(spec: BuildSpec) -> Built:
+def build(spec: BuildSpec, *, progress: Progress | None = None) -> Built:
+    """Build without UI; optionally report progress within each assembly stage."""
+    report(progress, "Preparing build", 0)
     registry = BlockRegistry.for_vanilla_26_2()
     domains = build_domains(spec)
     masked = _surface_masks(spec)
@@ -85,7 +88,9 @@ def build(spec: BuildSpec) -> Built:
     surface = SurfaceReference(load_terrain(surface_world, surface_dimension)) if masked else None
     world = BlockWorld(registry, surface_reference=surface)
     domains.bind(world)
+    report(progress, "Preparing build", 1)
 
+    report(progress, "Preparing path", 0)
     path = build_path(spec)
     spans = resolve_spans(spec, path)
     sections = build_sections(spec, registry, domains, spans)
@@ -93,24 +98,33 @@ def build(spec: BuildSpec) -> Built:
     frames = build_path_frames(spec, schedules, path)
     silhouette = PathSilhouette.for_sections(path, sections.values(), frames)
     clip = silhouette.clip
+    report(progress, "Preparing path", 1)
 
+    report(progress, "Preparing placements", 0)
     runs = sweep(spec, schedules, path, frames, silhouette)
     fittings: dict[str, list[BlockPos]] = {}
     fitting_ids: dict[str, list[int]] = {}
-    for laying in in_build_order(
+    layings = in_build_order(
         spec, all_layings(
             spec, runs, sections, world, registry, domains, frames, clip,
             schedules, silhouette,
         )
-    ):
+    )
+    report(progress, "Preparing placements", 1)
+    report(progress, "Placing features", 0, len(layings))
+    for number, laying in enumerate(layings, 1):
         placed = laying.lay()
         if laying.fitting:
             fitting_ids.setdefault(laying.fitting, []).extend(placed or ())
             fittings.setdefault(laying.fitting, []).extend(
                 feet_of(world, placed or ())
             )
+        report(progress, "Placing features", number, len(layings))
+    report(progress, "Supporting rail joints", 0)
     support_rail_joints(world, {domains.profile(section.domain).domain_id
                                 for section in spec.sections})
+    report(progress, "Supporting rail joints", 1)
+    report(progress, "Shaping terrain", 0)
     designed_masks = surface is not None and designed
     if designed_masks:
         # Features masked by the designed surface and the earthworks depend
@@ -144,7 +158,10 @@ def build(spec: BuildSpec) -> Built:
     if designed_masks and shaped is not None:
         surface.update(shaped)
         world.refresh_surface_masks()
+    report(progress, "Shaping terrain", 1)
+    report(progress, "Resolving blocks", 0)
     resolve(world, registry, domains)
+    report(progress, "Resolving blocks", 1)
     return Built(world, shaped)
 
 

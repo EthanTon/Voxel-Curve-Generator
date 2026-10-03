@@ -11,6 +11,7 @@ from functools import cache
 from pathlib import Path as FilePath
 
 import numpy as np
+import tomli_w
 
 from ..Core.World.block_world import BlockWorld
 from ..Core.block.palette import BlockPalette
@@ -25,12 +26,15 @@ from ..Terraform import Terraforming
 from ..Terraform.clearance import OPEN
 from ..Terraform.region import WorldBlocks
 from ..Terraform.terrain import region_directory
+from .progress import Progress, report
 
 WATER = BlockState.create("minecraft:water")
 
 
 @dataclass(frozen=True, slots=True)
 class Piece:
+    """A written piece with native Python integers in coordinates and counts."""
+
     name: str
     path: FilePath
     origin: BlockPos
@@ -39,15 +43,37 @@ class Piece:
     cleared: int
     copied: int
 
+    def __post_init__(self) -> None:
+        # Normalize at the export boundary; internal arrays stay in NumPy.
+        for name in ("origin", "size"):
+            object.__setattr__(self, name, _native_position(getattr(self, name)))
+        for name in ("placed", "cleared", "copied"):
+            object.__setattr__(self, name, int(getattr(self, name)))
+
+
+def _native_position(position: BlockPos) -> BlockPos:
+    return BlockPos(*(int(value) for value in position))
+
+
+@dataclass(frozen=True, slots=True)
+class Written:
+    """Absolute paths to the primary output and every file produced by this export."""
+
+    primary: FilePath
+    outputs: tuple[FilePath, ...]
+
 
 def write_pieces(
     world: BlockWorld,
     spec: BuildSpec,
     terraforming: Terraforming | None,
+    *,
+    progress: Progress | None = None,
 ) -> list[Piece]:
     split = spec.output.split
     if split is None:
         return []
+    report(progress, "Preparing pieces", 0)
     ground = split.terrain and terraforming is not None and spec.terraform is not None
     if split.terrain and not ground:
         raise ValueError(
@@ -72,7 +98,7 @@ def write_pieces(
         }
         for x, z in sorted(chunks):
             _require_chunk(source, x, z)
-    directory = FilePath(split.directory)
+    directory = FilePath(split.directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     # Remove the previous run's pieces so none are left over, numbered
     # plainly or, as they once were, to three places.
@@ -82,6 +108,8 @@ def write_pieces(
             stale.unlink()
     first = BlockPos.coerce(spec.path.points[0])
     pieces: list[Piece] = []
+    report(progress, "Preparing pieces", 1)
+    report(progress, "Writing pieces", 0, len(boxes))
     for number, (low, high) in enumerate(boxes):
         name = f"{spec.output.name}_{number}"
         region, placed, cleared, copied = _build_piece(
@@ -98,7 +126,10 @@ def write_pieces(
             metadata={"Part": str(number), "Of": spec.output.name},
         )
         pieces.append(Piece(name, path, region.origin, region.size, placed, cleared, copied))
+        report(progress, "Writing pieces", number + 1, len(boxes))
+    report(progress, "Writing placement manifest", 0)
     _manifest(directory / f"{spec.output.name}.toml", spec, pieces, source is not None)
+    report(progress, "Writing placement manifest", 1)
     return pieces
 
 
@@ -233,7 +264,7 @@ def _boxes(positions: np.ndarray, span: int, budget: int):
     for group in np.split(sorted_positions, breaks):
         low, high = group.min(axis=0), group.max(axis=0)
         width, depth = high[0] - low[0] + 1, high[2] - low[2] + 1
-        layers = max(1, budget // max(1, width * depth))
+        layers = max(1, int(budget // max(1, width * depth)))
         for bottom in range(int(low[1]), int(high[1]) + 1, layers):
             top = min(int(high[1]), bottom + layers - 1)
             yield (
@@ -243,6 +274,7 @@ def _boxes(positions: np.ndarray, span: int, budget: int):
 
 
 def _build_piece(name, low, high, states, positions, codes, soft, source, terraforming):
+    low, high = _native_position(low), _native_position(high)
     size = high - low + (1, 1, 1)
     palette = BlockPalette()
     region = BlockRegion(name, low, size, palette)
@@ -330,7 +362,7 @@ def _clearance_box(terraforming: Terraforming, low: BlockPos, size: BlockPos):
 
 
 def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool) -> None:
-    first = BlockPos.coerce(spec.path.points[0])
+    first = _native_position(BlockPos.coerce(spec.path.points[0]))
     how = (
         "Each piece is the world as the build leaves it: paste it as it is, air\n"
         "# and all -- //schem load <file>, then //paste -o -- and it changes what the\n"
@@ -344,7 +376,7 @@ def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool
         f"# {how}",
         f"# Coordinates are absolute; the paste origin is the first path point {list(first.as_tuple())}.",
         "",
-        f'name = "{spec.output.name}"',
+        tomli_w.dumps({"name": spec.output.name}).rstrip(),
         f"terrain = {'true' if ground else 'false'}",
         f"data_version = {spec.output.data_version}",
         f"paste_origin = {list(first.as_tuple())}",
@@ -357,28 +389,51 @@ def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool
         lines += [
             "",
             "[[piece]]",
-            f'file = "{piece.path.name}"',
+            tomli_w.dumps({"file": str(piece.path.resolve())}).rstrip(),
             f"origin = {list(piece.origin.as_tuple())}",
             f"size = {list(piece.size.as_tuple())}",
             f"placed = {piece.placed}",
             f"cleared = {piece.cleared}",
             f"copied = {piece.copied}",
         ]
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write(
-    world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None
+    world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None,
+    *, progress: Progress | None = None,
 ) -> FilePath:
+    """Write a build, returning the absolute path to its primary output."""
+    return write_outputs(world, spec, terraforming, progress=progress).primary
+
+
+def write_outputs(
+    world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None,
+    *, progress: Progress | None = None,
+) -> Written:
+    """Write once and collect actual output paths, without scanning directories."""
     # The output suffix picks .schem or .litematic; a split writes pieces,
     # with the full combined file optional for large terrain corridors.
-    if spec.output.split is not None:
-        write_pieces(world, spec, terraforming)
     split = spec.output.split
+    outputs: list[FilePath] = []
+    if split is not None:
+        pieces = write_pieces(world, spec, terraforming, progress=progress)
+        outputs.extend(piece.path for piece in pieces)
+        outputs.append(FilePath(split.directory).resolve() / f"{spec.output.name}.toml")
     if split is not None and not split.combined:
         # Do not leave a previous build's combined file looking current.
         spec.output.path.unlink(missing_ok=True)
-        return FilePath(split.directory) / f"{spec.output.name}.toml"
+        return Written(outputs[-1], tuple(outputs))
+    report(progress, "Writing combined output", 0)
+    primary = _write_combined(world, spec, terraforming).resolve()
+    report(progress, "Writing combined output", 1)
+    return Written(primary, (primary, *outputs))
+
+
+def _write_combined(
+    world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None,
+) -> FilePath:
+    split = spec.output.split
     if split is not None and split.terrain and terraforming is not None:
         states, positions, codes, soft = _changed_cells(
             world, terraforming, waterlog=bool(spec.terraform and spec.terraform.waterlog),
