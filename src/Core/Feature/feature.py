@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from ..Field.block_field import BlockField
@@ -9,6 +10,7 @@ from ..coordinates import BlockPos
 from ..block.states import BlockState
 from ..Domain import Domain
 from ...Terraform.surface_mask import SurfaceMaskSpec
+from .dependent_path import DependentFeaturePath, PathRuns
 
 
 @runtime_checkable
@@ -57,8 +59,21 @@ def feature_class(cls: type) -> type:
 
 @feature_class
 class PointFeature:
-    # Blocks stamped at each point of its path.
+    # Blocks stamped at each point of its path. The earthworks may cover
+    # those named in `yielding`.
     surface_mask: SurfaceMaskSpec | None = None
+    yielding: frozenset[str] = frozenset()
+    surface_mask_min_y: int | None = None
+
+
+@feature_class
+class DependentFeature:
+    # A point feature whose placement path is derived from other features.
+    dependency: DependentFeaturePath = field(kw_only=True)
+    surface_mask: SurfaceMaskSpec | None = None
+
+    def paths(self, available: Mapping[str, PathRuns]) -> PathRuns:
+        return self.dependency.derive(available)
 
 
 @feature_class

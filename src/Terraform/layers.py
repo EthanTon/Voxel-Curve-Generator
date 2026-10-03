@@ -10,6 +10,7 @@ import numpy as np
 from . import kernels
 from .grid import Field, Grid
 from .surface_mask import SurfaceMaskSpec
+from .terrain import ABSENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,28 +53,84 @@ def _pad(
     return background + weight * (_base(ground, from_crest) - background)
 
 
+# The steepest a smootherstep gets, per unit of its height over its width.
+EASED_PEAK = 1.875
+# The blur of the ground a slope measures its height from.
+GAP_BLUR = 3.0
+
+
+def smootherstep(t: Field) -> Field:
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+
+
 @dataclass(frozen=True, slots=True)
 class Slope:
+    # The ground eased from the track's level out to its own over a width
+    # that keeps the steepest part at `ratio` blocks across per block up:
+    # level across the shoulder, then flat at both the top and the foot of
+    # the slope, as a smooth curve rather than a straight run. `rising`
+    # slopes cut, the others fill; the layer's blend keeps each to its side.
     ratio: float
     rising: bool = False
     from_crest: bool = False
     height_response: float = 0.0
     terrain_response: float = 0.0
     max_ratio: float = 4.5
+    shoulder: float = 0.0
+    reach: float = 0.0
+    linear: bool = False
+    natural: bool = False
 
     def __call__(self, ground: Ground, accumulated: Field) -> Field:
+        base = _base(ground, self.from_crest)
         ratio = max(self.ratio, 1e-6)
+        if self.linear:
+            rise = np.maximum(ground.distance - self.shoulder, 0.0) / ratio
+            return base + (rise if self.rising else -rise)
         if not self.rising and (self.height_response or self.terrain_response):
             # Taller fills and rougher ground get gentler slopes.
-            height = np.maximum(_base(ground, self.from_crest) - ground.natural, 0.0)
+            height = np.maximum(base - ground.natural, 0.0)
             texture = _texture(ground.natural)
             ratio = np.clip(
                 ratio * (1.0 + self.height_response * height
                          + self.terrain_response * texture),
                 self.ratio, max(self.ratio, self.max_ratio),
             )
-        step = ground.distance / ratio
-        return _base(ground, self.from_crest) + (step if self.rising else -step)
+        settled = kernels.gaussian(accumulated, GAP_BLUR)
+        gap = np.abs(base - settled)
+        displacement = None
+        if self.natural:
+            from .distance import nearest
+            # A control outline carries how much the local land moves,
+            # rather than dragging every distant height toward track Y.
+            # Use the actual shoulder contact; high native ridges and low
+            # hollows outside it then retain their relative elevations.
+            contacts = (ground.distance <= self.shoulder) & (ground.natural > ABSENT)
+            if contacts.any():
+                source = nearest(contacts, (base - accumulated,),
+                                 self.reach + 1 if self.reach > 0 else max(accumulated.shape))
+                displacement = source[0]
+                gap = np.abs(displacement)
+        width = np.maximum(EASED_PEAK * ratio * gap, 1.0)
+        if self.reach > 0:
+            width = np.minimum(width, max(self.reach - self.shoulder, 1.0))
+        if self.natural:
+            # Vary whole banks, rather than sprinkling single-block noise
+            # over identical terraces. World coordinates keep contours
+            # continuous when a section or export piece changes.
+            scale = max(self.reach / 3.0, 4.0)
+            contours = _noise(ground.grid, scale, 0)
+            width *= np.clip(0.85 + 0.15 * contours, 0.55, 1.0)
+        eased = 1.0 - smootherstep((ground.distance - self.shoulder) / width)
+        if displacement is not None:
+            return np.where(ground.distance <= self.shoulder, base,
+                            accumulated + eased * displacement)
+        # The ground's own bumps fade out faster than the ground does, so the
+        # slope is a clean curve that still meets the ground bump for bump.
+        detail = 1.0 if self.natural else (1.0 - eased)
+        ground_under = settled + detail * (accumulated - settled)
+        return eased * base + (1.0 - eased) * ground_under
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +223,7 @@ class Filter(Protocol):
     def __call__(self, relief: Field, ground: Ground) -> Field: ...
 
 
-KERNELS = ("gaussian", "average", "both")
+KERNELS = ("gaussian", "average", "both", "wendland")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +236,8 @@ class Smooth:
     kernel: str = field(default="gaussian", kw_only=True)
 
     def blur(self, values: Field, size: float, edge: str) -> Field:
+        if self.kernel == "wendland":
+            return kernels.wendland(values, 3 * size, edge)
         if self.kernel != "average":
             values = kernels.gaussian(values, size, edge)
         if self.kernel != "gaussian":

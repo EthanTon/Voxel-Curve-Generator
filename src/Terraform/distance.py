@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from math import ceil
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from .grid import Field
 
@@ -31,27 +32,54 @@ class Nearest:
 
 
 def nearest(seeds: Field, carried: Sequence[Field], reach: float) -> Nearest:
-    distance = np.where(seeds, 0.0, np.inf)
+    # Each column's offset to its nearest seed, handed on from neighbour to
+    # neighbour and compared by its true length, so distances are Euclidean
+    # and contours round rather than octagonal. `carried` fields come along
+    # from the same seed.
+    if seeds.size >= 262144:
+        if not seeds.any():
+            return Nearest(np.full(seeds.shape, reach),
+                           tuple(np.zeros(seeds.shape) for _ in carried))
+        if carried:
+            distance, indices = distance_transform_edt(~seeds, return_indices=True)
+            fields = tuple(np.where(distance <= reach + 1.5, each[tuple(indices)], 0)
+                           .astype(np.float64) for each in carried)
+        else:
+            distance = distance_transform_edt(~seeds)
+            fields = ()
+        return Nearest(np.minimum(distance, reach), fields)
+    far = 1e9
+    along_rows = np.where(seeds, 0.0, far)
+    along_cells = np.where(seeds, 0.0, far)
+    squared = np.where(seeds, 0.0, np.inf)
     fields = [np.where(seeds, each, 0).astype(np.float64) for each in carried]
-    candidate = np.empty_like(distance)
-    shifted_field = np.empty_like(distance)
-    closer = np.empty(distance.shape, dtype=bool)
-    for _ in range(ceil(reach) + 1):
+    limit = (reach + 1.5) ** 2
+    rows_in = np.empty_like(squared)
+    cells_in = np.empty_like(squared)
+    shifted_field = np.empty_like(squared)
+    closer = np.empty(squared.shape, dtype=bool)
+    for _ in range(2 * ceil(reach) + 2):
         settled = True
-        for rows, cells, cost in STEPS:
-            _shift_into(distance, rows, cells, np.inf, candidate)
-            np.add(candidate, cost, out=candidate)
-            np.less(candidate, distance, out=closer)
+        for rows, cells, _ in STEPS:
+            _shift_into(along_rows, rows, cells, far, rows_in)
+            _shift_into(along_cells, rows, cells, far, cells_in)
+            rows_in -= rows
+            cells_in -= cells
+            candidate = rows_in * rows_in + cells_in * cells_in
+            np.less(candidate, squared, out=closer)
+            closer &= candidate <= limit
             if not closer.any():
                 continue
-            np.copyto(distance, candidate, where=closer)
+            np.copyto(squared, candidate, where=closer)
+            np.copyto(along_rows, rows_in, where=closer)
+            np.copyto(along_cells, cells_in, where=closer)
             for each in fields:
                 _shift_into(each, rows, cells, 0.0, shifted_field)
                 np.copyto(each, shifted_field, where=closer)
             settled = False
         if settled:
             break
-    return Nearest(np.minimum(distance, reach), tuple(fields))
+    return Nearest(np.minimum(np.sqrt(squared), reach), tuple(fields))
 
 
 def nearest_euclidean(

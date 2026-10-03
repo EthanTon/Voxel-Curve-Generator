@@ -73,7 +73,13 @@ def read_split(data: Mapping | None, path: Path) -> SplitSpec | None:
         max_blocks=data.get("max_blocks", 4_000_000),
         max_span=data.get("max_span", 128),
         terrain=data.get("terrain", False),
+        terrain_depth=data.get("terrain_depth", 16),
+        combined=data.get("combined", True),
     )
     if split.max_blocks <= 0 or split.max_span <= 0:
         raise ValueError("a split needs a positive max_blocks and max_span")
+    if type(split.terrain_depth) is not int or split.terrain_depth < 0:
+        raise ValueError("split.terrain_depth must be a nonnegative integer")
+    if type(split.combined) is not bool:
+        raise ValueError("split.combined must be true or false")
     return split

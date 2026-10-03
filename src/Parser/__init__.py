@@ -7,12 +7,14 @@ from pathlib import Path
 from .assignments import read_assignments
 from .domains import read_domain, read_interaction
 from .fittings import read_lane, read_structure, read_wire
+from .feature_paths import check_feature_paths, read_feature_path
 from .paths import read_markers, read_output, read_path
 from .sections import read_sections
 from .spec import (
     AssignmentSpec,
     BuildSpec,
     DomainSpec,
+    FeaturePathSpec,
     InteractionSpec,
     LaneSpec,
     Measure,
@@ -22,6 +24,7 @@ from .spec import (
     SectionElevation,
     SectionSpec,
     SpanSpec,
+    StationSpanSpec,
     StructureSpec,
     WireGeometry,
     WireSpec,
@@ -33,6 +36,7 @@ __all__ = [
     "AssignmentSpec",
     "BuildSpec",
     "DomainSpec",
+    "FeaturePathSpec",
     "InteractionSpec",
     "LaneSpec",
     "Measure",
@@ -42,6 +46,7 @@ __all__ = [
     "SectionElevation",
     "SectionSpec",
     "SpanSpec",
+    "StationSpanSpec",
     "StructureSpec",
     "WireGeometry",
     "WireSpec",
@@ -57,6 +62,8 @@ def load(path: Path | str) -> BuildSpec:
 
 def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
     markers = read_markers(data.get("marker", {}))
+    feature_paths = tuple(read_feature_path(each) for each in data.get("feature_path", ()))
+    named_paths = frozenset(each.name for each in feature_paths)
     spec = BuildSpec(
         output=read_output(require(data, "output"), base),
         path=read_path(require(data, "path"), base),
@@ -68,12 +75,14 @@ def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
             read_interaction(each) for each in data.get("interaction", ())
         ),
         structures=tuple(
-            read_structure(each, base) for each in data.get("structure", ())
+            read_structure(each, base, named_paths) for each in data.get("structure", ())
         ),
         wires=tuple(read_wire(each, base) for each in data.get("wire", ())),
         lanes=tuple(read_lane(each, base) for each in data.get("lane", ())),
+        feature_paths=feature_paths,
         terraform=read_terraform(data, base),
         surface_world=read_surface_world(data.get("surface"), base),
+        surface_dimension=read_surface_dimension(data.get("surface")),
     )
     check_references(spec)
     return spec
@@ -93,15 +102,27 @@ def read_terraform(data: Mapping, base: Path):
 def read_surface_world(data: Mapping | None, base: Path) -> Path | None:
     if data is None:
         return None
-    if not isinstance(data, Mapping) or set(data) != {"world"}:
-        raise ValueError("[surface] needs exactly one option: world")
-    world = data["world"]
+    if not isinstance(data, Mapping) or not set(data) <= {"world", "dimension"}:
+        raise ValueError("[surface] accepts world and dimension")
+    world = data.get("world")
+    if world is None:
+        return None
     if not isinstance(world, str) or not world:
         raise ValueError("[surface].world must name a world save or schematic")
     return base / world
 
 
+def read_surface_dimension(data: Mapping | None) -> str | None:
+    if data is None:
+        return None
+    dimension = data.get("dimension")
+    if dimension is not None and (not isinstance(dimension, str) or not dimension):
+        raise ValueError("[surface].dimension must name a dimension")
+    return dimension
+
+
 def check_references(spec: BuildSpec) -> None:
+    check_feature_paths(spec)
     for interaction in spec.interactions:
         spec.domain(interaction.source)
         spec.domain(interaction.target)
@@ -134,3 +155,24 @@ def check_references(spec: BuildSpec) -> None:
                     f"wire {wire.name!r} stretches to {name!r}, which is "
                     "itself stretched between other wires"
                 )
+    for structure in spec.structures:
+        if structure.wire is not None:
+            wire = spec.wire(structure.wire)
+            if wire.between or wire.geometry is not WireGeometry.LINE:
+                raise ValueError(f"structure {structure.name!r} needs a line wire along sections")
+            if not set(structure.sections) <= set(wire.sections):
+                raise ValueError(f"structure {structure.name!r} must ride sections of wire {wire.name!r}")
+            if (structure.offset.x, structure.offset.z) != (wire.offset.x, wire.offset.z):
+                raise ValueError(f"structure {structure.name!r} must share its wire's across/along offset")
+    shared: dict[str, StructureSpec] = {}
+    for structure in spec.structures:
+        if structure.feature_path is None or any(path.name == structure.feature_path for path in spec.feature_paths):
+            continue
+        first = shared.setdefault(structure.feature_path, structure)
+        spacing = ("spacing", "angle", "measure", "min_distance")
+        if any(getattr(structure, key) != getattr(first, key) for key in spacing):
+            raise ValueError(
+                f"structures {first.name!r} and {structure.name!r} share feature "
+                f"path {structure.feature_path!r}, so need the same spacing, "
+                "angle, measure and min_distance"
+            )

@@ -69,10 +69,12 @@ def enclosing(
     envelope: Mapping[tuple[int, int], Sequence[int]],
     headroom: Callable[[int, int], int],
     footing: Mapping[tuple[int, int], int] | None = None,
+    running: Mapping[tuple[int, int], int] | None = None,
+    running_headroom: int = 0,
 ) -> Clearance:
-    # Per column: every gap between the build's blocks (above the track's
-    # `footing`, if given) plus `headroom` over the top block. Ground in the
-    # gaps is cleared at any depth, e.g. a tunnel bore.
+    # A footing is the bottom of the foundation, not the running surface.
+    # Gaps below the latter are soil contact, not rooms to excavate. With
+    # no running survey, retain the footing-based envelope behavior.
     floor = grid.filled(OPEN)
     ceiling = grid.filled(-OPEN)
     for (x, z), heights in envelope.items():
@@ -80,13 +82,20 @@ def enclosing(
             continue
         levels = sorted(set(heights))
         base = None if footing is None else footing.get((x, z))
+        running_level = None if running is None else running.get((x, z))
         gaps = [
             (below + 1, above - 1)
             for below, above in zip(levels, levels[1:])
             if above - below > 1 and (base is None or below >= base)
+            and (running_level is None or above - 1 > running_level)
         ]
         room = headroom(x, z)
         low = gaps[0][0] if gaps else levels[-1] + 1
+        # Both enclosed rooms and open beds start at their own authored
+        # floor, which can sit below the rails. A raised footing reserves
+        # missing rail support; wholly buried gaps stay foundation contact.
+        if running_level is not None and not gaps and base is not None:
+            low = max(low, base + 1)
         high = max(
             gaps[-1][1] if gaps else -OPEN,
             levels[-1] + room if room > 0 else -OPEN,
@@ -96,4 +105,22 @@ def enclosing(
         at = grid.at(x, z)
         floor[at] = low
         ceiling[at] = high
+    # Headroom over the highest fitting is separate from the usable space
+    # above a rail. A bridge/tunnel can disable the former without allowing
+    # soil into the latter. Stop at the first authored overhead block so
+    # the roof and the hill over it remain intact.
+    if running is not None and running_headroom > 0:
+        for (x, z), level in running.items():
+            if not grid.holds(x, z):
+                continue
+            heights = envelope.get((x, z), ())
+            overhead = [y for y in heights if y > level]
+            bed = max((y for y in heights if y <= level), default=level)
+            base = None if footing is None else footing.get((x, z))
+            low = max(bed, base if base is not None else bed) + 1
+            high = min(level + running_headroom, min(overhead) - 1 if overhead else OPEN)
+            if high >= low:
+                at = grid.at(x, z)
+                floor[at] = min(floor[at], low)
+                ceiling[at] = max(ceiling[at], high)
     return Clearance(floor, ceiling)

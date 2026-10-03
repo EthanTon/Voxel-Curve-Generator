@@ -315,6 +315,19 @@ class NeighborContext:
     def connects_domain(self, other: NeighborBlock | ConnectivityCell) -> bool:
         return self.resolver.domains_can_connect(self.domain, other.domain)
 
+    @property
+    def keeps_authored(self) -> bool:
+        # A domain that does not connect to itself keeps what it was drawn
+        # with rather than remaking it from its neighbours.
+        return not self.resolver.domains_can_connect(self.domain, self.domain)
+
+    def authored(self, direction: Direction) -> str | None:
+        # A connection the placed block was authored with, where kept.
+        value = self.state.get(direction)
+        if value in (None, "false", "none") or not self.keeps_authored:
+            return None
+        return value
+
     def allows(self, direction: Direction, default: Callable[[NeighborBlock], bool]) -> bool:
         # Whether the neighbour toward `direction` counts: an override decides
         # if one matches, otherwise `default` does.
@@ -335,13 +348,18 @@ class NeighborContext:
     ) -> bool:
         neighbor = self.neighbor(direction)
         if neighbor is None:
-            return self.diagonal_decision(direction).action == ConnectionAction.CONNECT
+            return (
+                self.diagonal_decision(direction).action == ConnectionAction.CONNECT
+                or self.authored(direction) is not None
+            )
 
         decision = self.connection_decision(direction)
         if decision.action == ConnectionAction.CONNECT:
             return True
         if decision.action == ConnectionAction.DISCONNECT:
             return False
+        if self.authored(direction) is not None:
+            return True
 
         if self.diagonal_decision(direction).action == ConnectionAction.CONNECT:
             return True
@@ -431,10 +449,12 @@ class NeighborResolver:
         blocks_can_connect: BlockConnectionPredicate | None = None,
         options: ConnectivityOptions | None = None,
         stairs_join_diagonals: Callable[[ConnectivityDomainId], bool] | None = None,
+        preserve_state: Callable[[ConnectivityDomainId], bool] | None = None,
     ) -> None:
         self.registry = registry
         self.domains_can_connect = domains_can_connect or _same_domain
         self.stairs_join_diagonals = stairs_join_diagonals
+        self.preserve_state = preserve_state
         self.blocks_can_connect = blocks_can_connect
         self.options = options
         self.has_edge_overrides = bool(
@@ -494,6 +514,7 @@ class NeighborResolver:
             _predicate_token(self.domains_can_connect),
             _predicate_token(self.blocks_can_connect),
             _predicate_token(self.stairs_join_diagonals),
+            _predicate_token(self.preserve_state),
             repr(None if self.options is None else self.options.overrides),
             tuple(
                 sorted(
@@ -529,6 +550,9 @@ class NeighborResolver:
         source = view.source_at(position)
         if source is None:
             return None
+
+        if self.preserve_state is not None and self.preserve_state(source.domain):
+            return self.registry.get_state(source.block_id)
 
         info = self.registry.get_info(source.block_id)
         context = NeighborContext(
@@ -816,20 +840,30 @@ def _resolve_wall(context: NeighborContext) -> BlockState:
     )
     updates = dict(connected)
     updates["up"] = str(force_post or covered_from_above or not straight).lower()
+    # Kept as drawn, a wall keeps its post as drawn too.
+    if context.keeps_authored and context.state.get("up") in ("true", "false") and all(
+        connected[direction] == context.state.get(direction) for direction in HORIZONTAL_DIRECTIONS
+    ):
+        updates["up"] = context.state.get("up")
     return _with_properties(context.state, updates)
 
 
 def _wall_connection(context: NeighborContext, direction: Direction) -> str:
     neighbor = context.neighbor(direction)
+    authored = context.authored(direction)
     if neighbor is None:
         diagonal = context.diagonal_decision(direction)
-        return _wall_height(diagonal) if diagonal.action == ConnectionAction.CONNECT else "none"
+        if diagonal.action == ConnectionAction.CONNECT:
+            return _wall_height(diagonal)
+        return authored or "none"
 
     decision = context.connection_decision(direction)
     if decision.action == ConnectionAction.DISCONNECT:
         return "none"
     if decision.action == ConnectionAction.CONNECT:
         return _wall_height(decision)
+    if authored is not None:
+        return authored
 
     diagonal = context.diagonal_decision(direction)
     if diagonal.action == ConnectionAction.CONNECT:
@@ -2009,8 +2043,9 @@ def _has_attachment_support(
         neighbor.info.behavior == "ceiling_hanging_sign"
     ):
         supported = True
+    # A block of its own domain holds it up whether or not they connect.
     return bool(
-        context.connects_domain(neighbor)
+        (context.connects_domain(neighbor) or neighbor.domain == context.domain)
         and supported
     )
 

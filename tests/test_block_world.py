@@ -97,6 +97,32 @@ class BlockWorldTests(unittest.TestCase):
         world.remove_placement(upper)
         self.assertEqual(world.source_at((1, 0, 0)).block_id, stone)
 
+    def test_earthworks_cover_only_the_blocks_a_placement_yields(self) -> None:
+        andesite = self.registry.register(BlockState.create("minecraft:andesite"))
+        wool = self.registry.register(BlockState.create("minecraft:gray_wool"))
+        dirt = self.registry.register(BlockState.create("minecraft:dirt"))
+        section = BlockField(self.registry.palette)
+        section.set_block_id((0, 0, 0), andesite)
+        section.set_block_id((1, 0, 0), wool)
+        fill = BlockField(self.registry.palette)
+        fill.set_block_id((0, 0, 0), dirt)
+        fill.set_block_id((1, 0, 0), dirt)
+        world = BlockWorld(self.registry)
+        world.add_field(section, yielding=frozenset({"minecraft:andesite"}))
+        world.add_field(fill, placement_mode=PlacementMode.REPLACE_AIR_ONLY, earthworks=True)
+
+        self.assertEqual(world.source_at((0, 0, 0)).block_id, dirt)
+        self.assertEqual(world.source_at((1, 0, 0)).block_id, wool)
+
+    def test_only_earthworks_cover_a_yielded_block(self) -> None:
+        andesite = self.registry.register(BlockState.create("minecraft:andesite"))
+        dirt = self.registry.register(BlockState.create("minecraft:dirt"))
+        world = BlockWorld(self.registry)
+        world.add_field(self.field_with_id(andesite), yielding=frozenset({"minecraft:andesite"}))
+        world.add_field(self.field_with_id(dirt), placement_mode=PlacementMode.REPLACE_AIR_ONLY)
+
+        self.assertEqual(world.source_at((0, 0, 0)).block_id, andesite)
+
     def test_keep_existing_does_not_replace_a_lower_block(self) -> None:
         stone = self.registry.register(BlockState.create("minecraft:stone"))
         dirt = self.registry.register(BlockState.create("minecraft:dirt"))

@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 
 from ...Core.CrossSection.cross_section import CrossSection
 from ...Core.CrossSection.schedule import SectionSchedule, SectionSpan
+from ...Core.CrossSection.turns import heading
 from ...Core.Feature.feature_path import FeaturePathPoint
 from ...Core.Path.boundary import Boundary
 from ...Core.Path.path import Path
 from ...Core.Path.path_frame import PathFrame
 from ...Core.World.block_world import ColumnMask
+from ...Core.modes import StepMode
 from ...Core.plan_index import NearestInPlan
 from .boundaries import boundary_at
 
@@ -141,7 +143,11 @@ class SectionSilhouette:
             if frame.path_start > self.stop or frame.path_stop < self.start:
                 return False
             # A frame not cut at this span's ends falls back to the planes.
-            if frame.path_start >= self.start and frame.path_stop <= self.stop + 1:
+            if frame.path_start >= self.start and (
+                frame.path_stop <= self.stop
+                or (frame.path_stop == self.stop + 1
+                    and frame.path_stop < self.path.path.last_index)
+            ):
                 return True
         return (
             self._after(self.start, nearest, x, z)
@@ -184,6 +190,15 @@ class IntersectMask:
 
 
 @dataclass(frozen=True, slots=True)
+class OutsideMask:
+    # Columns in none of `masks`.
+    masks: tuple[ColumnMask, ...]
+
+    def contains(self, x: float, z: float) -> bool:
+        return not any(mask.contains(x, z) for mask in self.masks)
+
+
+@dataclass(frozen=True, slots=True)
 class SectionColumnMask:
     # Only the columns owned by (section, span).
     owners: Mapping[tuple[int, int], tuple[str, int]]
@@ -192,6 +207,72 @@ class SectionColumnMask:
 
     def contains(self, x: float, z: float) -> bool:
         return self.owners.get((x, z)) == (self.section, self.span)
+
+
+@dataclass(frozen=True, slots=True)
+class AnnotationColumnMask:
+    # Only the world columns `annotation` owns among its section's columns.
+    owners: Mapping[tuple[int, int], str]
+    annotation: str
+
+    def contains(self, x: float, z: float) -> bool:
+        return self.owners.get((x, z), self.annotation) == self.annotation
+
+
+def annotation_column_owners(
+    runs: Sequence[DeliveredPath], path: Path
+) -> dict[tuple[str, int], dict[tuple[int, int], str]]:
+    # Where a span's columns deliver to one world column -- a join's arms
+    # laid through each other, or over the rows of the points beside it --
+    # it goes to a column laid in the layout of the path point nearest it;
+    # among those to a stepping column, whose step holds a rail or a wall
+    # together; then to the one whose place across the section, as its
+    # layout lays it, is nearest the world column's offset from the point
+    # that laid it; a tie to the later laid.
+    laid = sorted(
+        runs,
+        key=lambda each: (each.start, each.annotation.step_mode is StepMode.MANHATTAN),
+    )
+    layouts: dict[int, set] = {}
+    for run in laid:
+        for point in run.path:
+            layouts.setdefault(point.path_index, set()).add(_layout(point))
+    nearest = NearestInPlan(
+        (point.position.x, point.position.z, index)
+        for index, point in enumerate(path.path_points)
+    )
+    preferred: dict[tuple[int, int], set] = {}
+    owners: dict[tuple[str, int], dict[tuple[int, int], str]] = {}
+    ranks: dict[tuple[str, int], dict[tuple[int, int], tuple[int, float]]] = {}
+    for run in laid:
+        key = (run.section_name, run.span)
+        held, best = owners.setdefault(key, {}), ranks.setdefault(key, {})
+        column = run.annotation.position.x
+        for point in run.path:
+            cell = (point.position.x, point.position.z)
+            wanted = preferred.get(cell)
+            if wanted is None:
+                wanted = preferred[cell] = layouts.get(nearest.nearest(*cell), set())
+            travel = (point.gradient.x, point.gradient.z)
+            length = hypot(*travel) or 1.0
+            tx, tz = travel[0] / length, travel[1] / length
+            centre = path.path_points[point.path_index].position
+            across = (point.position.x - centre.x) * -tz + (point.position.z - centre.z) * tx
+            axis = heading(_layout(point))
+            rank = (
+                0 if _layout(point) in wanted else 1,
+                0 if run.annotation.step_mode is StepMode.MANHATTAN else 1,
+                abs(across - column * (axis.x * tx + axis.z * tz)),
+            )
+            if cell not in best or rank[:2] < best[cell][:2] or (
+                rank[:2] == best[cell][:2] and rank[2] <= best[cell][2] + 1e-9
+            ):
+                held[cell], best[cell] = run.annotation.column_name, rank
+    return owners
+
+
+def _layout(point: FeaturePathPoint):
+    return point.turn if point.layout is None else point.layout
 
 
 def section_column_owners(

@@ -64,6 +64,7 @@ def read_connectivity(data: Mapping, name: str) -> ConnectivityRules:
         connects_to_self=data.get("connects_to_self"),
         connects_to_any=data.get("connects_to_any"),
         stairs_join_diagonals=data.get("stairs_join_diagonals"),
+        preserve_state=data.get("preserve_state"),
         overrides=tuple(
             read_override(each, f"domain {name!r}")
             for each in data.get("override", ())

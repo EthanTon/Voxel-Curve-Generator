@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -32,10 +34,9 @@ from src.Terraform.layers import AdaptiveSmooth, GaussianPad, Level, Mound, Smoo
 from src.Terraform.materialize import build as build_earthworks
 from src.Terraform.plan import Keepout, load as read_plan
 from src.Terraform.surroundings import Surroundings, measure
-from src.Terraform.terraform import _despeckle, _followers, _generator, _ground, _layers
+from src.Terraform.terraform import _continuous_keeps, _despeckle, _ease_preserved_bridge_ground, _followers, _generator, _ground, _layers, _taper_edit_edges
 from src.Terraform.terrain import ABSENT, EmptyTerrain, load_terrain, survey
 from sandbox.terraform_test.generate_route import Station as RouteStation, classify as classify_route, settle as settle_route
-from sandbox.terraform_test.make_sections import hillside
 
 
 STONE = BlockState.create("minecraft:stone")
@@ -65,6 +66,136 @@ def straight_track(level=70, length=20, half_width=2):
     return Alignment.of(blocks, stations)
 
 
+def test_a_linear_two_to_one_bank_reaches_ground_through_the_shore():
+    from src.Terraform.plan import Brush, Embankment
+    terrain, palette = ground_at(lambda x, z: 60)
+    for x in range(-40, 60):
+        for z in range(8, 60):
+            for y in range(61, 65):
+                terrain.blocks.set_block(BlockPos(x, y, z), BlockState.create("minecraft:water"))
+    plan = Plan(
+        look=Look.ENGINEERED, default=Intensity.SHAPE, margin=32, reach=32,
+        brush=Brush(passes=0), embankment=Embankment(ratio=2, shape="linear"),
+    )
+    result = terraform(plan, FieldTerrain(terrain.blocks), straight_track(), palette)
+    bank = np.array([result.designed[result.grid.at(10, z)] for z in range(2, 23)])
+    expected = np.maximum(60, 70 - np.arange(21) / 2)
+    assert np.floor(bank + 0.5) == pytest.approx(np.floor(expected + 0.5))
+    assert result.fill.get_block(BlockPos(10, 67, 8)) is not None
+    assert result.relief[result.grid.at(10, 23)] == 0
+
+
+def test_a_bridge_approach_can_continue_its_bank_to_the_underwater_bed():
+    from src.Terraform.plan import Brush, Embankment
+    terrain, palette = ground_at(lambda x, z: 60)
+    for x in range(15, 40):
+        for z in range(-12, 13):
+            for y in range(61, 65):
+                terrain.blocks.set_block(BlockPos(x, y, z), BlockState.create("minecraft:water"))
+    plan = Plan(
+        look=Look.ENGINEERED, margin=32, reach=32, brush=Brush(passes=0),
+        embankment=Embankment(ratio=2, shape="linear", water_spill=True),
+        spans=(Span(start=(0, 0), stop=(14, 0), profile="embankment"),
+               Span(start=(14, 0), stop=(29, 0), profile="bridge")),
+    )
+    result = terraform(plan, FieldTerrain(terrain.blocks), straight_track(length=30), palette)
+    assert np.floor(result.designed[result.grid.at(16, 0)] + 0.5) == 69
+    assert result.fill.get_block(BlockPos(16, 69, 0)) is not None
+    assert result.relief[result.grid.at(38, 0)] == 0
+
+
+@pytest.mark.parametrize("shape", ("linear", "natural"))
+@pytest.mark.parametrize("rotated", (False, True))
+def test_trench_earthworks_stop_at_the_walls_even_when_banks_bleed(shape, rotated):
+    from src.Terraform.plan import Embankment, Slopes
+    terrain, palette = ground_at(lambda x, z: 60)
+    blocks, stations = [], []
+    for x in range(40):
+        for z in range(-2, 3):
+            blocks.append(BlockPos(x, 70, z))
+            stations.append(x)
+        if 10 <= x <= 24:
+            for z in (-2, 2):
+                blocks.append(BlockPos(x, 79, z))
+                stations.append(x)
+    alignment = Alignment.of(blocks, stations)
+    if rotated:
+        alignment = Alignment.of([BlockPos(p.z, p.y, p.x) for p in blocks], stations)
+    def column(x, z):
+        return (z, x) if rotated else (x, z)
+    plan = Plan(
+        look=Look.NATURAL, bleed=True, margin=16, reach=16,
+        embankment=Embankment(ratio=2, shape=shape),
+        slopes=Slopes(repair_passes=32, cone_passes=32, max_drop=2),
+        spans=(Span(start=column(0, 0), stop=column(9, 0), profile="bridge"),
+               Span(start=column(10, 0), stop=column(24, 0), profile="retained_cutting"),
+               Span(start=column(25, 0), stop=column(39, 0), profile="bridge")),
+    )
+    result = terraform(plan, terrain, alignment, palette)
+    assert result.designed[result.grid.at(*column(17, 4))] > 60
+    for x in (7, 9, 25, 28):
+        cx, cz = column(x, 4)
+        assert result.designed[result.grid.at(cx, cz)] == 60
+        assert result.fill.get_block(BlockPos(cx, 61, cz)) is None
+
+
+def test_an_ordinary_bank_still_bleeds_beyond_its_section():
+    from src.Terraform.plan import Embankment
+    terrain, palette = ground_at(lambda x, z: 60)
+    plan = Plan(
+        bleed=True, margin=16, reach=16,
+        embankment=Embankment(ratio=2, shape="natural"),
+        spans=(Span(start=(0, 0), stop=(14, 0), profile="embankment"),
+               Span(start=(15, 0), stop=(29, 0), profile="bridge")),
+    )
+    result = terraform(plan, terrain, straight_track(length=30), palette)
+    assert result.designed[result.grid.at(18, 4)] > 60
+
+
+def test_preserved_bridge_pillars_keep_the_original_ground_in_their_buffer():
+    from src.Terraform.plan import Embankment
+    terrain, palette = ground_at(lambda x, z: 60)
+    plan = Plan(
+        default=Intensity.SHAPE, bleed=True, margin=16, reach=16,
+        embankment=Embankment(shape="natural"),
+        preserve_fittings=("pier",), fitting_buffer=3,
+    )
+    result = terraform(plan, terrain, straight_track(), palette,
+                       fittings={"pier": [BlockPos(10, 61, 8)]})
+    assert result.relief[result.grid.at(5, 8)] > 0
+    for x in range(7, 14):
+        assert result.designed[result.grid.at(x, 8)] == 60
+        assert result.fill.get_block(BlockPos(x, 61, 8)) is None
+
+
+def test_a_pier_buffer_does_not_remove_support_beneath_the_departing_bank():
+    terrain, palette = ground_at(lambda x, z: 60)
+    plan = Plan(
+        bleed=True, margin=16, reach=16,
+        preserve_fittings=("pier",), fitting_buffer=4,
+        spans=(Span(start=(0, 0), stop=(14, 0), profile="embankment"),
+               Span(start=(15, 0), stop=(29, 0), profile="bridge")),
+    )
+    result = terraform(plan, terrain, straight_track(length=30), palette,
+                       fittings={"pier": [BlockPos(16, 61, 0)]})
+    assert result.fill.get_block(BlockPos(14, 69, 0)) is not None
+    assert result.relief[result.grid.at(16, 4)] == 0
+
+
+def test_a_tall_bank_gets_room_to_reach_ground_without_widening_mountain_cuts():
+    from src.Terraform.plan import Brush, Embankment
+    terrain, palette = ground_at(lambda x, z: 85 if z < -32 else 60)
+    plan = Plan(
+        look=Look.ENGINEERED, default=Intensity.SHAPE, margin=16, reach=16,
+        brush=Brush(passes=0), embankment=Embankment(ratio=2, shape="linear", max_reach=48),
+    )
+    result = terraform(plan, terrain, straight_track(level=80), palette)
+    bank = np.floor([result.designed[result.grid.at(10, z)] + 0.5 for z in range(2, 43)])
+    assert bank == pytest.approx(np.floor(np.maximum(60, 80 - np.arange(41) / 2) + 0.5))
+    assert result.designed[result.grid.at(10, -35)] == 85
+    assert result.coverage[result.grid.at(10, 35)]
+
+
 def test_box_of_a_constant_field_is_that_constant():
     field = np.full((9, 9), 4.0)
     assert kernels.box(field, 3) == pytest.approx(field)
@@ -92,6 +223,30 @@ def test_disk_averages_over_a_circle():
     assert spread[23, 23] < spread[20, 24]
     assert kernels.disk(np.full((9, 11), 4.0), 2.5) == pytest.approx(np.full((9, 11), 4.0))
     assert kernels.disk(field, 0.5) is field
+
+
+def test_a_square_opening_takes_down_ridges_narrower_than_it():
+    field = np.full((9, 12), 60.0)
+    field[:, 3] = 64.0
+    field[:, 7:9] = 64.0
+    opened = kernels.square_opening(field, 2)
+    assert opened[4, 3] == 60.0
+    assert list(opened[4, 7:9]) == [64.0, 64.0]
+    assert np.all(kernels.square_opening(field, 3) == 60.0)
+    ramp = np.tile(np.arange(12.0), (9, 1))
+    assert np.array_equal(kernels.square_opening(ramp, 3), ramp)
+
+
+def test_a_square_closing_fills_grooves_narrower_than_it():
+    field = np.full((9, 12), 60.0)
+    field[:, 3] = 57.0
+    field[:, 7:9] = 57.0
+    closed = kernels.square_closing(field, 2)
+    assert closed[4, 3] == 60.0
+    assert list(closed[4, 7:9]) == [57.0, 57.0]
+    assert np.all(kernels.square_closing(field, 3) == 60.0)
+    ramp = np.tile(np.arange(12.0), (9, 1))
+    assert np.array_equal(kernels.square_closing(ramp, 3), ramp)
 
 
 def test_smooth_max_is_maximum_without_softness():
@@ -228,6 +383,49 @@ def test_mixed_cross_section_cuts_the_hill_and_fills_the_opposite_side():
     assert result.relief[result.grid.at(10, 8)] > 1
 
 
+def test_a_mixed_sections_walled_cut_side_holds_the_ground_at_its_wall_top():
+    terrain, palette = ground_at(lambda x, z: 90 if z < 0 else 60)
+    blocks, stations = [], []
+    for x in range(20):
+        for z in range(-2, 3):
+            blocks.append(BlockPos(x, 70, z))
+            stations.append(x)
+        for y in range(70, 76):
+            blocks.append(BlockPos(x, y, -3))
+            stations.append(x)
+    plan = Plan(
+        margin=24, reach=18.0,
+        spans=(Span((0, 0), (19, 0), cross_section="hillside"),),
+        cross_sections={"hillside": CrossSection(
+            "hillside", left="cutting", right="bridge", cut_base="crest")},
+    )
+    result = terraform(plan, terrain, Alignment.of(blocks, stations), palette)
+    assert 74 <= result.designed[result.grid.at(10, -4)] <= 76
+
+
+def test_a_railing_on_a_wall_is_left_out_of_its_crest():
+    wall = [BlockPos(0, y, 0) for y in range(10)]
+    slabs = [BlockPos(1, y, 0) for y in (0, 1)]
+    alignment = Alignment.of(
+        wall + slabs, [0] * 12,
+        decoration=[y >= 7 for y in range(10)] + [True, True],
+    )
+    assert alignment.crest[(0, 0)] == 6
+    assert alignment.crest[(1, 0)] == 1
+    assert alignment.footing[(0, 0)] == 0
+
+
+def test_mixed_sides_split_at_the_path_not_the_middle_of_an_uneven_section():
+    from dataclasses import replace
+    from src.Terraform.cross_section import axes
+    # 3 columns left of a path along x at z = 0, and 7 to its right.
+    blocks = [BlockPos(x, 70, z) for x in range(10) for z in range(-3, 8)]
+    alignment = Alignment.of(blocks, [block.x for block in blocks])
+    assert axes(alignment).z[5] == pytest.approx(2.0)
+    centred = replace(alignment, centres={x: (x, 0) for x in range(10)})
+    assert axes(centred).z[5] == 0
+
+
 def test_mixed_cross_section_can_leave_one_side_open_for_a_bridge():
     terrain, palette = ground_at(lambda x, z: 80 if z < 0 else 60)
     plan = Plan(
@@ -242,14 +440,16 @@ def test_mixed_cross_section_can_leave_one_side_open_for_a_bridge():
     assert result.relief[result.grid.at(10, 8)] == pytest.approx(0.0)
 
 
-def test_route_selector_can_choose_a_hillside_cross_section_from_both_banks():
-    class Banks:
+def test_route_selector_picks_a_thin_bridge_low_and_a_thick_one_high():
+    class Valley:
         def at(self, x, z):
-            return (80, False) if z < 0 else (60, z > 0)
+            return (60, False) if x < 40 else (40, False)
 
     points = [RouteStation((x, 70, 0), (1.0, 0.0, 0.0), float(x))
-              for x in range(40)]
-    assert set(classify_route(points, Banks(), mixed=True)) == {"hillside_left"}
+              for x in range(80)]
+    kinds = classify_route(points, Valley())
+    assert kinds[10] == "bridge_thin"
+    assert kinds[70] == "bridge_thick"
 
 
 def test_short_water_bridge_at_route_end_is_not_folded_into_embankment():
@@ -257,15 +457,6 @@ def test_short_water_bridge_at_route_end_is_not_folded_into_embankment():
     assert kinds[-1] == "bridge"
     assert kinds[-5] == "bridge"
     assert kinds[0] == "embankment"
-
-
-def test_hillside_section_places_one_wall_and_a_supported_deck():
-    left = hillside(-1)
-    right = hillside(1)
-    assert (-6, 5, 0) in left and (6, 5, 0) not in left
-    assert (6, 5, 0) in right and (-6, 5, 0) not in right
-    assert all((x, -1, 0) in left for x in range(-6, 7))
-    assert left[(-2, 0, 0)].name == "minecraft:cobblestone"
 
 
 def test_terrain_mask_keeps_water_and_existing_structures_untouched():
@@ -281,10 +472,47 @@ def test_terrain_mask_keeps_water_and_existing_structures_untouched():
         ),
     )
     result = terraform(plan, masked, straight_track(level=70), palette)
-    for x, z in ((10, 8), (10, 7), (12, -8)):
+    for x, z in ((10, 8), (12, -8)):
         assert result.relief[result.grid.at(x, z)] == pytest.approx(0.0)
         assert not any(p.x == x and p.z == z for p in result.cut)
         assert not any(p.x == x and p.z == z for p, _ in result.fill.iter_block_ids())
+    # The dry shore beside the water may carry a bank down to it, but no cut.
+    assert result.relief[result.grid.at(10, 7)] >= 0.0
+    assert not any(p.x == 10 and p.z == 7 for p in result.cut)
+
+
+@pytest.mark.parametrize("bank_height", [60, 68])
+def test_water_bank_slopes_to_the_water_surface_without_editing_the_river(bank_height):
+    terrain, palette = ground_at(lambda x, z: 60 if z >= 10 else bank_height)
+    for x in range(-40, 60):
+        for z in range(10, 60):
+            for y in range(61, 65):
+                terrain.blocks.set_block(BlockPos(x, y, z), BlockState.create("minecraft:water"))
+    terrain.blocks.set_block(BlockPos(20, bank_height + 1, 9), BlockState.create("minecraft:stone_bricks"))
+    plan = Plan(
+        look=Look.MINIMAL, default=Intensity.SHAPE, margin=16, reach=8.0,
+        terrain_mask=TerrainMask(
+            preserve_water=True, water_buffer=1, preserve_structures=True, slope_to_water=True,
+        ),
+    )
+    alignment = straight_track(level=70)
+    result = terraform(plan, FieldTerrain(terrain.blocks), alignment, palette)
+    bank = np.array([result.designed[result.grid.at(10, z)] for z in range(2, 10)])
+    assert np.floor(bank[-1] + 0.5) == 64  # The water surface, not its bed at 60.
+    assert np.all(np.diff(np.floor(bank + 0.5)) <= 0)
+    assert np.max(np.abs(np.diff(np.floor(bank + 0.5)))) <= 1
+    for z in range(10, 19):
+        assert result.relief[result.grid.at(10, z)] == 0
+    assert result.relief[result.grid.at(20, 9)] == 0
+    # The taper also meets protected high ground without cutting a cliff
+    # immediately beside it just to reach the water.
+    assert np.floor(result.designed[result.grid.at(19, 9)] + 0.5) >= bank_height - 1
+    assert all(result.designed[result.grid.at(x, z)] == height for (x, z), height in alignment.meets.items())
+    edited = [(p.x, p.z) for p in result.cut] + [(p.x, p.z) for p, _ in result.fill.iter_block_ids()]
+    assert not any(z >= 10 for x, z in edited)
+    assert not any((x, z) == (20, 9) for x, z in edited)
+    distance = nearest(result.grid.mark(alignment.columns), (), plan.margin + 1.0).distance
+    assert np.array_equal(result.designed[distance > plan.margin], result.natural[distance > plan.margin])
 
 
 def test_buried_tunnel_clearance_removes_bore_without_opening_surface():
@@ -316,8 +544,7 @@ def test_wildflowers_are_growth_rather_than_protected_structures():
 def test_a_shallow_cut_restores_the_local_surface():
     grid = Grid(ColumnPos(0, 0), 1, 1)
     cut = build_earthworks(
-        grid, grid.filled(70.0), grid.filled(69.0), Strata(GRASS, STONE, STONE),
-        BlockPalette(), {(0, 0): GRASS},
+        grid, grid.filled(70.0), grid.filled(69.0), Strata(GRASS, STONE, STONE), BlockPalette(),
     )
     assert cut.fill.get_block(BlockPos(0, 69, 0)) == GRASS
 
@@ -441,6 +668,90 @@ def test_an_embankment_fills_a_valley_and_leaves_the_far_field_alone():
     assert result.relief[far] == pytest.approx(0.0)
 
 
+def test_margin_preserves_a_mountain_inside_the_alignment_bounding_box():
+    terrain, palette = ground_at(lambda x, z: 80 if abs(z - 15) < 2 else 60)
+    blocks = [BlockPos(x, 70, z) for x in range(20) for z in (0, 30)]
+    alignment = Alignment.of(blocks, [x for x in range(20) for _ in (0, 30)])
+    result = terraform(
+        Plan(default=Intensity.SHAPE, margin=8, reach=24), terrain, alignment, palette,
+    )
+    distance = nearest(result.grid.mark(alignment.columns), (), 9).distance
+    outside = distance > 8
+    np.testing.assert_array_equal(result.designed[outside], result.natural[outside])
+    assert result.designed[result.grid.at(10, 15)] == 80
+    assert result.designed[result.grid.at(10, 2)] > 60
+    assert all(distance[result.grid.at(p.x, p.z)] <= 8 for p, _ in result.fill.iter_block_ids())
+    assert all(distance[result.grid.at(p.x, p.z)] <= 8 for p in result.cut)
+
+
+def test_a_short_range_tapers_inside_its_boundary():
+    terrain, palette = ground_at(lambda x, z: 64)
+    blocks = [BlockPos(x, 70, z) for x in range(20) for z in (0, 30)]
+    alignment = Alignment.of(blocks, [x for x in range(20) for _ in (0, 30)])
+    result = terraform(
+        Plan(default=Intensity.SHAPE, margin=8, reach=24), terrain, alignment, palette,
+    )
+    heights = np.floor(result.designed[:, result.grid.at(10, 0)[1]] + 0.5)
+    assert np.max(np.abs(np.diff(heights))) <= 1
+    assert result.designed[result.grid.at(10, 9)] == 64
+
+
+def test_a_tall_bleeding_bank_tapers_against_its_unchanged_boundary():
+    from src.Terraform.plan import Embankment, Slopes
+    terrain, palette = ground_at(lambda x, z: 60)
+    result = terraform(Plan(default=Intensity.SHAPE, bleed=True, margin=16, reach=16,
+                           embankment=Embankment(ratio=2.2, shape="natural"),
+                           slopes=Slopes(max_drop=2)),
+                       terrain, straight_track(level=86), palette)
+    heights = np.floor(result.designed + .5)
+    for axis in (0, 1):
+        assert np.max(np.abs(np.diff(heights, axis=axis))) <= 2
+
+
+@pytest.mark.parametrize("profile", ("at_grade", "retained_cutting"))
+@pytest.mark.parametrize("lower_bed", (False, True))
+def test_rail_terraforming_supports_protruding_rails_without_filling_bridges(profile, lower_bed):
+    from types import SimpleNamespace
+    from src.Assembly.earthworks import reshape
+    from src.Core.Domain import DomainRegistry
+    from src.Core.Path.path import Path
+    from src.Core.World.block_world import BlockWorld
+    from src.Core.block.registry import BlockRegistry
+
+    registry = BlockRegistry()
+    domains = DomainRegistry()
+    bed = domains.create("bed")
+    rails = domains.create("rail")
+    domains.create("terrain")
+    world = BlockWorld(registry)
+    domains.bind(world)
+    bed_field = BlockField(registry.palette)
+    rail_field = BlockField(registry.palette)
+    for x in range(20):
+        bed_field.set_block(BlockPos(x, 70, 0), STONE)
+        if lower_bed:
+            bed_field.set_block(BlockPos(x, 65, 3), STONE)
+        rail_field.set_block(BlockPos(x, 71, 3), BlockState.create("minecraft:rail"))
+    world.add_field(bed_field, connectivity_domain=bed.domain_id)
+    world.add_field(rail_field, connectivity_domain=rails.domain_id)
+    path = Path([(x, 70, 0) for x in range(20)], [(1, 0, 0)] * 20)
+    terrain, _ = ground_at(lambda x, z: 60)
+    plan = Plan(
+        default=Intensity.SHAPE, margin=8, reach=8, include_rails=True,
+        spans=(Span(start=(0, 0), stop=(19, 0), profile=profile),),
+    )
+    spec = SimpleNamespace(terraform=plan, sections=(SimpleNamespace(domain="bed"),))
+    result = reshape(spec, world, registry, domains, path, {}, apply=False, terrain=terrain)
+    assert result.designed[result.grid.at(10, 3)] == 70
+    assert result.fill.get_block(BlockPos(10, 70, 3)) is not None
+    assert result.fill.get_block(BlockPos(10, 71, 3)) is None
+
+    spec.terraform = replace(plan, spans=(Span(start=(0, 0), stop=(19, 0), profile="bridge"),))
+    bridge = reshape(spec, world, registry, domains, path, {}, apply=False, terrain=terrain)
+    assert bridge.designed[bridge.grid.at(10, 3)] == 60
+    assert len(bridge.fill) == 0
+
+
 def test_a_cutting_carves_a_hill_and_never_fills():
     terrain, palette = ground_at(lambda x, z: 80)
     alignment = straight_track(level=64)
@@ -472,6 +783,45 @@ def test_terraforming_never_enters_the_clearance():
     for position, _ in result.fill.iter_block_ids():
         row, cell = result.grid.at(position.x, position.z)
         assert not clearance.holds(row, cell, position.y)
+
+
+def test_raising_a_surface_over_a_buried_bore_keeps_it_empty():
+    grid = Grid.around([ColumnPos(0, 0)], 0)
+    clearance = Clearance(grid.filled(71), grid.filled(76))
+    works = build_earthworks(grid, grid.filled(69), grid.filled(79),
+                            Plan().strata, BlockPalette(), clearance=clearance)
+    assert {p.y for p, _ in works.fill.iter_block_ids()} == {70, 77, 78, 79}
+
+
+def test_a_rock_cut_exposes_saved_stone_without_painting_grass_ledges():
+    grid = Grid.around([ColumnPos(0, 0)], 0)
+    works = build_earthworks(grid, grid.filled(80), grid.filled(74),
+                            Plan().strata, BlockPalette(), rock_surface=grid.filled(77))
+    assert works.fill.get_block(BlockPos(0, 74, 0)) is None
+    assert BlockPos(0, 75, 0) in works.cut
+    soil = build_earthworks(grid, grid.filled(80), grid.filled(79),
+                           Plan().strata, BlockPalette(), rock_surface=grid.filled(77))
+    assert soil.fill.get_block(BlockPos(0, 79, 0)) == GRASS
+
+
+def test_zero_section_headroom_cannot_leave_soil_over_a_laid_rail():
+    terrain, palette = ground_at(lambda x, z: 79)
+    alignment = straight_track(level=74)
+    envelope = {(x, z): [74, 75] for x in range(20) for z in range(-2, 3)}
+    envelope[10, 0] += [83]
+    running = {(x, z): 75 for x in range(20) for z in range(-2, 3)}
+    result = terraform(Plan(headroom=12, spans=(
+        Span((0, 0), (19, 0), profile="bridge", headroom=0),
+    )), terrain, alignment, palette, envelope=envelope, running=running)
+    assert result.clearance.floor[result.grid.at(10, 0)] == 76
+    assert result.clearance.ceiling[result.grid.at(10, 0)] == 82
+    assert result.clearance.ceiling[result.grid.at(9, 0)] == 87
+    for x in (9, 10):
+        for y in (76, 77, 78, 79):
+            assert BlockPos(x, y, 0) in result.cut
+            assert result.fill.get_block(BlockPos(x, y, 0)) is None
+    assert BlockPos(10, 83, 0) not in result.cut
+    assert result.fill.get_block(BlockPos(9, 74, 0)) is None
 
 
 def test_a_keepout_suppresses_its_box():
@@ -694,25 +1044,17 @@ def test_the_feather_reaches_every_stretch_layer():
     assert stack and all(layer.feather == 8.0 for layer in stack)
 
 
-def test_a_gentle_deep_cut_is_soiled_and_a_steep_one_is_bare():
+def test_a_cut_takes_the_lands_surface_and_leaves_its_face_as_it_was():
     dirt = BlockState.create("minecraft:dirt")
     grid = Grid(ColumnPos(0, 0), 3, 1)
     natural = grid.filled(80.0)
     strata = Strata(GRASS, dirt, STONE, depth=2)
-    gentle = grid.filled(0.0)
-    gentle[0] = [70.0, 71.0, 72.0]
-    cut = build_earthworks(grid, natural, gentle, strata, BlockPalette(), {(0, c): GRASS for c in range(3)})
-    assert cut.fill.get_block(BlockPos(1, 71, 0)) == GRASS
-    assert cut.fill.get_block(BlockPos(2, 72, 0)) == GRASS
-    steep = grid.filled(0.0)
-    steep[0] = [70.0, 74.0, 78.0]
-    cut = build_earthworks(grid, natural, steep, strata, BlockPalette(), {(0, c): GRASS for c in range(3)})
-    assert cut.fill.get_block(BlockPos(1, 74, 0)) == STONE
-    two = grid.filled(0.0)
-    two[0] = [70.0, 72.0, 74.0]
-    cut = build_earthworks(grid, natural, two, strata, BlockPalette(), {(0, c): GRASS for c in range(3)})
-    assert cut.fill.get_block(BlockPos(1, 72, 0)) == GRASS
-    assert cut.fill.get_block(BlockPos(1, 71, 0)) == dirt
+    for levels in ([70.0, 71.0, 72.0], [70.0, 74.0, 78.0]):
+        designed = grid.filled(0.0)
+        designed[0] = levels
+        cut = build_earthworks(grid, natural, designed, strata, BlockPalette())
+        assert cut.fill.get_block(BlockPos(1, int(levels[1]), 0)) == GRASS
+        assert cut.fill.get_block(BlockPos(1, int(levels[1]) - 1, 0)) is None
 
 
 def test_the_smoothing_kernel_is_read_and_checked(tmp_path):
@@ -753,6 +1095,9 @@ def test_despeckle_only_raises_where_it_may_not_lower():
 def test_terrain_mask_and_named_cross_section_are_read_from_the_file(tmp_path):
     written = tmp_path / "terraform.toml"
     written.write_text("""
+[terraform]
+clear_track = true
+
 [terraform.terrain_mask]
 preserve_water = true
 water_buffer = 2
@@ -769,6 +1114,7 @@ to = [19, 0]
 cross_section = "hillside"
 """)
     plan = read_plan(written)
+    assert plan.clear_track
     assert plan.terrain_mask.water_buffer == 2
     assert plan.terrain_mask.preserve_structures
     assert plan.cross_section("hillside").right == "bridge"
@@ -832,6 +1178,9 @@ def test_a_section_span_requires_an_assigned_section_and_no_markers():
         Plan(spans=(Span(section="missing"),)).stretches(
             lambda where: where, 10, {"bank": ((0, 9),)}
         )
+    assert Plan(spans=(Span(section="unused"),)).stretches(
+        lambda where: where, 10, {"unused": ()},
+    ) == ()
 
 
 def test_an_unknown_profile_names_the_known_ones():
@@ -878,6 +1227,21 @@ def test_a_follows_layer_levels_a_pad_at_each_placement():
     assert result.relief[away] == pytest.approx(0.0)
 
 
+def test_a_bank_fills_under_its_own_track_on_a_dry_shore():
+    from src.Terraform.plan import TerrainMask
+    terrain, palette = ground_at(lambda x, z: 60)
+    for x in range(-40, 60):
+        terrain.blocks.set_block(BlockPos(x, 61, 3), BlockState.create("minecraft:water"))
+    plan = Plan(
+        margin=20, reach=16.0,
+        terrain_mask=TerrainMask(preserve_water=True, water_buffer=1),
+        spans=(Span(start=(0, 0), stop=(19, 0), profile="embankment"),),
+    )
+    result = terraform(plan, FieldTerrain(terrain.blocks), straight_track(level=70), palette)
+    assert result.designed[result.grid.at(10, 2)] >= 69
+    assert result.designed[result.grid.at(10, 3)] == result.natural[result.grid.at(10, 3)]
+
+
 def test_a_bridge_span_leaves_the_valley_alone_without_fittings():
     terrain, palette = ground_at(lambda x, z: 60)
     alignment = straight_track(level=74, length=30)
@@ -889,6 +1253,42 @@ def test_a_bridge_span_leaves_the_valley_alone_without_fittings():
     result = terraform(plan, terrain, alignment, palette)
     assert len(result.fill) == 0
     assert result.cut == frozenset()
+
+
+def test_a_natural_bridge_trims_a_crown_reaching_into_its_deck():
+    from src.Terraform.plan import Bridge
+    terrain, palette = ground_at(lambda x, z: 60)
+    blocks = terrain.blocks
+    trunk = [BlockPos(10, y, 6) for y in range(61, 70)]
+    crown = [BlockPos(10, y, z) for y in range(70, 73) for z in range(3, 10)]
+    for position in trunk:
+        blocks.set_block(position, OAK)
+    for position in crown:
+        blocks.set_block(position, LEAVES)
+    plan = Plan(
+        margin=20,
+        reach=16.0,
+        bridge=Bridge(natural_only=True),
+        spans=(Span(start=(0, 0), stop=(29, 0), profile="bridge"),),
+    )
+    result = terraform(plan, FieldTerrain(blocks), straight_track(level=70, length=30), palette)
+    assert {BlockPos(10, y, 3) for y in range(70, 73)} <= result.cut
+    assert not set(trunk) & result.cut
+    assert BlockPos(10, 71, 8) not in result.cut
+
+
+def test_a_natural_bridge_takes_the_ground_down_under_its_deck():
+    from src.Terraform.plan import Bridge
+    terrain, palette = ground_at(lambda x, z: 74 if z <= 0 else 60)
+    plan = Plan(
+        margin=20,
+        reach=16.0,
+        bridge=Bridge(natural_only=True),
+        spans=(Span(start=(0, 0), stop=(29, 0), profile="bridge"),),
+    )
+    result = terraform(plan, terrain, straight_track(level=70, length=30), palette)
+    assert result.designed[result.grid.at(10, -1)] <= 69
+    assert result.designed[result.grid.at(10, -8)] == pytest.approx(74.0)
 
 
 def test_a_follows_layer_needs_its_fitting_to_be_placed():
@@ -977,7 +1377,11 @@ def test_land_mast_footing_stops_at_bridge_deck_but_keeps_its_own_pad():
         plan, terrain, straight_track(level=70, length=30), palette,
         fittings={"mast": [BlockPos(16, 70, 8)]},
     )
-    assert result.designed[result.grid.at(13, 2)] == 60.0
+    # The apron is cut off at the deck, and only graded under it a block a
+    # column down from the pad.
+    assert result.report.steep == 0
+    assert result.designed[result.grid.at(13, 2)] <= 70.0 - 6.0
+    assert result.designed[result.grid.at(8, 0)] == 60.0
     assert result.designed[result.grid.at(16, 8)] == pytest.approx(70.0)
 
 
@@ -1154,6 +1558,34 @@ def test_a_save_folder_descends_into_its_region_directory(tmp_path):
     assert loaded.directory == region
 
 
+def test_a_save_selects_named_and_vanilla_dimensions(tmp_path):
+    from src.Terraform.terrain import region_directory
+
+    save = tmp_path / "save"
+    for folder, dimension in (
+        ("region", "minecraft:overworld"),
+        ("DIM-1/region", "minecraft:the_nether"),
+        ("DIM1/region", "minecraft:the_end"),
+        ("dimensions/minecraft/nova_proxima/region", "minecraft:nova_proxima"),
+        ("dimensions/example/moon/region", "example:moon"),
+    ):
+        region = save / folder
+        region.mkdir(parents=True)
+        (region / "r.0.0.mca").write_bytes(b"")
+        assert region_directory(save, dimension) == region
+        assert load_terrain(save, dimension).directory == region
+
+
+def test_a_missing_or_unsafe_dimension_is_rejected(tmp_path):
+    save = tmp_path / "save"
+    (save / "region").mkdir(parents=True)
+    (save / "region" / "r.0.0.mca").write_bytes(b"")
+    with pytest.raises(ValueError, match="no region files"):
+        load_terrain(save, "minecraft:missing")
+    with pytest.raises(ValueError, match="invalid dimension"):
+        load_terrain(save, "example:../region")
+
+
 def test_an_omitted_world_terraforms_nothing():
     assert isinstance(load_terrain(None), EmptyTerrain)
 
@@ -1227,6 +1659,21 @@ def test_region_terrain_keeps_only_the_top_levels(tmp_path):
     assert len(stack) == 5
     assert stack[0][0] == 60
     assert stack[-1][0] == 64
+
+
+def test_a_deep_bore_extends_only_its_saved_terrain_columns(tmp_path):
+    from src.Terraform.region import RegionTerrain
+    saved = saved_world(tmp_path / "region", [(2, 2), (3, 2)], height=180, depth=110)
+    terrain = RegionTerrain(saved)
+    assert terrain.column(2, 2)[0][0] == 116
+    terrain.include_depths({(2, 2): 90})
+    assert terrain.column(2, 2)[0][0] == 90
+    assert terrain.column(3, 2)[0][0] == 116
+    plan = Plan(default=Intensity.NONE, margin=2, headroom=0)
+    alignment = Alignment.of([BlockPos(2, 100, 2), BlockPos(2, 110, 2)])
+    result = terraform(plan, terrain, alignment, envelope={(2, 2): [100, 110]})
+    assert {BlockPos(2, y, 2) for y in range(101, 110)} <= result.cut
+    assert BlockPos(2, 111, 2) not in result.cut
 
 
 def test_presence_is_answered_without_decoding(tmp_path):
@@ -1402,38 +1849,28 @@ def test_natural_settling_smooths_the_edited_surface_itself():
     assert settled[0, 0] == pytest.approx(natural[0, 0], abs=0.01)
 
 
-def test_waterline_selects_dry_cap_and_submerged_sediment():
-    sand = BlockState.create("minecraft:sand")
+def test_under_water_a_fill_takes_what_lies_beneath_the_lands_top():
     dirt = BlockState.create("minecraft:dirt")
-    sandstone = BlockState.create("minecraft:sandstone")
     water = BlockState.create("minecraft:water")
     grid = Grid(ColumnPos(0, 0), 1, 1)
     strata = Strata(GRASS, dirt, STONE, depth=2)
-    inherited = {(0, 0): sand}
-    raised = build_earthworks(
-        grid, grid.filled(60), grid.filled(67), strata, BlockPalette(),
-        inherited, grid.filled(64),
+    drowned = build_earthworks(
+        grid, grid.filled(60), grid.filled(63), strata, BlockPalette(), None, grid.filled(64),
     )
-    assert [raised.fill.get_block(BlockPos(0, y, 0)) for y in range(61, 68)] == [
-        sand, sand, sand, sand, dirt, dirt, GRASS,
-    ]
+    assert [drowned.fill.get_block(BlockPos(0, y, 0)) for y in range(61, 64)] == [dirt, dirt, dirt]
     lowered = build_earthworks(
-        grid, grid.filled(60), grid.filled(58), strata, BlockPalette(),
-        inherited, grid.filled(64),
+        grid, grid.filled(60), grid.filled(58), strata, BlockPalette(), None, grid.filled(64),
     )
     assert lowered.cut == frozenset()
     assert lowered.fill.get_block(BlockPos(0, 59, 0)) == water
     protected = build_earthworks(
         grid, grid.filled(60), grid.filled(58), strata, BlockPalette(),
-        inherited, grid.filled(64), Clearance(grid.filled(59), grid.filled(64)),
+        None, grid.filled(64), Clearance(grid.filled(59), grid.filled(64)),
     )
     assert BlockPos(0, 59, 0) in protected.cut
     assert protected.fill.get_block(BlockPos(0, 59, 0)) is None
-    dry = build_earthworks(
-        grid, grid.filled(60), grid.filled(65), strata, BlockPalette(), inherited,
-    )
-    assert dry.fill.get_block(BlockPos(0, 64, 0)) == sand
-    assert dry.fill.get_block(BlockPos(0, 61, 0)) == sandstone
+    dry = build_earthworks(grid, grid.filled(60), grid.filled(65), strata, BlockPalette())
+    assert [dry.fill.get_block(BlockPos(0, y, 0)) for y in range(65, 60, -1)] == [GRASS, dirt, dirt, STONE, STONE]
 
 
 def test_survey_records_water_above_the_riverbed():
@@ -1489,9 +1926,12 @@ def test_an_embankment_runs_full_to_a_bridge_and_spills_under_its_first_span():
     def level(x):
         return result.designed[result.grid.at(x, 0)]
 
+    # Ten blocks high at a block per two columns, the spill runs twenty
+    # columns under the bridge.
     assert level(28) == pytest.approx(70.0, abs=0.5)
     assert 60.5 < level(32) < 69.5
-    assert level(45) == pytest.approx(60.0)
+    assert level(45) == pytest.approx(62.0)
+    assert level(52) == pytest.approx(60.0)
 
 
 def test_embankment_runout_does_not_fill_a_bridge_channel():
@@ -1516,6 +1956,69 @@ def test_embankment_runout_does_not_fill_a_bridge_channel():
     assert result.fill.get_block(BlockPos(32, 61, 0)) is None
 
 
+def test_bridge_section_handover_does_not_restart_terrain_transitions():
+    terrain, palette = ground_at(lambda x, z: 60 + (x + 2 * z) % 3)
+    alignment = straight_track(level=70, length=60)
+    plan = Plan(
+        look=Look.MINIMAL,
+        margin=24,
+        reach=16.0,
+        spans=(
+            Span(start=(0, 0), stop=(29, 0), profile="embankment"),
+            Span(start=(29, 0), stop=(59, 0), profile="bridge"),
+        ),
+    )
+    continuous = terraform(plan, terrain, alignment, palette)
+    split = terraform(replace(plan, spans=(
+        plan.spans[0],
+        Span(start=(29, 0), stop=(38, 0), profile="bridge"),
+        Span(start=(38, 0), stop=(59, 0), profile="bridge"),
+    )), terrain, alignment, palette)
+    # Switching bridge schematics must not introduce a new terrain edge,
+    # change the approach spill or open a gap in the protected bridge area.
+    np.testing.assert_array_equal(split.designed, continuous.designed)
+    assert split.cut == continuous.cut
+
+
+def test_embankment_underpinning_stops_at_the_incoming_bridge():
+    from types import SimpleNamespace
+    from src.Terraform.materialize import Earthworks
+    from src.Terraform.terraform import _underpin
+
+    terrain, palette = ground_at(lambda x, z: 60)
+    alignment = straight_track(level=70, length=40)
+    grid = Grid.around(alignment.columns, 4)
+    plan = Plan(spans=(
+        Span(start=(0, 0), stop=(20, 0), profile="embankment"),
+        Span(start=(20, 0), stop=(39, 0), profile="bridge"),
+    ))
+    earthworks = Earthworks(BlockField(palette), frozenset())
+    layering = SimpleNamespace(layers=np.empty((1,)), at=lambda *args: STONE)
+    _underpin(plan, terrain, alignment, plan.stretches(alignment.locate, 40),
+              earthworks, grid, layering)
+    assert earthworks.fill.get_block(BlockPos(19, 69, 0)) == STONE
+    # The shared marker belongs to the bridge: only the designed approach
+    # spill may enter it, never a wall of support fill down from its deck.
+    assert earthworks.fill.get_block(BlockPos(20, 69, 0)) is None
+
+
+@pytest.mark.parametrize("changes", (
+    {"start": (40, 0)},  # A gap is still an end of a bridge.
+    {"headroom": 0},
+    {"transition": 12},
+    {"order": 1},
+    {"intensity": Intensity.NONE},
+    {"cross_section": "open"},
+))
+def test_distinct_bridge_terrain_rules_keep_their_boundary(changes):
+    plan = Plan(spans=(
+        Span(start=(0, 0), stop=(29, 0), profile="bridge"),
+        replace(Span(start=(29, 0), stop=(59, 0), profile="bridge"), **changes),
+    ))
+    stretches = plan.stretches(lambda where: where[0], 60)
+    assert _continuous_keeps(plan, stretches) == stretches
+
+
 def test_a_retained_cutting_is_cut_back_from_the_top_of_its_walls():
     terrain, palette = ground_at(lambda x, z: 90)
     blocks, stations = [], []
@@ -1536,7 +2039,8 @@ def test_a_retained_cutting_is_cut_back_from_the_top_of_its_walls():
     assert result.designed[result.grid.at(15, 0)] == pytest.approx(70.0, abs=0.5)
 
 
-def test_a_tunnel_clears_its_bore_and_keeps_the_mountain_over_its_roof():
+@pytest.mark.parametrize("bleed", (False, True))
+def test_a_tunnel_clears_its_bore_and_keeps_the_mountain_over_its_roof(bleed):
     terrain, palette = ground_at(lambda x, z: 95)
     alignment = straight_track(level=70, length=30)
     envelope = {(x, z): [70, 80] for x in range(30) for z in range(-2, 3)}
@@ -1544,6 +2048,7 @@ def test_a_tunnel_clears_its_bore_and_keeps_the_mountain_over_its_roof():
         margin=16,
         reach=12.0,
         headroom=12,
+        bleed=bleed,
         spans=(
             Span(
                 start=(0, 0), stop=(29, 0), intensity=Intensity.NONE,
@@ -1556,6 +2061,31 @@ def test_a_tunnel_clears_its_bore_and_keeps_the_mountain_over_its_roof():
     assert result.designed[row, cell] == pytest.approx(95.0)
     assert (result.clearance.floor[row, cell], result.clearance.ceiling[row, cell]) == (71, 79)
     assert not any(position.y > 80 for position in result.cut)
+
+
+def test_a_bleeding_bank_near_a_tunnel_does_not_remove_its_roof():
+    from src.Terraform.plan import Smoothing
+    terrain, palette = ground_at(lambda x, z: 95)
+    for x in range(10, 30):
+        for z in range(-2, 3):
+            for y in range(71, 89):
+                terrain.blocks.set_block(BlockPos(x, y, z), STONE)
+    terrain = FieldTerrain(terrain.blocks)
+    alignment = straight_track(level=70, length=30)
+    envelope = {(x, z): [70] if x < 10 else [70, 80]
+                for x in range(30) for z in range(-2, 3)}
+    plan = Plan(
+        bleed=True, margin=16, reach=16,
+        # This regression checks a held mountain without portal grading.
+        smoothing=Smoothing(transition_reach=0),
+        spans=(Span(start=(0, 0), stop=(9, 0), profile="embankment"),
+               Span(start=(10, 0), stop=(29, 0), profile="tunnel",
+                    intensity=Intensity.NONE, headroom=0)),
+    )
+    result = terraform(plan, terrain, alignment, palette, envelope=envelope)
+    assert result.designed[result.grid.at(15, 0)] == 95
+    assert BlockPos(15, 75, 0) in result.cut
+    assert BlockPos(15, 85, 0) not in result.cut
 
 
 def test_the_first_point_out_of_a_tunnel_takes_the_open_tracks_headroom():
@@ -1622,9 +2152,10 @@ def test_a_meadow_is_cleared_only_where_the_ground_changes():
         reach=10.0,
         spans=(Span(start=(0, 0), stop=(19, 0), profile="embankment"),),
     )
-    result = terraform(plan, grown, straight_track(level=70), palette)
+    # A six-block bank runs twelve columns out at a block per two.
+    result = terraform(plan, grown, straight_track(level=66), palette)
     assert BlockPos(10, 61, 0) in result.cut
-    assert BlockPos(10, 61, 20) not in result.cut
+    assert BlockPos(10, 61, 22) not in result.cut
 
 
 def test_growth_deep_under_a_clearance_is_left_alone():
@@ -1637,6 +2168,113 @@ def test_growth_deep_under_a_clearance_is_left_alone():
     )
     result = terraform(plan, grown, straight_track(level=74), palette)
     assert BlockPos(10, 61, 0) not in result.cut
+
+
+def test_raising_a_bank_leaves_growth_in_a_cave_below_it():
+    terrain, palette = ground_at(lambda x, z: 60)
+    lichen = BlockPos(10, 55, 0)
+    terrain.blocks.set_block(lichen, BlockState.create("minecraft:glow_lichen"))
+    result = terraform(Plan(default=Intensity.SHAPE, margin=8, reach=8),
+                       terrain, straight_track(level=66), palette)
+    assert result.designed[result.grid.at(10, 0)] == 66
+    assert lichen not in result.cut
+
+
+def test_a_protected_shore_keeps_its_soil_but_clears_bridge_headroom():
+    from src.Terraform.plan import TerrainMask
+    terrain, palette = ground_at(lambda x, z: 60)
+    blocks = terrain.blocks
+    for x in range(20):
+        blocks.set_block(BlockPos(x, 61, 2), BlockState.create("minecraft:water"))
+    blocks.set_block(BlockPos(10, 75, 0), LEAVES)
+    blocks.set_block(BlockPos(10, 61, 0), TUFT)
+    result = terraform(Plan(
+        margin=8, reach=8, terrain_mask=TerrainMask(preserve_water=True, water_buffer=3),
+        spans=(Span(start=(0, 0), stop=(19, 0), profile="bridge"),),
+    ), FieldTerrain(blocks), straight_track(level=74), palette)
+    assert result.designed[result.grid.at(10, 0)] == 60
+    assert BlockPos(10, 75, 0) in result.cut
+    assert BlockPos(10, 61, 0) not in result.cut
+
+
+def test_a_shore_buffer_does_not_leave_rock_inside_a_bridge_bore():
+    terrain, palette = ground_at(lambda x, z: 120)
+    blocks = terrain.blocks
+    for x in range(20):
+        blocks.set_block(BlockPos(x, 121, 2), BlockState.create("minecraft:water"))
+    blocks.set_block(BlockPos(10, 76, 0), STONE)
+    result = terraform(Plan(
+        margin=8, reach=8, terrain_mask=TerrainMask(preserve_water=True, water_buffer=3),
+        spans=(Span(start=(0, 0), stop=(19, 0), profile="bridge"),),
+    ), FieldTerrain(blocks), straight_track(level=74), palette)
+    assert result.designed[result.grid.at(10, 0)] == 120
+    assert BlockPos(10, 76, 0) in result.cut
+
+
+def test_a_pier_buffer_does_not_preserve_shore_foliage_in_bridge_headroom():
+    terrain, palette = ground_at(lambda x, z: 60)
+    blocks = terrain.blocks
+    for x in range(20):
+        blocks.set_block(BlockPos(x, 61, 2), BlockState.create("minecraft:water"))
+    leaf = BlockPos(10, 75, 0)
+    blocks.set_block(leaf, LEAVES)
+    result = terraform(Plan(
+        margin=8, reach=8, preserve_fittings=("pier",), fitting_buffer=3,
+        terrain_mask=TerrainMask(preserve_water=True, water_buffer=3),
+        spans=(Span(start=(0, 0), stop=(19, 0), profile="bridge"),),
+    ), FieldTerrain(blocks), straight_track(level=74), palette,
+        fittings={"pier": [BlockPos(10, 60, 0)]})
+    assert result.designed[result.grid.at(10, 0)] == 60
+    assert leaf in result.cut
+
+
+def test_edit_edges_taper_back_toward_fixed_ground_without_extending_the_footprint():
+    natural = np.array([[41., 50., 50., 89., 88., 90., 60.]])
+    designed = np.array([[67., 50., 50., 89., 85., 90., 60.]])
+    movable = np.array([[True, False, False, False, True, False, False]])
+    eased = _taper_edit_edges(designed, natural, movable, 2, 16)
+    assert eased[0, 0] == 52
+    assert eased[0, 4] == 88
+    assert eased[0, 1] == designed[0, 1]
+    assert eased[0, 5] == designed[0, 5]
+
+
+def test_a_cut_is_carried_back_from_a_fixed_bore_in_its_existing_footprint():
+    natural = np.array([[123., 122.]])
+    designed = np.array([[120., 113.]])
+    eased = _taper_edit_edges(designed, natural, np.array([[True, False]]), 2, 8)
+    assert eased.tolist() == [[115., 113.]]
+
+
+def test_successive_cuts_carry_the_lower_bore_outward_without_oscillating():
+    natural = np.array([[124., 124., 124.]])
+    designed = np.array([[122., 120., 113.]])
+    eased = _taper_edit_edges(designed, natural, np.array([[True, True, False]]), 2, 8)
+    assert eased.tolist() == [[117., 115., 113.]]
+
+
+def test_a_shallow_cut_beside_unchanged_mountain_is_restored_in_place():
+    natural = np.array([[139., 139., 135., 134.]])
+    designed = np.array([[139., 136., 132., 130.]])
+    movable = np.array([[False, True, True, True]])
+    eased = _taper_edit_edges(designed, natural, movable, 2, 16)
+    assert eased[0, 0] == 139
+    assert eased[0, 1] >= 137
+    assert np.max(np.abs(np.diff(eased[0]))) <= 2
+
+
+def test_bridge_fill_eases_into_preserved_ground_without_touching_the_track():
+    natural = np.full((1, 4), 93.)
+    designed = np.array([[99., 99., 99., 93.]])
+    protected = np.array([[False, False, False, True]])
+    distance = np.array([[0., 1., 2., 3.]])
+    eased = _ease_preserved_bridge_ground(
+        designed, natural, np.ones((1, 4), dtype=bool),
+        np.full((1, 4), 50.), protected,
+        np.zeros((1, 4), dtype=bool), np.ones((1, 4), dtype=bool),
+        distance, 2, 4,
+    )
+    assert eased.tolist() == [[99., 97., 95., 93.]]
 
 
 def test_nothing_that_grows_in_a_keepout_is_cleared():
@@ -1688,3 +2326,40 @@ def test_a_step_measured_from_anywhere_else_is_refused(tmp_path):
     written.write_text('[profile.odd]\naction = "level"\nfrom = "roof"\n')
     with pytest.raises(ValueError, match="footing or crest"):
         read_plan(written)
+
+
+def test_an_approach_cutting_wraps_back_into_the_hill_beside_a_portal():
+    terrain, palette = ground_at(lambda x, z: 90 if x >= 10 else 84)
+    blocks = [BlockPos(x, y, z) for x in range(30) for z in range(-2, 3) for y in (70, 76)]
+    alignment = Alignment.of(blocks, [block.x for block in blocks])
+    plan = Plan(
+        margin=24, reach=12,
+        spans=(Span(start=(0, 0), stop=(9, 0), profile="cutting"),
+               Span(start=(10, 0), stop=(29, 0), profile="tunnel", intensity=Intensity.NONE)),
+    )
+    result = terraform(plan, terrain, alignment, palette)
+    beside = result.designed[result.grid.at(11, 5)]
+    assert 77 <= beside < 90
+    # Over the lining it is graded too, keeping a block over the roof.
+    assert 77 <= result.designed[result.grid.at(11, 0)] < 90
+    assert result.designed[result.grid.at(28, 5)] == 90
+    assert result.designed[result.grid.at(28, 0)] == 90
+
+
+def test_a_bleeding_bank_keeps_the_hillside_beside_a_buried_tunnel():
+    from src.Terraform.plan import Smoothing
+    terrain, palette = ground_at(lambda x, z: 88 if x >= 10 else 60)
+    alignment = straight_track(level=70, length=30)
+    plan = Plan(
+        bleed=True, margin=24, reach=20,
+        smoothing=Smoothing(transition_reach=0),
+        spans=(Span(start=(0, 0), stop=(9, 0), profile="embankment"),
+               Span(start=(10, 0), stop=(29, 0), profile="tunnel", intensity=Intensity.NONE)),
+    )
+    result = terraform(plan, terrain, alignment, palette)
+    for x in range(14, 29):
+        for z in range(-18, 19):
+            at = result.grid.at(x, z)
+            assert result.designed[at] == result.natural[at], (x, z)
+    # The approach bank still shapes its own exposed formation.
+    assert result.designed[result.grid.at(4, 0)] > 60

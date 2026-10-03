@@ -237,6 +237,38 @@ class DiagonalLayoutTests(unittest.TestCase):
                         f"{edge} does not meet at turn {turn}",
                     )
 
+    def test_a_stepping_outside_edge_closes_round_the_corner(self) -> None:
+        # Each arm carries half its row, which on an odd row leaves the two
+        # halves of a stepping outside edge a cell apart, and a hole through
+        # the join beside it. Nothing inboard covers the outside edge.
+        for edge in (-9, 9):
+            section = CrossSection(PointField(
+                annotation(
+                    (x, 0, 0),
+                    StepMode.MANHATTAN if x == edge else StepMode.CHEBYSHEV,
+                    f"c{x}",
+                )
+                for x in range(-9, 10)
+            ))
+            for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+                for turn in (45, 135, 225, 315):
+                    with self.subTest(edge=edge, direction=direction, turn=turn):
+                        cells = {
+                            (p.x, p.z)
+                            for offset in section.orient(turn, direction)
+                            if offset.annotation.name == f"c{edge}"
+                            for p in offset.offsets
+                        }
+                        start = next(iter(cells))
+                        reached, stack = {start}, [start]
+                        while stack:
+                            x, z = stack.pop()
+                            for near in ((x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)):
+                                if near in cells and near not in reached:
+                                    reached.add(near)
+                                    stack.append(near)
+                        self.assertEqual(reached, cells)
+
     def test_each_arm_keeps_its_own_quarter(self) -> None:
         # A mirror across the long edge moves nothing sideways, so the arm
         # stays in the quarter it was laid for. Anything riding it is placed

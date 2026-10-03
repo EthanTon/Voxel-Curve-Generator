@@ -686,6 +686,59 @@ class ConnectivityTests(unittest.TestCase):
 
         self.assertEqual(registry.get_state(blocks[(3, 0, 0)]).get("powered"), "true")
 
+    def test_a_domain_not_joining_itself_keeps_authored_connections(self) -> None:
+        # The wall was authored joined north and east; only north has a
+        # neighbour. Joining itself, the wall is remade from its neighbours;
+        # not, it keeps what it was authored with and adds nothing.
+        wall = self.registry.register(
+            BlockState.create(
+                "minecraft:andesite_wall",
+                {"north": "tall", "east": "tall", "south": "none", "west": "none", "up": "true"},
+            ),
+            BlockInfo(neighbor_rule=NeighborRule.WALL),
+        )
+        plain = self.registry.register(
+            BlockState.create("minecraft:andesite_wall"),
+            BlockInfo(neighbor_rule=NeighborRule.WALL),
+        )
+        joined = {(0, 0, 0): wall, (0, 0, -1): plain, (0, 0, 1): plain}
+        kept = dict(joined)
+
+        NeighborResolver(self.registry).resolve_all(joined)
+        NeighborResolver(self.registry, domains_can_connect=lambda a, b: False).resolve_all(kept)
+
+        remade = self.registry.get_state(joined[(0, 0, 0)])
+        authored = self.registry.get_state(kept[(0, 0, 0)])
+        self.assertEqual([remade.get(side) for side in ("north", "east", "south")], ["low", "none", "low"])
+        self.assertEqual([authored.get(side) for side in ("north", "east", "south")], ["tall", "tall", "none"])
+
+    def test_a_wall_kept_as_drawn_keeps_its_post_as_drawn(self) -> None:
+        # Three sides would raise a post, but it was drawn without one.
+        wall = self.registry.register(
+            BlockState.create(
+                "minecraft:andesite_wall",
+                {"north": "tall", "east": "tall", "south": "tall", "west": "none", "up": "false"},
+            ),
+            BlockInfo(neighbor_rule=NeighborRule.WALL),
+        )
+        blocks = {(0, 0, 0): wall}
+
+        NeighborResolver(self.registry, domains_can_connect=lambda a, b: False).resolve_all(blocks)
+
+        self.assertEqual(self.registry.get_state(blocks[(0, 0, 0)]).get("up"), "false")
+
+    def test_a_block_of_its_own_domain_holds_it_up(self) -> None:
+        registry = BlockRegistry.for_vanilla_26_2()
+        button = registry.register(BlockState.create(
+            "minecraft:stone_button", {"face": "floor", "facing": "east", "powered": "false"},
+        ))
+        bars = registry.register(BlockState.create("minecraft:iron_bars"))
+        blocks = {(0, 0, 0): bars, (0, 1, 0): button}
+
+        NeighborResolver(registry, domains_can_connect=lambda a, b: False).resolve_all(blocks)
+
+        self.assertIn((0, 1, 0), blocks)
+
     def test_vanilla_wall_attachable_requires_center_support(self) -> None:
         registry = BlockRegistry.for_vanilla_26_2()
         torch_state = vanilla_catalog().default_state("minecraft:wall_torch")

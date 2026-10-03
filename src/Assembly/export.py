@@ -5,7 +5,9 @@ from __future__ import annotations
 # blocks, air where it clears ground, and the save's own blocks elsewhere --
 # so pasting it with air changes exactly what the build changes.
 
+import re
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path as FilePath
 
 import numpy as np
@@ -13,6 +15,7 @@ import numpy as np
 from ..Core.World.block_world import BlockWorld
 from ..Core.block.palette import BlockPalette
 from ..Core.block.states import BlockState
+from ..Core.block.vanilla import vanilla_catalog
 from ..Core.coordinates import BlockPos
 from ..Format.litematic import write_litematic
 from ..Format.region import AIR, AIR_NAMES, BlockRegion
@@ -22,6 +25,8 @@ from ..Terraform import Terraforming
 from ..Terraform.clearance import OPEN
 from ..Terraform.region import WorldBlocks
 from ..Terraform.terrain import region_directory
+
+WATER = BlockState.create("minecraft:water")
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,22 +53,39 @@ def write_pieces(
         raise ValueError(
             "the split asks for terrain, but the build has no terraform world to copy it from"
         )
-    states, positions, codes = _changed_cells(world, terraforming)
-    source = (
-        WorldBlocks(region_directory(FilePath(spec.terraform.world).resolve()))
-        if ground and spec.terraform.world is not None else None
+    states, positions, codes, soft = _changed_cells(
+        world, terraforming, waterlog=bool(spec.terraform and spec.terraform.waterlog),
     )
+    source = (
+        WorldBlocks(region_directory(FilePath(spec.terraform.terrain_world).resolve(), spec.terraform.dimension),
+                    snapshot=getattr(terraforming, "terrain_chunks", None))
+        if ground and spec.terraform.terrain_world is not None else None
+    )
+    extent = _terrain_extent(positions, terraforming, split.terrain_depth) if ground else positions
+    boxes = list(_boxes(extent, split.max_span, split.max_blocks))
+    # Check availability before replacing an older complete export.
+    if source is not None:
+        chunks = {
+            (x, z) for low, high in boxes
+            for x in range(low.x >> 4, (high.x >> 4) + 1)
+            for z in range(low.z >> 4, (high.z >> 4) + 1)
+        }
+        for x, z in sorted(chunks):
+            _require_chunk(source, x, z)
     directory = FilePath(split.directory)
     directory.mkdir(parents=True, exist_ok=True)
-    # Remove the previous run's pieces so none are left over.
-    for stale in directory.glob(f"{spec.output.name}_[0-9][0-9][0-9]{SCHEM_SUFFIX}"):
-        stale.unlink()
+    # Remove the previous run's pieces so none are left over, numbered
+    # plainly or, as they once were, to three places.
+    numbered = re.compile(rf"{re.escape(spec.output.name)}_[0-9]+{re.escape(SCHEM_SUFFIX)}")
+    for stale in directory.iterdir():
+        if numbered.fullmatch(stale.name):
+            stale.unlink()
     first = BlockPos.coerce(spec.path.points[0])
     pieces: list[Piece] = []
-    for number, (low, high) in enumerate(_boxes(positions, split.max_span, split.max_blocks)):
-        name = f"{spec.output.name}_{number:03d}"
+    for number, (low, high) in enumerate(boxes):
+        name = f"{spec.output.name}_{number}"
         region, placed, cleared, copied = _build_piece(
-            name, low, high, states, positions, codes, source, terraforming
+            name, low, high, states, positions, codes, soft, source, terraforming
         )
         path = directory / f"{name}{SCHEM_SUFFIX}"
         relative = spec.output.mode == "relative"
@@ -80,16 +102,20 @@ def write_pieces(
     return pieces
 
 
-def _changed_cells(world: BlockWorld, terraforming: Terraforming | None):
+def _changed_cells(world: BlockWorld, terraforming: Terraforming | None, *, waterlog: bool = False):
     # Every changed cell as (positions, codes into `states`): laid blocks and
-    # air where ground is cut and nothing is laid.
+    # air where ground is cut and nothing is laid. `soft` marks laid blocks
+    # the ground may cover.
     states: list[BlockState] = [AIR]
     index: dict[BlockState, int] = {AIR: 0}
-    xs, ys, zs, codes = [], [], [], []
+    xs, ys, zs, codes, soft = [], [], [], [], []
     laid: set[tuple[int, int, int]] = set()
     for _, blocks in world.iter_resolved_chunks(None):
         for position, block_id in blocks.items():
             state = world.registry.get_state(block_id)
+            if (waterlog or getattr(terraforming, "track_clearance", None) is not None
+                    or getattr(terraforming, "dry_blocks", ())):
+                state = _in_water(state, position, terraforming, waterlog=waterlog)
             code = index.get(state)
             if code is None:
                 code = index[state] = len(states)
@@ -98,6 +124,13 @@ def _changed_cells(world: BlockWorld, terraforming: Terraforming | None):
             ys.append(position.y)
             zs.append(position.z)
             codes.append(code)
+            # An explicit excavation wins over a yielding authored cell.
+            # Otherwise copying the save can put its snow, leaves or rock
+            # back into the clearance after the cut has already claimed it.
+            soft.append(
+                False if terraforming is not None and position in terraforming.cut
+                else world.yields(world.source_at(position))
+            )
             laid.add((position.x, position.y, position.z))
     if terraforming is not None:
         for position in terraforming.cut:
@@ -107,11 +140,88 @@ def _changed_cells(world: BlockWorld, terraforming: Terraforming | None):
             xs.append(position.x)
             ys.append(position.y)
             zs.append(position.z)
-            codes.append(0)
+            state = WATER if _submerged(position, terraforming) else AIR
+            code = index.get(state)
+            if code is None:
+                code = index[state] = len(states)
+                states.append(state)
+            codes.append(code)
+            soft.append(False)
     if not xs:
         raise ValueError("the build changes nothing to export")
     positions = np.stack([np.array(xs), np.array(ys), np.array(zs)], axis=1).astype(np.int64)
-    return states, positions, np.array(codes, dtype=np.int64)
+    return states, positions, np.array(codes, dtype=np.int64), np.array(soft, dtype=bool)
+
+
+def _in_track_space(position: BlockPos, terraforming: Terraforming | None, *, floor: bool = False) -> bool:
+    clearance = getattr(terraforming, "track_clearance", None)
+    if clearance is None or not terraforming.grid.holds(position.x, position.z):
+        return False
+    row, cell = terraforming.grid.at(position.x, position.z)
+    low, high = clearance.floor.item(row, cell), clearance.ceiling.item(row, cell)
+    return low <= high and low - int(floor) <= position.y <= high
+
+
+def _in_water(state: BlockState, position: BlockPos, terraforming: Terraforming | None, *, waterlog: bool = True) -> BlockState:
+    if position in getattr(terraforming, "dry_blocks", ()) or _in_track_space(position, terraforming, floor=True):
+        if state.get("waterlogged") == "true":
+            return BlockState.create(state.name, {**dict(state.properties), "waterlogged": "false"})
+        return state
+    if not waterlog or terraforming is None or terraforming.water is None:
+        return state
+    grid = terraforming.grid
+    if not grid.holds(position.x, position.z):
+        return state
+    at = grid.at(position.x, position.z)
+    water = terraforming.water[at]
+    natural = terraforming.natural[at]
+    bottom = min(natural, np.floor(terraforming.designed[at] + 0.5))
+    if water > natural and bottom < position.y <= water:
+        return _waterlogged_variant(state)
+    return state
+
+
+def _submerged(position: BlockPos, terraforming: Terraforming) -> bool:
+    # A cut cell under a column's water, such as cleared kelp, fills with it.
+    if _in_track_space(position, terraforming):
+        return False
+    water = getattr(terraforming, "water", None)
+    grid = terraforming.grid
+    if water is None or not grid.holds(position.x, position.z):
+        return False
+    at = grid.at(position.x, position.z)
+    return water[at] > terraforming.natural[at] and position.y <= water[at]
+
+
+@cache
+def _waterlogged_variant(state: BlockState) -> BlockState:
+    # Full cubes and double slabs cannot hold water; authored modded blocks
+    # may declare their capability with an existing waterlogged property.
+    if state.get("type") == "double":
+        return state
+    if state.get("waterlogged") is None:
+        try:
+            properties = vanilla_catalog().definition(state.name).properties
+        except KeyError:
+            return state
+        if "waterlogged" not in properties:
+            return state
+    return BlockState.create(state.name, {**dict(state.properties), "waterlogged": "true"})
+
+
+def _terrain_extent(positions, terraforming, depth):
+    coverage = getattr(terraforming, "coverage", None)
+    if coverage is None or not coverage.any():
+        return positions
+    rows, cols = np.nonzero(coverage)
+    grid = terraforming.grid
+    xs, zs = cols + grid.origin.x, rows + grid.origin.z
+    low = terraforming.natural[rows, cols].astype(np.int64) - depth
+    tops = getattr(terraforming, "terrain_top", None)
+    high = (terraforming.natural if tops is None else tops)[rows, cols].astype(np.int64)
+    # Bounds only, not changed cells: all the ground between these bounds
+    # comes from the saved world. No piece drops a bridge's bed or a coast.
+    return np.concatenate((positions, np.stack((xs, low, zs), axis=1), np.stack((xs, high, zs), axis=1)))
 
 
 def _boxes(positions: np.ndarray, span: int, budget: int):
@@ -132,7 +242,7 @@ def _boxes(positions: np.ndarray, span: int, budget: int):
             )
 
 
-def _build_piece(name, low, high, states, positions, codes, source, terraforming):
+def _build_piece(name, low, high, states, positions, codes, soft, source, terraforming):
     size = high - low + (1, 1, 1)
     palette = BlockPalette()
     region = BlockRegion(name, low, size, palette)
@@ -143,22 +253,25 @@ def _build_piece(name, low, high, states, positions, codes, source, terraforming
     lookup = np.array([palette.add(state) for state in states], dtype=np.uint32)
     cells[here[:, 1], here[:, 2], here[:, 0]] = lookup[code]
     occupancy[here[:, 1], here[:, 2], here[:, 0]] = 1
+    yielding = np.zeros_like(occupancy, dtype=bool)
+    yielding[here[:, 1], here[:, 2], here[:, 0]] = soft[inside]
     placed = int(np.count_nonzero(code))
     cleared = int(np.count_nonzero(code == 0))
     copied = 0
     if source is not None:
-        copied = _copy_ground(region, cells, occupancy, source, terraforming)
+        copied = _copy_ground(region, cells, occupancy, yielding, source, terraforming)
     return region, placed, cleared, copied
 
 
-def _copy_ground(region, cells, occupancy, source: WorldBlocks, terraforming: Terraforming) -> int:
-    # Unchanged cells take the save's block, or air inside the clearance.
+def _copy_ground(region, cells, occupancy, yielding, source: WorldBlocks, terraforming: Terraforming) -> int:
+    # Unchanged cells take the save's block; a
+    # laid block the ground may cover gives way to the save's ground.
     low, size = region.origin, region.size
-    floor, ceiling = _clearance_box(terraforming, low, size)
     copied = 0
-    lookups: dict[int, np.ndarray] = {}
+    lookups: dict[tuple[BlockState, ...], np.ndarray] = {}
     for chunk_x in range(low.x >> 4, (low.x + size.x - 1 >> 4) + 1):
         for chunk_z in range(low.z >> 4, (low.z + size.z - 1 >> 4) + 1):
+            _require_chunk(source, chunk_x, chunk_z)
             x0, x1 = max(low.x, chunk_x * 16), min(low.x + size.x, chunk_x * 16 + 16)
             z0, z1 = max(low.z, chunk_z * 16), min(low.z + size.z, chunk_z * 16 + 16)
             for section_y in range(low.y >> 4, (low.y + size.y - 1 >> 4) + 1):
@@ -172,7 +285,7 @@ def _copy_ground(region, cells, occupancy, source: WorldBlocks, terraforming: Te
                     z0 - chunk_z * 16:z1 - chunk_z * 16,
                     x0 - chunk_x * 16:x1 - chunk_x * 16,
                 ]
-                key = id(states)
+                key = tuple(states)
                 mapped = lookups.get(key)
                 if mapped is None:
                     mapped = lookups[key] = np.array(
@@ -180,21 +293,23 @@ def _copy_ground(region, cells, occupancy, source: WorldBlocks, terraforming: Te
                         dtype=np.uint32,
                     )
                 natural = mapped[block]
-                ys = np.arange(y0, y1)[:, None, None]
-                keep = (
-                    (ys < floor[None, z0 - low.z:z1 - low.z, x0 - low.x:x1 - low.x])
-                    | (ys > ceiling[None, z0 - low.z:z1 - low.z, x0 - low.x:x1 - low.x])
-                )
-                natural = np.where(keep, natural, 0).astype(np.uint32)
                 window = (
                     slice(y0 - low.y, y1 - low.y),
                     slice(z0 - low.z, z1 - low.z),
                     slice(x0 - low.x, x1 - low.x),
                 )
-                free = occupancy[window] == 0
+                free = (occupancy[window] == 0) | (yielding[window] & (natural != 0))
                 cells[window] = np.where(free, natural, cells[window])
                 copied += int(np.count_nonzero(free & (natural != 0)))
     return copied
+
+
+def _require_chunk(source, x, z):
+    if not source.generated(x, z):
+        raise ValueError(
+            f"Cannot copy terrain: saved chunk ({x}, {z}) is missing or unfinished. "
+            "Generate and save that area before exporting."
+        )
 
 
 def _clearance_box(terraforming: Terraforming, low: BlockPos, size: BlockPos):
@@ -255,10 +370,35 @@ def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool
 def write(
     world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None
 ) -> FilePath:
-    # The output suffix picks .schem or .litematic; a split also writes pieces.
+    # The output suffix picks .schem or .litematic; a split writes pieces,
+    # with the full combined file optional for large terrain corridors.
     if spec.output.split is not None:
         write_pieces(world, spec, terraforming)
-    region = BlockRegion.from_world(world, name=spec.output.name)
+    split = spec.output.split
+    if split is not None and not split.combined:
+        # Do not leave a previous build's combined file looking current.
+        spec.output.path.unlink(missing_ok=True)
+        return FilePath(split.directory) / f"{spec.output.name}.toml"
+    if split is not None and split.terrain and terraforming is not None:
+        states, positions, codes, soft = _changed_cells(
+            world, terraforming, waterlog=bool(spec.terraform and spec.terraform.waterlog),
+        )
+        extent = _terrain_extent(positions, terraforming, split.terrain_depth)
+        source = WorldBlocks(region_directory(FilePath(spec.terraform.terrain_world).resolve(), spec.terraform.dimension),
+                             snapshot=getattr(terraforming, "terrain_chunks", None))
+        region, _, _, _ = _build_piece(
+            spec.output.name, BlockPos.coerce(extent.min(axis=0)), BlockPos.coerce(extent.max(axis=0)),
+            states, positions, codes, soft, source, terraforming,
+        )
+    else:
+        region = BlockRegion.from_world(world, name=spec.output.name)
+        waterlog = bool(spec.terraform and spec.terraform.waterlog)
+        if (waterlog or getattr(terraforming, "track_clearance", None) is not None
+                or getattr(terraforming, "dry_blocks", ())):
+            for position, state in region.iter_occupied():
+                wet = _in_water(state, position, terraforming, waterlog=waterlog)
+                if wet != state:
+                    region.set_state(position, wet)
     first_point = spec.path.points[0]
     if spec.output.path.suffix == SCHEM_SUFFIX:
         # Offset is the minimum corner; relative mode rebases it on the first

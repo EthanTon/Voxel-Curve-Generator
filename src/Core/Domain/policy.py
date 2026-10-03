@@ -48,6 +48,7 @@ class DomainProfile:
     terrain_mask_mode: TerrainMaskMode
     properties: Mapping[str, object]
     stairs_join_diagonals: bool = False
+    preserve_state: bool = False
 
     @property
     def domain_id(self) -> DomainId:
@@ -102,6 +103,21 @@ class DomainPlacementRule(_PolicyRule):
     @property
     def policy_token(self) -> tuple[object, ...]:
         return self.policy.placement_token
+
+
+class DomainStateRule(_PolicyRule):
+    __slots__ = ()
+
+    def __call__(self, domain: DomainId) -> bool:
+        profile = self.policy._profiles.get(domain)
+        return profile is not None and profile.preserve_state
+
+    @property
+    def policy_token(self) -> tuple[object, ...]:
+        return tuple(
+            (key, profile.preserve_state)
+            for key, profile in sorted(self.policy._profiles.items())
+        )
 
 
 class DomainPolicy(DomainLookup):
@@ -300,6 +316,7 @@ class DomainPolicy(DomainLookup):
             domains_can_connect=self.connection_rule,
             blocks_can_connect=blocks_can_connect,
             stairs_join_diagonals=DomainStairRule(self),
+            preserve_state=DomainStateRule(self),
             options=ConnectivityOptions(combined) if combined else None,
         )
 
@@ -423,6 +440,7 @@ class DomainPolicy(DomainLookup):
             stairs_join_diagonals=inherit(
                 lambda d: d.connectivity.stairs_join_diagonals, False
             ),
+            preserve_state=inherit(lambda d: d.connectivity.preserve_state, False),
             placement_mode=inherit(lambda d: d.placement.mode, DEFAULT_PLACEMENT_MODE),
             replace=inherit(lambda d: d.placement.replace, DEFAULT_BLOCK),
             replacement=self._inherit(lineage, lambda d: d.replacement),

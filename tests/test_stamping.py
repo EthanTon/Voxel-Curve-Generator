@@ -236,9 +236,10 @@ class HeadingStampTests(StampingTestCase):
         self.assertEqual(stamp.at(22.5), (features[22.5], 0, False))
         self.assertEqual(stamp.at(67.5), (features[22.5], 0, True))
 
-    def test_the_mirror_reflects_what_it_lays_about_the_diagonal(self) -> None:
-        # An L, so a reflection shows: what 67.5 lays is what 22.5 lays with
-        # x and z swapped, which is what a mirror across the diagonal is.
+    def test_the_mirror_keeps_the_left_of_travel_on_the_left(self) -> None:
+        # An L, so a reflection shows: what 67.5 lays is what 22.5 lays
+        # mirrored across the other diagonal, so the side of travel each
+        # block stands on is kept and only its place along travel turns.
         shape = self.feature()
         shape.blocks.set_block(BlockPos(2, 0, 0), BlockState.create("minecraft:stone"))
         shape.blocks.set_block(BlockPos(0, 0, 2), BlockState.create("minecraft:gold_block"))
@@ -252,7 +253,31 @@ class HeadingStampTests(StampingTestCase):
             stamp.stamp(world, stamp.rule(point), point, clip=UNCLIPPED)
             laid[heading] = {(p.x, p.z) for p in world.iter_source_positions()}
 
-        self.assertEqual(laid[67.5], {(z, x) for x, z in laid[22.5]})
+        self.assertEqual(laid[67.5], {(-z, -x) for x, z in laid[22.5]})
+
+    def test_a_diagonal_leans_with_the_quarter_it_is_laid_in(self) -> None:
+        # A 4-block arm staircased across a north-east diagonal: laid north it
+        # runs mostly along x, laid east (the section's rows run along z) it
+        # is its reflection across the diagonal and runs mostly along z.
+        arm = self.feature()
+        for x, z in ((1, 0), (2, 1), (3, 1)):
+            arm.blocks.set_block(BlockPos(x, 0, z), BlockState.create("minecraft:stone"))
+        stamp = HeadingStamp({h: arm for h in (0.0, 22.5, 45.0)}, 22.5, self.domains)
+
+        self.assertEqual(stamp.at(135.0, 90), (arm, 1, False))
+        self.assertEqual(stamp.at(135.0, 180), (arm, 1, True))
+        laid = {}
+        for layout in (90, 180):
+            world = BlockWorld(BlockRegistry())
+            self.domains.bind(world)
+            point = self.point(gradient=(1, 0, -1), layout=layout)
+            stamp.stamp(world, stamp.rule(point), point, clip=UNCLIPPED)
+            laid[layout] = {(p.x, p.z) for p in world.iter_source_positions()}
+
+        self.assertEqual(laid[180], {(z, x) for x, z in laid[90]})
+        spread = lambda cells, axis: len({cell[axis] for cell in cells})
+        self.assertGreater(spread(laid[90], 0), spread(laid[90], 1))
+        self.assertGreater(spread(laid[180], 1), spread(laid[180], 0))
 
     def test_grade_does_not_change_which_feature_is_stamped(self) -> None:
         features = self.quadrant()

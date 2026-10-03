@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
 from ..Core.Domain import DomainRegistry
 from ..Core.CrossSection.turns import (
+    is_quarter,
     normalize,
     place_along as placed_column,
     quarter_of,
@@ -189,26 +190,37 @@ class HeadingStamp:
         self.resolution = resolution
         self.domains = domains
         self._features = by_authored(features, resolution)
-        self._turns: dict[int, tuple[Feature, int, bool]] = {}
+        self._turns: dict[tuple[int, bool], tuple[Feature, int, bool]] = {}
 
     @property
     def headings(self) -> tuple[Heading, ...]:
         return authored_headings(self.resolution)
 
-    def at(self, heading: Heading) -> tuple[Feature, int, bool]:
+    def at(self, heading: Heading, layout: int | None = None) -> tuple[Feature, int, bool]:
         # (variant, quarter turns, mirrored), cached per step so the same
-        # feature object is reused.
+        # feature object is reused. A diagonal laid in the next quarter leans
+        # the other way, mirrored across it to follow the section's rows.
         step = step_of(heading, self.resolution)
-        found = self._turns.get(step)
+        per_quarter = steps_per_quarter(self.resolution)
+        quarter_turns, within = divmod(step, per_quarter)
+        past = (
+            2 * within == per_quarter
+            and layout is not None
+            and is_quarter(layout)
+            and normalize(layout) // 90 == (quarter_turns + 1) % 4
+        )
+        found = self._turns.get((step, past))
         if found is None:
-            quarter_turns, within = divmod(step, steps_per_quarter(self.resolution))
-            offset, mirrored = authored_for(within, self.resolution, self._features)
+            if past:
+                offset, mirrored = within, True
+            else:
+                offset, mirrored = authored_for(within, self.resolution, self._features)
             found = (self._features[offset], quarter_turns, mirrored)
-            self._turns[step] = found
+            self._turns[(step, past)] = found
         return found
 
     def rule(self, point: FeaturePathPoint) -> Feature:
-        return self.at(heading_of(point.gradient))[0]
+        return self.at(heading_of(point.gradient), point.laid_at)[0]
 
     def stamp(
         self,
@@ -220,7 +232,7 @@ class HeadingStamp:
         y_offset: YOffset | None = None,
         sequence_index: int | None = None,
     ) -> tuple[PlacementId, ...]:
-        _, quarter_turns, mirrored = self.at(heading_of(point.gradient))
+        _, quarter_turns, mirrored = self.at(heading_of(point.gradient), point.laid_at)
         return (
             place(
                 world,
@@ -228,7 +240,9 @@ class HeadingStamp:
                 point,
                 clip=clip,
                 quarter_turns=laid_out(quarter_turns + (DIAGONAL_TURN if mirrored else 0)),
-                mirror="x" if mirrored else None,
+                # Mirrored along travel, as the offset is: a reflection
+                # across it would carry the left of travel to the right.
+                mirror="z" if mirrored else None,
                 # The offset follows the section's layout, not the heading.
                 offset_layout=point.layout,
                 domains=self.domains,
@@ -268,6 +282,10 @@ def place(
     )
     profile = None if domains is None else domains.profile(feature.domain)
     surface_mask = getattr(feature, "surface_mask", None)
+    predicate = None if surface_mask is None else world.surface_reference.mask(surface_mask)
+    minimum_y = getattr(feature, "surface_mask_min_y", None)
+    if predicate is not None and minimum_y is not None:
+        predicate = replace(predicate, minimum_y=transform.origin.y + minimum_y)
     return world.add_field(
         feature.blocks,
         placement_mode=feature.placement_mode,
@@ -280,10 +298,8 @@ def place(
         connectivity_domain=0 if profile is None else profile.domain_id,
         sequence_index=sequence_index,
         clip=clip,
-        surface_mask=(
-            None if surface_mask is None else
-            world.surface_reference.mask(surface_mask)
-        ),
+        surface_mask=predicate,
+        yielding=getattr(feature, "yielding", frozenset()),
     )
 
 
@@ -296,7 +312,8 @@ def stamp_along(
     y_offset: YOffset | None = None,
     sequence_index: int | None = None,
 ) -> tuple[PlacementId, ...]:
-    # Stamps every point of `path`; connectivity is resolved later.
+    # Stamps every point of `path`; connectivity is resolved later. Each
+    # placement records the path point that laid it, unless told otherwise.
     return tuple(
         placed
         for point in path
@@ -306,7 +323,7 @@ def stamp_along(
             point,
             clip=clip(point),
             y_offset=y_offset,
-            sequence_index=sequence_index,
+            sequence_index=point.path_index if sequence_index is None else sequence_index,
         )
     )
 

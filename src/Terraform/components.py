@@ -15,12 +15,16 @@ FACES = (
 )
 
 
-def reaching(within: Set[BlockPos], sources: Iterable[BlockPos]) -> frozenset[BlockPos]:
+def reaching(
+    within: Set[BlockPos], sources: Iterable[BlockPos],
+    steps: Iterable[BlockPos] = FACES,
+) -> frozenset[BlockPos]:
+    steps = tuple(steps)
     found = {each for each in sources if each in within}
     pending = list(found)
     while pending:
         position = pending.pop()
-        for step in FACES:
+        for step in steps:
             neighbour = position + step
             if neighbour in within and neighbour not in found:
                 found.add(neighbour)
@@ -28,10 +32,13 @@ def reaching(within: Set[BlockPos], sources: Iterable[BlockPos]) -> frozenset[Bl
     return frozenset(found)
 
 
-def components(cells: Set[BlockPos]) -> Iterator[frozenset[BlockPos]]:
+def components(
+    cells: Set[BlockPos], steps: Iterable[BlockPos] = FACES,
+) -> Iterator[frozenset[BlockPos]]:
+    steps = tuple(steps)
     remaining = set(cells)
     while remaining:
-        found = reaching(remaining, [next(iter(remaining))])
+        found = reaching(remaining, [next(iter(remaining))], steps)
         remaining -= found
         yield found
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 from ..Core.CrossSection.cross_section import CrossSection
@@ -13,13 +13,18 @@ from ..Core.Path.path_frame import PathFrame
 from ..Core.World.block_world import BlockWorld
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos
+from ..Core.Feature.dependent_path import DependentFeaturePath
 from ..Core.modes import StepMode
+from ..Core.line import line
 from ..Generation.Geometry.frames import level_near
 from ..Generation.Geometry.orientation import SectionOrientation
 from ..Generation.Geometry.silhouette import (
+    AnnotationColumnMask,
     IntersectMask,
+    OutsideMask,
     PathSilhouette,
     SectionColumnMask,
+    annotation_column_owners,
     section_column_owners,
 )
 from ..Generation.Sweep.delivery import nearby_frames
@@ -27,10 +32,10 @@ from ..Generation.Sweep.paths import DeliveredPath, deliver_paths
 from ..Terraform import Terraforming, load_terrain
 from ..Terraform.surface_mask import SurfaceReference
 from ..Stamping import ClipRule, TurnStamp, resolve, stamp_along
-from ..Parser.spec import BuildSpec
-from .anchors import runs_under, structure_points, structure_runs
+from ..Parser.spec import BuildSpec, WireGeometry, WireSpec
+from .anchors import fitted_sections, runs_under, strand_source, structure_points, structure_runs, wire_routes
 from .earthworks import feet_of, reshape
-from .lanes import lane_support, mark_lane
+from .lanes import lane_support, mark_lane, support_rail_joints
 from .structure import (
     build_domains,
     build_lane,
@@ -41,7 +46,8 @@ from .structure import (
     build_structure,
     resolve_spans,
 )
-from .wires import lay_wire, strand_of
+from .wires import WIRE_LINES, dependent_strand, lay_wire, line_strand, strand_of
+from .dependencies import build_feature_paths, dependent_intervals
 
 
 # How many path points from its own a fitting may land in a frame of: past
@@ -65,7 +71,7 @@ def build(spec: BuildSpec) -> Built:
     masked = _surface_masks(spec)
     designed = any(mask.reference == "designed" for mask in masked)
     surface_world = spec.surface_world or (
-        None if spec.terraform is None else spec.terraform.world
+        None if spec.terraform is None else spec.terraform.terrain_world
     )
     if masked and surface_world is None:
         raise ValueError(
@@ -73,7 +79,10 @@ def build(spec: BuildSpec) -> Built:
         )
     if spec.terraform is None and designed:
         raise ValueError("surface_mask.reference = 'designed' needs a terraform plan")
-    surface = SurfaceReference(load_terrain(surface_world)) if masked else None
+    surface_dimension = spec.surface_dimension or (
+        spec.terraform.dimension if spec.surface_world is None and spec.terraform else None
+    )
+    surface = SurfaceReference(load_terrain(surface_world, surface_dimension)) if masked else None
     world = BlockWorld(registry, surface_reference=surface)
     domains.bind(world)
 
@@ -100,6 +109,8 @@ def build(spec: BuildSpec) -> Built:
             fittings.setdefault(laying.fitting, []).extend(
                 feet_of(world, placed or ())
             )
+    support_rail_joints(world, {domains.profile(section.domain).domain_id
+                                for section in spec.sections})
     designed_masks = surface is not None and designed
     if designed_masks:
         # Features masked by the designed surface and the earthworks depend
@@ -190,15 +201,19 @@ def all_layings(
     silhouette: PathSilhouette,
 ) -> Iterator[Laying]:
     # Every placement of the build, lazily. Sections are clipped to their own
-    # frames; fittings may land in frames near their point. Later spans and
-    # then stepping columns go in last, so they keep contested cells.
+    # frames, and a world column two of a span's columns reach goes to one
+    # of them; fittings may land in frames near their point.
     owners = section_column_owners(runs, schedules)
+    columns = annotation_column_owners(runs, silhouette.path)
     for run in sorted(
         runs,
         key=lambda run: (run.start, run.annotation.step_mode is StepMode.MANHATTAN),
     ):
         span_mask = silhouette.for_span(schedules[run.section_name].spans[run.span])
         stack_mask = SectionColumnMask(owners, run.section_name, run.span)
+        held = columns.get((run.section_name, run.span))
+        if held is not None:
+            stack_mask = IntersectMask(stack_mask, AnnotationColumnMask(held, run.annotation.column_name))
         section_clip = lambda point, mask=span_mask, stack=stack_mask: IntersectMask(
             IntersectMask(clip(point), mask), stack
         )
@@ -212,28 +227,125 @@ def all_layings(
         )
     fitted = nearby_frames(frames, max(spec.path.lead, FITTING_REACH))
     level = level_near(frames)
+
+    def kept_to(fitting) -> ClipRule:
+        # Near its point, and off the spans of sections it doesn't ride, so
+        # a rail ending at a handover doesn't step onto the next section.
+        riding = fitted_sections(spec, fitting)
+        if isinstance(fitting, WireSpec) and not fitting.between:
+            # Straight and followed parts of the same strand may continue
+            # across a section handover. Do not clip their connecting cells
+            # against each other; an unwired stretch still excludes them.
+            riding = tuple(dict.fromkeys(
+                name for wire in spec.wires
+                if not wire.between
+                and (wire.domain, wire.offset, wire.schematic) ==
+                    (fitting.domain, fitting.offset, fitting.schematic)
+                and strand_source(spec, wire) == strand_source(spec, fitting)
+                for name in wire.sections
+            ))
+        ridden = [
+            span for name, schedule in schedules.items() if name in riding
+            for span in schedule.spans
+        ]
+        # A section laid over one it rides, such as an edge, doesn't count;
+        # neighbours sharing only the point they meet at do.
+        others = tuple(
+            silhouette.for_span(span)
+            for name, schedule in schedules.items() if name not in riding
+            for span in schedule.spans
+            if not any(
+                min(each.path_stop, span.path_stop) - max(each.path_start, span.path_start) > 1
+                for each in ridden
+            )
+        )
+        if not others:
+            return fitted
+        outside = OutsideMask(others)
+        return lambda point: IntersectMask(fitted(point), outside)
+
+    wire_paths = {
+        wire.name: wire_routes(wire, runs_under(spec, wire, runs))
+        for wire in spec.wires if wire.geometry is WireGeometry.LINE and not wire.between and wire.feature_path is None
+    }
+    named_paths = {each.name for each in spec.feature_paths}
+    dependent_paths = build_feature_paths(spec, runs, sections, silhouette.path, level, kept_to) if named_paths else {}
     for structure in spec.structures:
+        structure_clip = kept_to(structure)
+        dependent = structure.feature_path in named_paths or (
+            structure.wire is not None and spec.wire(structure.wire).feature_path is not None
+        )
+        if dependent:
+            stamp = build_structure(replace(structure, offset=BlockPos(0, 0, 0)), registry, domains,
+                                    DependentFeaturePath(f"structure:{structure.name}", rules=()))
+            for points in dependent_paths[f"structure:{structure.name}"]:
+                yield Laying(structure.domain, partial(stamp_along, stamp, world, points, clip=structure_clip), structure.name)
+            continue
         stamp = build_structure(structure, registry, domains)
-        for run, anchors in structure_runs(spec, structure, runs):
+        for run, anchors in structure_runs(spec, structure, runs, wire_paths.get(structure.wire)):
             points = structure_points(
                 structure, anchors, sections[run.section_name], level
             )
             yield Laying(
                 structure.domain,
-                partial(stamp_along, stamp, world, points, clip=fitted),
+                partial(stamp_along, stamp, world, points, clip=structure_clip),
                 structure.name,
             )
+    continuations = {}
+
+    def remember(wire, start, stop, strand):
+        if strand:
+            key = (wire.domain, wire.offset, wire.schematic, wire.step, strand_source(spec, wire))
+            continuations.setdefault(key, []).append((start, stop, strand[0], strand[-1], wire))
+
     for wire in spec.wires:
+        if wire.feature_path is not None:
+            intervals = dependent_intervals(spec, wire, runs)
+            for anchors in dependent_paths[f"wire:{wire.name}"]:
+                strand = dependent_strand(anchors, wire.step, kept_to(wire))
+                start, stop = anchors[0].path_index, anchors[-1].path_index
+                start, stop = next(((first, last) for first, last in intervals
+                                    if first <= start <= stop <= last), (start, stop))
+                remember(wire, start, stop, strand)
+                yield Laying(wire.domain, partial(lay_wire, wire, strand, world, registry, domains, frames))
+            continue
+        if wire.geometry is WireGeometry.LINE and not wire.between:
+            for route in wire_paths[wire.name]:
+                strand = line_strand(wire, route, sections, level, kept_to(wire))
+                remember(wire, route[0][1][0].path_index, route[-1][1][-1].path_index, strand)
+                yield Laying(
+                    wire.domain,
+                    partial(lay_wire, wire, strand, world, registry, domains, frames),
+                )
+            continue
         for run in runs_under(spec, wire, runs):
             strand = strand_of(
-                spec, wire, run, sections[run.section_name], level, fitted, runs
+                spec, wire, run, sections[run.section_name], level, kept_to(wire), runs,
+                dependent_paths,
             )
+            if not wire.between:
+                remember(wire, min(point.path_index for point in run.path),
+                         max(point.path_index for point in run.path), strand)
+            yield Laying(
+                wire.domain,
+                partial(lay_wire, wire, strand, world, registry, domains, frames),
+            )
+    for pieces in continuations.values():
+        pieces.sort(key=lambda piece: piece[:2])
+        for previous, following in zip(pieces, pieces[1:]):
+            if following[0] != previous[1] + 1:
+                continue
+            wire = following[-1]
+            # Preserve the face-connected handover between two compatible
+            # strands, including a change between line and follow geometry.
+            strand = line(previous[3], following[2], WIRE_LINES[wire.step])
             yield Laying(
                 wire.domain,
                 partial(lay_wire, wire, strand, world, registry, domains, frames),
             )
     for lane in spec.lanes:
         stamp = TurnStamp(build_lane(lane, registry, domains), domains)
+        clip_lane = kept_to(lane)
         for run in runs_under(spec, lane, runs):
             marked = mark_lane(
                 lane, run, sections[run.section_name], level,
@@ -241,6 +353,6 @@ def all_layings(
             )
             yield Laying(
                 lane.domain,
-                partial(stamp_along, stamp, world, marked, clip=fitted),
+                partial(stamp_along, stamp, world, marked, clip=clip_lane),
                 lane.name,
             )

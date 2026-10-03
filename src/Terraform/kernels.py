@@ -17,10 +17,70 @@ def box(field: Field, radius: int, edge: str = "edge") -> Field:
 
 
 def gaussian(field: Field, sigma: float, edge: str = "edge") -> Field:
-    # Approximated by repeated box blurs.
-    for radius in _box_radii(sigma, GAUSSIAN_PASSES):
-        field = box(field, radius, edge)
-    return field
+    # A separable Gaussian responds continuously even at sub-block sizes.
+    # Integer box approximations made 0.75..1.25 brushes jump between shapes.
+    from scipy.ndimage import gaussian_filter
+    if sigma <= 0:
+        return field
+    return gaussian_filter(field.astype(np.float64), sigma,
+                           mode="nearest" if edge == "edge" else edge, truncate=4.0)
+
+
+def wendland(field: Field, radius: float, edge: str = "edge") -> Field:
+    """Radial C2 kernel with finite support, for compact contour finishing."""
+    from scipy.ndimage import convolve
+    if radius <= 0:
+        return field
+    reach = ceil(radius)
+    axis = np.arange(-reach, reach + 1)
+    t = np.minimum(np.hypot(axis[:, None], axis[None, :]) / radius, 1.0)
+    weight = (1 - t) ** 4 * (1 + 4 * t)
+    weight /= weight.sum()
+    return convolve(field.astype(np.float64), weight,
+                    mode="nearest" if edge == "edge" else edge)
+
+
+def normalized(values: Field, known: Field, radius: float, kernel: str = "gaussian") -> Field:
+    """Missing samples are absent, rather than zero-height terrain."""
+    def spread(field):
+        if kernel == "wendland":
+            return wendland(field, 3 * radius, "constant")
+        if kernel == "average":
+            return disk(field, 2 * radius, "constant")
+        if kernel == "both":
+            return disk(gaussian(field, radius, "constant"), 2 * radius, "constant")
+        return gaussian(field, radius, "constant")
+    share = spread(known.astype(float))
+    total = spread(np.where(known, values, 0.0))
+    return np.divide(total, share, out=values.astype(float).copy(), where=share > 1e-9)
+
+
+def contour(values: Field, guide: Field, domain: Field, iterations: int,
+            edge_scale: float = 3.0) -> Field:
+    """Diffuse displacement along native contours, through face neighbours.
+
+    Unlike a spatial blur this cannot jump a masked strip. All updates use
+    the same snapshot; native cliffs weaken diffusion across their edge.
+    """
+    result = values.astype(float).copy()
+    edges = []
+    for axis in range(values.ndim):
+        first, second = [slice(None)] * values.ndim, [slice(None)] * values.ndim
+        first[axis], second[axis] = slice(None, -1), slice(1, None)
+        first, second = tuple(first), tuple(second)
+        valid = domain[first] & domain[second]
+        delta = np.where(valid, guide[first] - guide[second], 0.0)
+        affinity = valid * np.exp(-.5 * (delta / max(edge_scale, 1e-6)) ** 2)
+        edges.append((first, second, affinity))
+    for _ in range(iterations):
+        total, share = result.copy(), np.ones_like(result)
+        for first, second, affinity in edges:
+            total[first] += affinity * result[second]
+            total[second] += affinity * result[first]
+            share[first] += affinity
+            share[second] += affinity
+        result = np.where(domain, total / share, values)
+    return result
 
 
 def disk(field: Field, radius: float, edge: str = "edge") -> Field:
@@ -75,6 +135,29 @@ def closing(field: Field, radius: int) -> Field:
     return local_minimum(local_maximum(field, radius), radius)
 
 
+def square_opening(field: Field, size: int) -> Field:
+    # Every ridge narrower than a `size`-wide square comes down to the
+    # ground either side of it.
+    return _squared(field, size, np.minimum, np.maximum)
+
+
+def square_closing(field: Field, size: int) -> Field:
+    # Every groove narrower than a `size`-wide square fills to the ground
+    # either side of it.
+    return _squared(field, size, np.maximum, np.minimum)
+
+
+def _squared(field: Field, size: int, first, then) -> Field:
+    # `first` over each square, then `then` over the squares holding each
+    # cell; padded so a square off the edge sees the edge.
+    reach = size - 1
+    if reach < 1:
+        return field
+    padded = np.pad(field, reach, mode="edge")
+    out = _from_corner(_from_corner(padded, size, first, 1), size, then, -1)
+    return out[(slice(reach, -reach),) * field.ndim]
+
+
 def slope(field: Field) -> Field:
     rise_z, rise_x = np.gradient(field)
     return np.hypot(rise_x, rise_z)
@@ -101,6 +184,17 @@ def _sweep(field: Field, radius: int, combine) -> Field:
         for shift in range(-radius, radius + 1):
             if shift:
                 gathered = combine(gathered, _shifted(field, shift, axis))
+        field = gathered
+    return field
+
+
+def _from_corner(field: Field, size: int, combine, direction: int) -> Field:
+    # Each cell with the `size - 1` after it (direction 1) or before it (-1)
+    # along every axis: a square anchored at a corner, so any size works.
+    for axis in range(field.ndim):
+        gathered = field
+        for step in range(1, size):
+            gathered = combine(gathered, _shifted(field, -direction * step, axis))
         field = gathered
     return field
 

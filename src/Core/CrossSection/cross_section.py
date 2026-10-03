@@ -382,19 +382,29 @@ class CrossSection:
         leaving, taking = (lower, upper) if clockwise else (upper, lower)
         leaving_lean, taking_lean = (PLAIN, MIRRORED) if clockwise else (MIRRORED, PLAIN)
         inside = profile.right if clockwise else profile.left
+        outside = profile.left if clockwise else profile.right
         half = max(1, profile.long_length // 2)
         taking_up = self._layout(taking, profile, (0, 0), taking_lean)
         being_left = self._layout(leaving, profile, (0, 0), leaving_lean)
         shift = _onto(being_left, taking_up, self.origin, inside)
-        ahead = tuple((forward_x * k, forward_z * k) for k in range(half))
-        behind = tuple(
-            (shift[0] - forward_x * k, shift[1] - forward_z * k)
-            for k in reversed(range(half))
-        )
-        return _centred(_in_travel_order(
-            _repeated(being_left, ahead) + _repeated(taking_up, behind),
-            (forward_x, forward_z),
-        ))
+
+        def carried(carry: int) -> OrientedSection:
+            ahead = tuple((forward_x * k, forward_z * k) for k in range(carry))
+            behind = tuple(
+                (shift[0] - forward_x * k, shift[1] - forward_z * k)
+                for k in reversed(range(carry))
+            )
+            return _repeated(being_left, ahead) + _repeated(taking_up, behind)
+
+        arms = carried(half)
+        if outside in profile.pushes:
+            # A stepping outside edge is a staircase, and the two arms' halves
+            # of it stop a cell apart; one more carry closes it.
+            arms = tuple(
+                longer if offset.annotation.position.x - self.origin.x == outside else offset
+                for offset, longer in zip(arms, carried(half + 1))
+            )
+        return _centred(_in_travel_order(arms, (forward_x, forward_z)))
 
     def _layout(
         self,

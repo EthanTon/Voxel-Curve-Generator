@@ -142,10 +142,10 @@ class LitematicTests(unittest.TestCase):
         loaded = load_litematic(path)
         self.assertEqual(
             sorted(piece.name for piece in loaded),
-            ["curve_000", "curve_001", "curve_002"],
+            ["curve_0", "curve_1", "curve_2"],
         )
         by_name = {piece.name: piece for piece in loaded}
-        self.assertEqual(by_name["curve_001"].origin, BlockPos(4, 0, 0))
+        self.assertEqual(by_name["curve_1"].origin, BlockPos(4, 0, 0))
         self.assertEqual(sum(piece.block_count for piece in loaded), 12)
 
     def test_entities_round_trip_per_region(self) -> None:

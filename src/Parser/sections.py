@@ -41,7 +41,60 @@ def read_section(
         edge_domains=edge_domains,
         edge_from=edge_from,
         surface_mask=read_surface_mask(defined.get("surface_mask")),
+        formation=read_formation(defined.get("formation"), name),
+        terrain_overrides=read_block_names(defined.get("terrain_overrides", ()), name),
+        terrain_overrides_columns=read_override_columns(defined.get("terrain_overrides_columns")),
+        schematic_turns=read_local_height(defined.get("schematic_turns", 0), "schematic_turns"),
+        left_schematic=None if "left_schematic" not in defined else base / defined["left_schematic"],
+        right_schematic=None if "right_schematic" not in defined else base / defined["right_schematic"],
+        half_schematic_turns=read_local_height(defined.get("half_schematic_turns", 0), "half_schematic_turns"),
+        surface_mask_min_y=read_local_height(defined.get("surface_mask_min_y"), "surface_mask_min_y"),
+        surface_mask_columns=read_mask_columns(defined.get("surface_mask_columns")),
     )
+
+
+def read_local_height(value, name):
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+        raise ValueError(f"{name} must be a whole number")
+    return value
+
+
+def read_mask_columns(value):
+    if value is None:
+        return None
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(not isinstance(v, int) or isinstance(v, bool) for v in value)
+            or value[0] > value[1]):
+        raise ValueError("surface_mask_columns needs inclusive [minimum, maximum] columns")
+    return tuple(value)
+
+
+def read_override_columns(value):
+    if value is None:
+        return None
+    if (not isinstance(value, (list, tuple))
+            or any(not isinstance(v, int) or isinstance(v, bool) for v in value)):
+        raise ValueError("terrain_overrides_columns must list whole local columns")
+    return frozenset(value)
+
+
+def read_block_names(data: object, name: str) -> frozenset[str]:
+    if not isinstance(data, (list, tuple)) or not all(
+        isinstance(each, str) and ":" in each for each in data
+    ):
+        raise ValueError(
+            f"section {name!r} terrain_overrides must list block names such as "
+            '"minecraft:andesite"'
+        )
+    return frozenset(data)
+
+
+def read_formation(data: object, name: str) -> int | None:
+    if data is None:
+        return None
+    if not isinstance(data, int) or isinstance(data, bool):
+        raise ValueError(f"section {name!r} formation must be a whole local height")
+    return data
 
 
 def read_edge_domains(data: object, name: str) -> tuple[str, str] | None:
@@ -64,18 +117,20 @@ def read_edge_from(data: object, name: str) -> int | None:
     return data
 
 
-def read_steps(data: Mapping, name: str) -> dict[tuple[int, int], StepMode]:
-    # Per-column step modes, keyed "x,z" in the profile's own local axes.
+def read_steps(data: Mapping, name: str) -> dict[tuple[int, ...], StepMode]:
+    # Step modes in the profile's own local axes: a whole column keyed "x,z",
+    # or one height of it keyed "x,y,z".
     steps = {}
-    for column, mode in data.items():
+    for key, mode in data.items():
         try:
-            x, _, z = column.partition(",")
-            where = (int(x), int(z))
+            where = tuple(int(part) for part in key.split(","))
         except ValueError:
+            where = ()
+        if len(where) not in (2, 3):
             raise ValueError(
-                f"section {name!r} keys a step by {column!r}; a column is "
-                'written "x,z", as in "0,0"'
-            ) from None
+                f"section {name!r} keys a step by {key!r}; a column is "
+                'written "x,z", as in "0,0", and one height of it "x,y,z"'
+            )
         steps[where] = read_enum(StepMode, mode)
     return steps
 

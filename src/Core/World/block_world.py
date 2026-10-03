@@ -132,6 +132,9 @@ class BlockPlacement:
     revision: int = 0
     clip: ColumnMask | None = None
     surface_mask: Callable[[BlockPos], bool] | None = None
+    # Block names an earthworks placement may cover.
+    yielding: frozenset[str] = frozenset()
+    earthworks: bool = False
 
     @property
     def offset(self) -> BlockPos:
@@ -237,6 +240,8 @@ class BlockWorld:
         sequence_index: int | None = None,
         clip: ColumnMask | None = None,
         surface_mask: Callable[[BlockPos], bool] | None = None,
+        yielding: frozenset[str] = frozenset(),
+        earthworks: bool = False,
     ) -> PlacementId:
         if placement_mode == PlacementMode.TERRAIN_MASK and self.terrain_mask is None:
             raise ValueError("TERRAIN_MASK placement requires a terrain_mask callback")
@@ -263,6 +268,8 @@ class BlockWorld:
             order=self._next_order,
             clip=clip,
             surface_mask=surface_mask,
+            yielding=frozenset(yielding),
+            earthworks=earthworks,
         )
         positions = tuple(self._placement_positions(placement))
         before = self._sources(positions)
@@ -562,6 +569,8 @@ class BlockWorld:
             and not self.placement_policy(placement.connectivity_domain, current.domain)
         ):
             return False
+        if placement.earthworks and self.yields(current):
+            return True
         mode = placement.placement_mode
         if mode == PlacementMode.OVERWRITE:
             return True
@@ -580,6 +589,16 @@ class BlockWorld:
                 and self.terrain_mask(position, placement.terrain_mask_mode)
             )
         raise ValueError(f"Unknown placement mode: {mode}")
+
+    def yields(self, cell: ConnectivityCell | None) -> bool:
+        # A block its placement lets the earthworks cover.
+        if cell is None or cell.placement_id is None:
+            return False
+        placement = self._placements.get(cell.placement_id)
+        return bool(
+            placement is not None and placement.yielding
+            and self.registry.get_state(cell.block_id).name in placement.yielding
+        )
 
     def _world_block_id(
         self,

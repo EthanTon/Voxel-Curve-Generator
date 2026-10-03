@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+/sandbox/terraform_test/source_world/
 *.py[codz]
 *$py.class
 
@@ -219,8 +220,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Sandbox
-sandbox/
+# Sandbox experiments are ignored except for the assignment selector sample.
+sandbox/*
+!sandbox/auto_assign/
+sandbox/auto_assign/__pycache__/
+sandbox/auto_assign/*.tmp
+sandbox/auto_assign/out/
 
 .DS_Store
-

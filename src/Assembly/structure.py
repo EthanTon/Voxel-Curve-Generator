@@ -9,21 +9,25 @@ from ..Core.CrossSection.schedule import SectionSchedule, SectionSpan
 from ..Core.Domain import DomainRegistry
 from ..Core.Feature.feature import (
     ContinuousFeature,
+    DependentFeature,
     Feature,
     PointFeature,
 )
 from ..Core.Field.block_field import BlockField
+from ..Core.Feature.dependent_path import DependentFeaturePath
+from ..Core.World.block_world import BlockTransform
 from ..Core.Path.path import Path
 from ..Core.Path.path_frame import PathFrame
 from ..Core.block.palette import BlockPalette
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos, ColumnPos
-from ..Core.modes import ElevationMode, PlacementMode
+from ..Core.modes import ElevationMode, PlacementMode, StepMode
 from ..Format.schematics import load_blocks, parse_state_key
 from ..Generation.Geometry.frames import (
     build_frames,
     build_section_frames,
     elevation_breaks,
+    heading_stations,
     span_stations,
 )
 from ..Generation.Geometry.padding import padded_path
@@ -34,6 +38,7 @@ from ..Parser.spec import (
     LaneSpec,
     SectionSpec,
     SpanSpec,
+    StationSpanSpec,
     StructureSpec,
     WireSpec,
 )
@@ -89,6 +94,7 @@ def resolve_spans(spec: BuildSpec, path: Path) -> dict[str, tuple[tuple[int, int
     starts = {
         (assignment.span.start.x, assignment.span.start.z)
         for assignment in spec.assignments
+        if isinstance(assignment.span, SpanSpec)
     }
     return {
         name: section_spans(spec.section(name), spans, path, starts)
@@ -96,8 +102,8 @@ def resolve_spans(spec: BuildSpec, path: Path) -> dict[str, tuple[tuple[int, int
     }
 
 
-def stretches_by_section(spec: BuildSpec) -> dict[str, list[SpanSpec]]:
-    stretches: dict[str, list[SpanSpec]] = {}
+def stretches_by_section(spec: BuildSpec) -> dict[str, list[SpanSpec | StationSpanSpec]]:
+    stretches: dict[str, list[SpanSpec | StationSpanSpec]] = {}
     for assignment in spec.assignments:
         for name in assignment.sections:
             stretches.setdefault(name, []).append(assignment.span)
@@ -105,7 +111,7 @@ def stretches_by_section(spec: BuildSpec) -> dict[str, list[SpanSpec]]:
 
 
 def section_spans(
-    section: SectionSpec, spans: Sequence[SpanSpec], path: Path,
+    section: SectionSpec, spans: Sequence[SpanSpec | StationSpanSpec], path: Path,
     starts: set[tuple[int, int]] | None = None,
 ) -> tuple[tuple[int, int], ...]:
     # Merges stretches that meet or overlap.
@@ -120,9 +126,17 @@ def section_spans(
 
 
 def span_indices(
-    section: SectionSpec, span: SpanSpec, path: Path,
+    section: SectionSpec, span: SpanSpec | StationSpanSpec, path: Path,
     starts: set[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
+    if isinstance(span, StationSpanSpec):
+        start, stop = span.start + path.first_index, span.stop + path.first_index
+        if stop > path.last_index:
+            raise ValueError(
+                f"section {section.name!r} sweeps {span}, past the last authored path station "
+                f"({path.last_index - path.first_index})"
+            )
+        return start, stop
     start = marker_index(section, span, span.start, path)
     stop = marker_index(section, span, span.stop, path)
     # A marker shared with the next assignment belongs to that one.
@@ -171,12 +185,27 @@ def build_section(
     # One annotation per column of the profile schematic (with every block
     # of that column), so a diagonal join can stagger the columns. The
     # centreline column, named after the section, is what fittings ride.
-    blocks = load_field(spec.schematic, registry.palette, spec.name)
+    blocks = authored_field(spec.schematic, registry, spec.name, spec.schematic_turns)
+    for side, schematic in ((-1, spec.left_schematic), (1, spec.right_schematic)):
+        if schematic is None:
+            continue
+        half = authored_field(schematic, registry, spec.name, spec.half_schematic_turns)
+        combined = BlockField(registry.palette)
+        for source, replacing in ((blocks, False), (half, True)):
+            for position, block_id in source.iter_block_ids():
+                on_side = position.x < 0 if side < 0 else position.x > 0
+                if on_side == replacing:
+                    combined.set_block(position, source.palette.get_state(block_id))
+        blocks = combined
     check_extent(spec, blocks)
-    mode = placing_mode(spec, domains)
+    placing = placing_mode(spec, domains)
     domain = domains.get(spec.domain)
     annotations: list[FeatureAnnotation] = []
-    for column, stack in columns_of(blocks, registry).items():
+    columns = columns_of(blocks, registry)
+    depth_counts: dict[int, int] = {}
+    for x, _ in columns:
+        depth_counts[x] = depth_counts.get(x, 0) + 1
+    for column, stack in columns.items():
         edge = spec.edge_domains is not None and (
             spec.edge_from is not None and abs(column[0]) >= spec.edge_from
             or any(local.y > 0 for local, _ in stack.iter_block_ids())
@@ -187,34 +216,69 @@ def build_section(
             )
         position = BlockPos(column[0], 0, column[1])
         step = spec.steps.get(column, spec.step)
-        if stack.bounds is None and column != (0, 0):
-            continue
+        pieces = pieces_by_step(stack, column, spec.steps, step, registry)
         placed_domain = (
             domains.get(spec.edge_domains[column[0] > 0])
             if edge else domain
         )
-        annotations.append(FeatureAnnotation(
-            name=(
-                f"{spec.name}_edge[{column[0]},{column[1]}]" if edge
-                else spec.name if column == (0, 0)
-                else f"{spec.name}[{column[0]},{column[1]}]"
-            ),
-            position=position,
-            feature=PointFeature(
-                blocks=stack,
-                placement_mode=(
-                    spec.placement_mode
-                    or domains.profile(placed_domain).placement_mode
-                ) if edge else mode,
-                domain=placed_domain, offset=None,
-                elevation_mode=ElevationMode.RIGID,
-                surface_mask=spec.surface_mask,
-            ),
-            step_mode=step,
-            section=spec.name,
-            clip_to_span=edge,
-        ))
+        name = (
+            f"{spec.name}_edge[{column[0]},{column[1]}]" if edge
+            else spec.name if column == (0, 0)
+            else f"{spec.name}[{column[0]},{column[1]}]"
+        )
+        for mode, piece in pieces.items():
+            if piece.bounds is None and (column != (0, 0) or mode is not step):
+                continue
+            annotations.append(FeatureAnnotation(
+                name=name if mode is step else f"{name}@{mode.value}",
+                position=position,
+                feature=PointFeature(
+                    blocks=piece,
+                    placement_mode=(
+                        spec.placement_mode
+                        or domains.profile(placed_domain).placement_mode
+                    ) if edge else placing,
+                    domain=placed_domain, offset=None,
+                    elevation_mode=ElevationMode.RIGID,
+                    surface_mask=(spec.surface_mask if spec.surface_mask_columns is None
+                                  or spec.surface_mask_columns[0] <= column[0] <= spec.surface_mask_columns[1]
+                                  else None),
+                    surface_mask_min_y=spec.surface_mask_min_y,
+                    yielding=(spec.terrain_overrides if spec.terrain_overrides_columns is None
+                              or column[0] in spec.terrain_overrides_columns else frozenset()),
+                ),
+                step_mode=mode,
+                section=spec.name,
+                clip_to_span=edge,
+                # Depth slices of one lateral column overlap when swept.
+                # Share ownership so a recessed roof does not clip away
+                # the floor or panels in the adjacent slice.
+                column=(
+                    f"{spec.name}[{column[0]},*]" if depth_counts[column[0]] > 1
+                    else name if len(pieces) > 1 else None
+                ),
+            ))
     return CrossSection(points=PointField(annotations))
+
+
+def pieces_by_step(
+    stack: BlockField,
+    column: tuple[int, int],
+    steps: Mapping[tuple[int, ...], StepMode],
+    step: StepMode,
+    registry: BlockRegistry,
+) -> dict[StepMode, BlockField]:
+    # A column's blocks by step mode: heights keyed "x,y,z" step their own
+    # way, the rest as the column does.
+    if not any(len(key) == 3 and (key[0], key[2]) == column for key in steps):
+        return {step: stack}
+    pieces = {step: BlockField(registry.palette)}
+    for local, block_id in stack.iter_block_ids():
+        mode = steps.get((column[0], local.y, column[1]), step)
+        pieces.setdefault(mode, BlockField(registry.palette)).set_block(
+            local, stack.palette.get_state(block_id)
+        )
+    return pieces
 
 
 def columns_of(
@@ -268,7 +332,7 @@ def build_path_frames(
     schedules: dict[str, SectionSchedule],
     path: Path,
 ) -> list[PathFrame]:
-    # Frames cut at every level change and every section start or stop.
+    # Frames cut at levels, section ends and bends that turn back on a leg.
     sections = [span.section for schedule in schedules.values() for span in schedule.spans]
     check_lead(spec, path, sections)
     elevation = build_elevation_frames(spec, path, sections)
@@ -282,6 +346,7 @@ def build_path_frames(
             *(frame.path_start for frame in elevation[1:]),
         }
     )
+    stations = sorted({*stations, *heading_stations(path, stations, lateral_reach(sections))})
     return build_section_frames(
         path, elevation, stations, half_width=lateral_reach(sections)
     )
@@ -310,16 +375,17 @@ def check_lead(spec: BuildSpec, path: Path, sections: Sequence[CrossSection]) ->
 
 
 def build_structure(
-    spec: StructureSpec, registry: BlockRegistry, domains: DomainRegistry
+    spec: StructureSpec, registry: BlockRegistry, domains: DomainRegistry,
+    dependency: DependentFeaturePath | None = None,
 ) -> HeadingStamp | TurnStamp:
     if spec.turn == "layout":
         [schematic] = spec.headings.values()
         return TurnStamp(
-            build_structure_feature(spec, schematic, registry, domains), domains
+            build_structure_feature(spec, schematic, registry, domains, dependency), domains
         )
     return HeadingStamp(
         {
-            heading: build_structure_feature(spec, schematic, registry, domains)
+            heading: build_structure_feature(spec, schematic, registry, domains, dependency)
             for heading, schematic in spec.headings.items()
         },
         spec.resolution,
@@ -332,14 +398,17 @@ def build_structure_feature(
     schematic: FilePath,
     registry: BlockRegistry,
     domains: DomainRegistry,
+    dependency: DependentFeaturePath | None = None,
 ) -> Feature:
-    return PointFeature(
-        blocks=load_field(schematic, registry.palette, spec.name),
+    kind = PointFeature if dependency is None else DependentFeature
+    return kind(
+        blocks=authored_field(schematic, registry, spec.name, spec.schematic_turns),
         placement_mode=placing_mode(spec, domains),
         domain=domains.get(spec.domain),
         offset=spec.offset,
         elevation_mode=spec.elevation_mode,
         surface_mask=spec.surface_mask,
+        **({} if dependency is None else {"dependency": dependency}),
     )
 
 
@@ -392,6 +461,19 @@ def placing_mode(
     if spec.placement_mode is not None:
         return spec.placement_mode
     return domains.profile(spec.domain).placement_mode
+
+
+def authored_field(path: FilePath, registry: BlockRegistry, name: str, turns: int) -> BlockField:
+    field = load_field(path, registry.palette, name)
+    if turns % 4 == 0:
+        return field
+    from ..Core.block.rotation import rotate_block_state
+    transform = BlockTransform(quarter_turns=turns)
+    rotated = BlockField(registry.palette)
+    for position, block_id in field.iter_block_ids():
+        state = field.palette.get_state(block_id)
+        rotated.set_block(transform.apply(position), rotate_block_state(state, registry.get_info(block_id), turns))
+    return rotated
 
 
 def load_field(path: FilePath, palette: BlockPalette, section: str) -> BlockField:

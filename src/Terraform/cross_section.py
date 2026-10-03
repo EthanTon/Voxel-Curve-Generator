@@ -42,6 +42,11 @@ def axes(alignment: Alignment) -> StationAxes:
     indices = np.arange(count)
     x = np.interp(indices, valid, x[valid] / samples[valid])
     z = np.interp(indices, valid, z[valid] / samples[valid])
+    # Sides are measured from the path itself: an uneven section's middle
+    # column is not its centreline.
+    for station, (cx, cz) in alignment.centres.items():
+        if station < count:
+            x[station], z[station] = cx, cz
     height = np.interp(indices, valid, height[valid] / samples[valid])
     dx = np.gradient(x) if count > 1 else np.ones(count)
     dz = np.gradient(z) if count > 1 else np.zeros(count)

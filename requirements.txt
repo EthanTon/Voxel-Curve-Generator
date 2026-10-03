@@ -4,3 +4,10 @@
 #   amulet-nbt>=5.0.0a1  imports as `amulet.nbt`  (prebuilt wheels on 3.13)
 amulet-nbt>=5.0.0a1
 numpy>=2.0
+tomli-w>=1.0
+
+# Exact distance fields keep long, world-spanning terrain routes practical.
+scipy>=1.14
+
+# Optional: the read-only world inspector in src/Auto/mcp_server.py.
+#   mcp>=2,<3

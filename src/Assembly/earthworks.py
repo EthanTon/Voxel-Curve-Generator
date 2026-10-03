@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..Core.Domain import DomainRegistry
 from ..Core.Path.path import Path
 from ..Core.World.block_world import BlockWorld
+from ..Core.block.info import SolidFace
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos
 from ..Core.modes import PlacementMode
 from ..Core.plan_index import NearestInPlan
+from ..Generation.Geometry.frames import level_near
 from ..Generation.Geometry.silhouette import PathSilhouette
 from ..Parser.spec import BuildSpec
 from ..Terraform import Alignment, Terraforming, load_terrain, terraform
+
+
+RAILS = frozenset({
+    "minecraft:rail", "minecraft:powered_rail",
+    "minecraft:detector_rail", "minecraft:activator_rail",
+})
 
 
 def reshape(
@@ -30,26 +38,36 @@ def reshape(
 ) -> Terraforming | None:
     if spec.terraform is None:
         return None
-    # The ground is shaped to the sections' blocks alone; everything the
-    # build lays defines the space to clear.
+    # The sections define the ground's alignment, with protruding rail
+    # columns included on request; all build blocks define clearance.
     track = {
         domains.profile(section.domain).domain_id for section in spec.sections
     }
-    alignment = alignment_of(world, path, track, silhouette)
+    alignment = alignment_of(
+        world, path, track, silhouette, formation_of(spec, silhouette, section_spans),
+        include_rails=spec.terraform.include_rails,
+    )
     if not alignment.columns:
         raise ValueError(
             "no track blocks remain for terraforming; check section surface masks "
             "and placement order"
         )
+    if section_spans is not None:
+        # Auto selection can leave a declared section unused in this world.
+        # Its terrain rule then has no stretches; a misspelled section still
+        # fails in Plan.stretches.
+        section_spans = {section.name: section_spans.get(section.name, ())
+                         for section in spec.sections}
     shaped = terraform(
         spec.terraform,
-        terrain if terrain is not None else load_terrain(spec.terraform.world),
+        terrain if terrain is not None else load_terrain(spec.terraform.terrain_world, spec.terraform.dimension),
         alignment,
         registry.palette,
         locate=marker_locator(spec, path),
         fittings=fittings,
         envelope=envelope_of(world),
         section_spans=section_spans,
+        running=running_of(world, alignment),
     )
     if not apply:
         return shaped
@@ -60,11 +78,55 @@ def reshape(
             placement_mode=PlacementMode.REPLACE_AIR_ONLY,
             connectivity_domain=profile.domain_id,
             block_replacement=profile.replacement,
+            earthworks=True,
         )
     if shaped.cut:
         world.base_blocks = Excavated(world.base_blocks, shaped.cut)
         world.invalidate_connectivity_policy()
     return shaped
+
+
+def running_of(world: BlockWorld, alignment: Alignment) -> dict[tuple[int, int], int]:
+    """Carry actual rail level across the section's occupied track columns.
+
+    Clearance over just the rails leaves soil between lanes and in curved
+    joints. Restrict the corridor to the section footprint; enclosing then
+    clips each interval against that column's actual wall or roof blocks.
+    """
+    rails = [position for position in world.iter_source_positions()
+             if (state := world.get_block(position, resolved=False)) is not None
+             and state.name in RAILS]
+    if not rails:
+        return {}
+    nearest = NearestInPlan((p.x, p.z, i) for i, p in enumerate(rails))
+    running = {(x, z): rails[nearest.nearest(x, z)].y for x, z in alignment.footing}
+    running.update(((p.x, p.z), p.y) for p in rails)
+    return running
+
+
+def formation_of(
+    spec: BuildSpec,
+    silhouette: PathSilhouette | None,
+    section_spans: Mapping[str, Sequence[tuple[int, int]]] | None,
+) -> Callable[[int, int, int], int | None] | None:
+    # A column's formation: its level plus the formation of the section laid
+    # at its station, the first declared where several are.
+    declared = [
+        (section.formation, section_spans.get(section.name, ()))
+        for section in spec.sections
+        if section.formation is not None
+    ] if section_spans else []
+    if not declared or silhouette is None or not silhouette.frames:
+        return None
+    level = level_near(silhouette.frames)
+
+    def at(x: int, z: int, station: int) -> int | None:
+        for formation, spans in declared:
+            if any(start <= station <= stop for start, stop in spans):
+                return level(x, z, station) + formation
+        return None
+
+    return at
 
 
 def marker_locator(spec: BuildSpec, path: Path) -> Callable[[object], int]:
@@ -84,9 +146,12 @@ def marker_locator(spec: BuildSpec, path: Path) -> Callable[[object], int]:
 
 
 def envelope_of(world: BlockWorld) -> dict[tuple[int, int], list[int]]:
-    # The heights of every block the build lays, by column.
+    # The heights of every block the build lays, by column, but those the
+    # earthworks may cover.
     heights: dict[tuple[int, int], list[int]] = {}
     for position in world.iter_source_positions():
+        if world.yields(world.source_at(position)):
+            continue
         heights.setdefault((position.x, position.z), []).append(position.y)
     return heights
 
@@ -96,10 +161,15 @@ def alignment_of(
     path: Path,
     domains: set[int] | None = None,
     silhouette: PathSilhouette | None = None,
+    formation: Callable[[int, int, int], int | None] | None = None,
+    *,
+    include_rails: bool = False,
 ) -> Alignment:
-    # The blocks of `domains` (all if None), each at the station of its
+    # The firm blocks of `domains` (all if None), each at the station of its
     # nearest path point, held to the points of the frame owning its column
     # so a slanted handover does not take the next stretch's terraforming.
+    # Replaceable side foundations and railings are not formation contacts:
+    # including them would extend the flat shoulder beyond the actual bed.
     stations = {
         (point.position.x, point.position.z): index
         for index, point in enumerate(path.path_points)
@@ -107,23 +177,63 @@ def alignment_of(
     laid = tuple(
         position
         for position in world.iter_source_positions()
-        if domains is None or world.source_at(position).domain in domains
+        if ((source := world.source_at(position)) is not None
+            and (domains is None or source.domain in domains)
+            and not world.yields(source))
     )
+    section_columns = {(position.x, position.z) for position in laid}
+    rails = tuple(
+        position for position in world.iter_source_positions()
+        if (state := world.get_block(position, resolved=False)) is not None
+        and state.name in RAILS
+        and ((position.x, position.z) not in section_columns
+             or world.source_at(position + (0, -1, 0)) is None)
+    ) if include_rails else ()
+    laid += rails
     nearest = NearestInPlan(
         (x, z, index) for (x, z), index in stations.items()
     )
     owned: dict[tuple[int, int], int] = {}
 
     def station(at: BlockPos) -> int:
+        # The station of the path point that laid the column, else the
+        # nearest point within the frame that owns it.
         column = (at.x, at.z)
         found = owned.get(column)
+        if found is None:
+            source = world.source_at(at)
+            laid_by = None if source is None else source.sequence_index
+            if laid_by is not None and 0 <= laid_by < len(path.path_points):
+                found = owned[column] = laid_by
         if found is None:
             found = owned[column] = _within_frame(
                 nearest.nearest(at.x, at.z), at, path, silhouette
             )
         return found
 
-    return Alignment.of(laid, [station(each) for each in laid])
+    alignment = Alignment.of(
+        laid, [station(each) for each in laid], formation,
+        [world.yields(world.source_at(each)) for each in laid],
+        [not _full(world, each) for each in laid],
+    )
+    alignment = replace(alignment, centres={
+        index: (point.position.x, point.position.z)
+        for index, point in enumerate(path.path_points)
+    })
+    if rails:
+        support = {
+            (position.x, position.z): position.y - 1
+            for position in rails
+        }
+        alignment = replace(
+            alignment, formation={**alignment.formation, **support}, rail_support=support,
+        )
+    return alignment
+
+
+def _full(world: BlockWorld, position: BlockPos) -> bool:
+    block_id = world.get_block_id(position)
+    return block_id is not None and world.registry.get_info(block_id).solid_faces == SolidFace.ALL
 
 
 def _within_frame(

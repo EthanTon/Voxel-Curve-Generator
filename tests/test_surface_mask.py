@@ -42,6 +42,44 @@ def test_surface_types_are_opted_in_separately():
         assert surface.height(0, 0, spec) == height
 
 
+def test_retaining_wall_includes_nearby_water_without_raising_to_nearby_ground():
+    blocks = BlockField(BlockPalette())
+    blocks.set_block(BlockPos(0, 68, 0), BlockState.create("minecraft:grass_block"))
+    blocks.set_block(BlockPos(2, 72, 0), BlockState.create("minecraft:water"))
+    blocks.set_block(BlockPos(1, 90, 0), BlockState.create("minecraft:stone"))
+    blocks.set_block(BlockPos(4, 80, 0), BlockState.create("minecraft:water"))
+    reference = SurfaceReference(FieldTerrain(blocks))
+    original = SurfaceMaskSpec("below", include_water=True)
+    retained = read_surface_mask({"side": "below", "include_water": True, "water_reach": 3})
+    assert reference.height(0, 0, original) == 68
+    assert reference.height(0, 0, retained) == 72
+    assert reference.mask(retained)(BlockPos(0, 72, 0))
+    assert not reference.mask(retained)(BlockPos(0, 73, 0))
+    assert reference.height(0, 0, SurfaceMaskSpec("below", water_reach=3)) == 68
+
+
+def test_nearby_water_mask_refreshes_when_design_clears_the_pool():
+    blocks = BlockField(BlockPalette())
+    blocks.set_block(BlockPos(0, 68, 0), BlockState.create("minecraft:stone"))
+    pool = BlockPos(2, 72, 0)
+    blocks.set_block(pool, BlockState.create("minecraft:water"))
+    reference = SurfaceReference(FieldTerrain(blocks))
+    spec = SurfaceMaskSpec("below", reference="designed", include_water=True, water_reach=3)
+    grid = Grid(ColumnPos(0, 0), 1, 1)
+    shaped = SimpleNamespace(grid=grid, natural=grid.filled(68), designed=grid.filled(68), cut=frozenset())
+    reference.update(shaped)
+    assert reference.height(0, 0, spec) == 72
+    shaped.cut = frozenset({pool})
+    reference.update(shaped)
+    assert reference.height(0, 0, spec) == 68
+
+
+@pytest.mark.parametrize("reach", [-1, True, 1.5, "3"])
+def test_water_mask_rejects_invalid_neighborhood_reach(reach):
+    with pytest.raises(ValueError, match="water_reach"):
+        read_surface_mask({"side": "below", "water_reach": reach})
+
+
 def test_offset_and_side_clip_world_positions_and_refresh_with_design():
     registry = BlockRegistry()
     field = BlockField(registry.palette)
@@ -185,6 +223,8 @@ def test_parser_accepts_feature_surface_mask_and_rejects_bad_options(tmp_path):
     }
     spec = parse(data, tmp_path)
     assert spec.surface_world == tmp_path / "world"
+    data["surface"]["dimension"] = "minecraft:nova_proxima"
+    assert parse(data, tmp_path).surface_dimension == "minecraft:nova_proxima"
     assert spec.section("deck").surface_mask == SurfaceMaskSpec(
         "below", -2, include_water=True,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import time
 import zlib
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -271,6 +272,46 @@ def read_region_chunk(path: Path | str, offset: int, sectors: int) -> nbt.Compou
         framed = source.read(sectors * SECTOR)
     length = int.from_bytes(framed[:4], "big")
     return nbt.loads(_decompress(framed[5 : 4 + length], framed[4])).compound
+
+
+# How often, and how far apart, a chunk caught half written is read again.
+SAVED_ATTEMPTS = 20
+SAVED_PAUSE = 0.25
+
+
+def read_saved_chunk(path: Path | str, chunk: tuple[int, int]) -> nbt.CompoundTag | None:
+    # A chunk of a save the game may be writing as it is read. Its place is
+    # taken afresh from the header each try, since a saved chunk can move,
+    # and one caught half written is read again. None if it isn't there.
+    path = Path(path)
+    slot = (chunk[0] % REGION_CHUNKS + (chunk[1] % REGION_CHUNKS) * REGION_CHUNKS) * 4
+    failure: Exception | None = None
+    for attempt in range(SAVED_ATTEMPTS):
+        if attempt:
+            time.sleep(SAVED_PAUSE)
+        try:
+            with path.open("rb") as source:
+                source.seek(slot)
+                entry = source.read(4)
+                if len(entry) < 4:
+                    return None
+                offset = int.from_bytes(entry[:3], "big")
+                sectors = entry[3]
+                if offset == 0 or sectors == 0:
+                    return None
+                source.seek(offset * SECTOR)
+                framed = source.read(sectors * SECTOR)
+            length = int.from_bytes(framed[:4], "big")
+            if length < 1 or 4 + length > len(framed):
+                raise ValueError("the chunk runs past what was read")
+            return nbt.loads(_decompress(framed[5 : 4 + length], framed[4])).compound
+        except Exception as error:  # noqa: BLE001 -- any half-written chunk
+            failure = error
+    raise ValueError(
+        f"chunk {chunk} in {path} could not be read after {SAVED_ATTEMPTS} tries: "
+        "the game may be saving the world. Close the world, or copy the save, "
+        "and build again."
+    ) from failure
 
 
 def write_region_files(

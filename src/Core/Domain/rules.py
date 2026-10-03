@@ -23,6 +23,8 @@ class ConnectivityRules:
     connects_to_any: bool | None = None
     overrides: tuple[ConnectionOverride, ...] = ()
     stairs_join_diagonals: bool | None = None
+    # Keep decorative authored states, including intentionally floating fittings.
+    preserve_state: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "overrides", tuple(self.overrides))

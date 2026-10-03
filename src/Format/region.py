@@ -70,7 +70,7 @@ class SplitBudget:
     cuts: tuple[int, ...] = ()
     max_span: int | None = None
     overflow: Overflow = Overflow.SUBDIVIDE
-    name_template: str = "{name}_{index:03d}"
+    name_template: str = "{name}_{index}"
 
     def __post_init__(self) -> None:
         if self.max_blocks <= 0:

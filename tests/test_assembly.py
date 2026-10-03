@@ -355,6 +355,32 @@ class TerraformSectionSpanBuildTests(SectionTestCase):
 class SchematicTests(SectionTestCase):
     profile = staticmethod(profile_schematic)
 
+    def test_recessed_roof_does_not_clip_the_floor_of_its_column(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(
+                spans=[["start", "end"]], width=3, depth=2,
+            )
+            data["path"]["lead"] = 3
+            data["path"]["points"] = [[x, 64, 0] for x in range(-3, 8)]
+            data["path"]["gradients"] = [[1, 0, 0]] * 11
+            self.profile(
+                Path(directory) / "schems",
+                blocks=[(-1, 0, 0), (0, 0, 0), (1, 0, 0), (1, 2, 1)],
+            )
+            world = assemble(parse(data, Path(directory)))
+
+        # Adjacent depth slices overlap as the section sweeps. A roof in
+        # one slice must not take ownership of the other slice's floor.
+        for x in (1, 2, 3):
+            for y in (64, 66):
+                with self.subTest(x=x, y=y):
+                    block_id = world.get_block_id(BlockPos(x, y, 1))
+                    self.assertIsNotNone(block_id)
+                    self.assertEqual(
+                        world.registry.get_state(block_id).name,
+                        "minecraft:stone",
+                    )
+
     def test_overlapping_section_does_not_split_stair_from_support(self) -> None:
         with TemporaryDirectory() as directory:
             schems = Path(directory) / "schems"
@@ -498,6 +524,30 @@ class SchematicTests(SectionTestCase):
         self.assertEqual(modes[(1, 0, 0)], StepMode.MANHATTAN)
         self.assertEqual(modes[(0, 0, 0)], StepMode.CHEBYSHEV)
 
+    def test_one_height_of_a_column_may_step_on_its_own(self) -> None:
+        # A floor keyed "x,y,z" steps; the wall above it keeps to one cell.
+        with TemporaryDirectory() as directory:
+            data = self.sectioned(width=3, depth=1, steps={"1,0,0": "manhattan"})
+            profile_schematic(
+                Path(directory) / "schems",
+                blocks=[(-1, 0, 0), (0, 0, 0), (1, 0, 0), (1, 2, 0)],
+            )
+            spec = parse(data, Path(directory))
+            section = build_sections(
+                spec, BlockRegistry(), build_domains(spec),
+                resolve_spans(spec, build_path(spec)),
+            )["standard"]
+
+        pieces = {each.name: each for each in section.points if each.position.x == 1}
+        floor, wall = pieces["standard[1,0]@manhattan"], pieces["standard[1,0]"]
+        heights = lambda each: sorted(p.y for p, _ in each.feature.blocks.iter_block_ids())
+        self.assertEqual((floor.step_mode, heights(floor)), (StepMode.MANHATTAN, [0]))
+        self.assertEqual((wall.step_mode, heights(wall)), (StepMode.CHEBYSHEV, [2]))
+        self.assertEqual(floor.column_name, wall.column_name)
+        laid = {offset.annotation.name: offset.offsets for offset in section.orient(0)}
+        self.assertEqual(len(laid["standard[1,0]@manhattan"]), 2)
+        self.assertEqual(len(laid["standard[1,0]"]), 1)
+
     def test_a_badly_written_column_says_how_to_write_it(self) -> None:
         with TemporaryDirectory() as directory:
             data = self.sectioned(width=3, depth=1, steps={"middle": "manhattan"})
@@ -592,6 +642,33 @@ class SchematicTests(SectionTestCase):
 
 
 class FrameTests(SchematicTests):
+    def test_a_hairpin_handover_does_not_clip_the_first_leg(self) -> None:
+        from math import cos, radians, sin
+
+        points = [[0, 64, z] for z in range(150, 0, -1)]
+        gradients = [[0, 0, -1]] * len(points)
+        for degrees in range(181):
+            angle = radians(degrees)
+            points.append([round(100 - 100 * cos(angle)), 64, round(-100 * sin(angle))])
+            gradients.append([sin(angle), 0, -cos(angle)])
+        points.extend([[200, 64, z] for z in range(1, 151)])
+        gradients.extend([[0, 0, 1]] * 150)
+        with TemporaryDirectory() as directory:
+            self.profile(Path(directory) / "schems", blocks=[(0, 0, 0)])
+            data = config(
+                path={"points": points, "gradients": gradients, "lead": 3},
+                section=[{"name": "standard", "domain": "rail",
+                          "schematic": "schems/stdtrack.schem", "width": 1, "depth": 1}],
+                assignment=[{"stations": [0, 280], "sections": ["standard"]},
+                            {"stations": [282, len(points) - 1], "sections": ["standard"]}],
+            )
+            world = assemble(parse(data, Path(directory)))
+            built = set(world.iter_source_positions())
+        # The end plane of the first span lies around the bend, beyond the
+        # starting leg. Both complete straight legs must still be authored.
+        self.assertTrue({BlockPos(*point) for point in points[:150]} <= built)
+        self.assertTrue({BlockPos(*point) for point in points[-150:]} <= built)
+
     def framed(self, directory, points=None, **overrides):
         # A single-block profile, so a lead of one point is enough for it.
         data = self.sectioned(width=1, depth=1, **overrides)
@@ -976,6 +1053,62 @@ class StructureTests(SweepTests):
             )
 
         self.assertEqual(marks, [0, 3, 6, 8])
+
+    def two_pillars(self, directory, shared):
+        data = self.structured(directory, spacing=3, feature_path=shared)
+        data["marker"]["mid"] = [4, 0]
+        data["section"].append({**data["section"][0], "name": "other"})
+        data["assignment"] = [
+            {"from": "start", "to": "mid", "sections": ["standard"]},
+            {"from": "mid", "to": "end", "sections": ["other"]},
+        ]
+        data["structure"].append({
+            **data["structure"][0],
+            "name": "thick",
+            "sections": ["other"],
+            "headings": {"0.0": "schems/thick.schem"},
+        })
+        self.profile(Path(directory) / "schems", "thick", blocks=[(0, 0, 0)],
+                     block="minecraft:iron_block")
+        return data
+
+    def pillar_marks(self, world):
+        marks: dict[str, list[int]] = {}
+        for position in world.iter_source_positions():
+            name = world.registry.get_state(world.get_block_id(position)).name
+            if name in ("minecraft:gold_block", "minecraft:iron_block"):
+                marks.setdefault(name, []).append(position.x)
+        return {name: sorted(xs) for name, xs in marks.items()}
+
+    def test_structures_on_one_feature_path_share_its_spacing(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.two_pillars(directory, "piers")
+            world = assemble(parse(data, Path(directory)))
+
+        self.assertEqual(self.pillar_marks(world), {
+            "minecraft:gold_block": [0, 3],
+            "minecraft:iron_block": [6, 8],
+        })
+
+    def test_structures_on_their_own_paths_start_afresh(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.two_pillars(directory, None)
+            for structure in data["structure"]:
+                del structure["feature_path"]
+            world = assemble(parse(data, Path(directory)))
+
+        self.assertEqual(self.pillar_marks(world), {
+            "minecraft:gold_block": [0, 3],
+            "minecraft:iron_block": [4, 7, 8],
+        })
+
+    def test_a_shared_feature_path_needs_one_spacing(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = self.two_pillars(directory, "piers")
+            data["structure"][1]["spacing"] = 5
+
+            with self.assertRaisesRegex(ValueError, "same spacing"):
+                parse(data, Path(directory))
 
     def test_without_spacing_it_lands_at_every_point(self) -> None:
         with TemporaryDirectory() as directory:

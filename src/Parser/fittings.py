@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from pathlib import Path
 
 from ..Core.coordinates import BlockPos
@@ -8,10 +9,11 @@ from ..Core.modes import ElevationMode, PlacementMode, StepMode
 from ..Stamping import authored_headings, mirrorable_headings
 from .spec import LaneSpec, Measure, StructureSpec, WireGeometry, WireSpec
 from .values import read_enum, require
+from .sections import read_local_height
 from ..Terraform.surface_mask import read_surface_mask
 
 
-def read_structure(data: Mapping, base: Path = Path(".")) -> StructureSpec:
+def read_structure(data: Mapping, base: Path = Path("."), named_paths: frozenset[str] = frozenset()) -> StructureSpec:
     name = require(data, "name")
     turn = data.get("turn", "heading")
     if turn not in ("heading", "layout"):
@@ -27,6 +29,25 @@ def read_structure(data: Mapping, base: Path = Path(".")) -> StructureSpec:
     check_headings(name, headings, resolution)
     sections = read_fitted_to(data, f"structure {name!r}")
     spacing, angle, measure = read_where_it_sits(data, f"structure {name!r}")
+    wire = data.get("wire")
+    if wire is not None:
+        if not isinstance(wire, str) or not wire:
+            raise ValueError(f"structure {name!r} wire must name a wire")
+        if any(key in data for key in ("spacing", "angle", "measure", "min_distance")):
+            raise ValueError(
+                f"structure {name!r} uses its wire's anchors; "
+                "omit spacing, angle, measure and min_distance"
+            )
+    feature_path = data.get("feature_path")
+    if feature_path is not None:
+        if not isinstance(feature_path, str) or not feature_path:
+            raise ValueError(f"structure {name!r} feature_path must be a name")
+        if wire is not None:
+            raise ValueError(
+                f"structure {name!r} uses its wire's anchors; omit feature_path"
+            )
+        if feature_path in named_paths and any(key in data for key in ("spacing", "angle", "measure", "min_distance")):
+            raise ValueError(f"structure {name!r} uses feature_path anchors; put spacing and angle on that path and omit measure and min_distance")
     return StructureSpec(
         name=name,
         domain=require(data, "domain"),
@@ -43,6 +64,10 @@ def read_structure(data: Mapping, base: Path = Path(".")) -> StructureSpec:
         ),
         turn=turn,
         surface_mask=read_surface_mask(data.get("surface_mask")),
+        wire=wire,
+        min_distance=read_min_distance(data, f"structure {name!r}"),
+        feature_path=feature_path,
+        schematic_turns=read_local_height(data.get("schematic_turns", 0), "schematic_turns"),
     )
 
 
@@ -51,6 +76,14 @@ def read_wire(data: Mapping, base: Path = Path(".")) -> WireSpec:
     sections, between = read_what_a_wire_spans(data, name)
     geometry = read_how_a_wire_runs(data, name, between)
     spacing, angle, measure = read_where_it_sits(data, f"wire {name!r}")
+    feature_path = data.get("feature_path")
+    if feature_path is not None:
+        if not isinstance(feature_path, str) or not feature_path:
+            raise ValueError(f"wire {name!r} feature_path must be a name")
+        if between:
+            raise ValueError(f"wire {name!r} feature_path needs a longitudinal wire along sections")
+        if any(key in data for key in ("spacing", "angle", "measure", "min_distance")):
+            raise ValueError(f"wire {name!r} uses feature_path anchors; omit spacing, angle, measure and min_distance")
     return WireSpec(
         name=name,
         domain=require(data, "domain"),
@@ -65,6 +98,8 @@ def read_wire(data: Mapping, base: Path = Path(".")) -> WireSpec:
         step=read_enum(StepMode, data.get("step"), StepMode.MANHATTAN),
         placement_mode=read_enum(PlacementMode, data.get("placement_mode")),
         surface_mask=read_surface_mask(data.get("surface_mask")),
+        min_distance=read_min_distance(data, f"wire {name!r}"),
+        feature_path=feature_path,
     )
 
 
@@ -142,7 +177,7 @@ def read_how_a_wire_runs(
         raise ValueError(
             f"wire {name!r} stretches between two wires, which only a line can"
         )
-    anchoring = [key for key in ("spacing", "angle", "measure") if key in data]
+    anchoring = [key for key in ("spacing", "angle", "measure", "min_distance") if key in data]
     if anchoring:
         raise ValueError(
             f"wire {name!r} follows its column through every point; "
@@ -163,13 +198,28 @@ def read_where_it_sits(data: Mapping, where: str) -> tuple[float, float, Measure
     spacing = data.get("spacing", 0.0)
     angle = data.get("angle", 0.0)
     measure = read_enum(Measure, data.get("measure"), Measure.DISTANCE)
+    if (not isinstance(spacing, (int, float)) or isinstance(spacing, bool)
+            or not isfinite(spacing)):
+        raise ValueError(f"{where} spacing must be a finite nonnegative number, got {spacing!r}")
     if spacing < 0:
         raise ValueError(f"{where} has a negative spacing of {spacing}")
-    if not 0 <= angle <= 180:
+    if (not isinstance(angle, (int, float)) or isinstance(angle, bool)
+            or not isfinite(angle) or not 0 <= angle <= 180):
         raise ValueError(
             f"{where} has an angle of {angle}; a turn is between 0 and 180 degrees"
         )
     return spacing, angle, measure
+
+
+def read_min_distance(data: Mapping, where: str) -> float:
+    distance = data.get("min_distance", 0.0)
+    if (not isinstance(distance, (int, float)) or isinstance(distance, bool)
+            or not isfinite(distance) or distance < 0):
+        raise ValueError(f"{where} min_distance must be a nonnegative number")
+    if (data.get("measure", "distance") == "distance"
+            and data.get("spacing", 0) > 0 and distance > data["spacing"]):
+        raise ValueError(f"{where} min_distance cannot exceed spacing")
+    return distance
 
 
 def read_quoted_heading(name: str, key: str, value: object) -> str:

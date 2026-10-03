@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Iterable, Sequence
+from math import sqrt
 from typing import NamedTuple
 
 from ...Core.CrossSection.schedule import SectionSchedule
@@ -12,6 +13,7 @@ from .boundaries import (
     LateralReach,
     Orientation,
     boundary_at,
+    crosses_within,
     orthogonal,
     path_bounds,
     validate_frames,
@@ -27,6 +29,7 @@ __all__ = [
     "level_near",
     "frames_for_index",
     "span_stations",
+    "heading_stations",
 ]
 
 
@@ -79,6 +82,39 @@ def span_stations(schedule: SectionSchedule, path: Path) -> list[int]:
         for station in stations
         if path.first_index < station < path.last_index
     )
+
+
+def heading_stations(
+    path: Path, existing: Iterable[int] = (),
+    half_width: float | LateralReach | None = None,
+) -> list[int]:
+    # Long level spans may turn back toward their start. Split their planes
+    # as the heading turns, before a far end plane can clip an earlier leg.
+    facing = path.path_points[path.first_index].heading.unit()
+    bounds = path_bounds(path)
+    indices = [path.first_index, *sorted(existing), path.last_index]
+    planes = [bounds.start, *(boundary_at(path, i) for i in indices[1:-1]), bounds.end]
+    stations = []
+    for index in range(path.first_index + 1, path.last_index):
+        direction = path.path_points[index].heading.unit()
+        if facing.x * direction.x + facing.z * direction.z <= sqrt(0.5):
+            at = bisect_right(indices, index)
+            if indices[at - 1] == index:
+                facing = direction
+                continue
+            plane = boundary_at(path, index)
+            # A sharp corner needs room for its two layouts. Wait until
+            # the added plane no longer crosses its neighbours in the bed.
+            if half_width is not None and (
+                crosses_within(planes[at - 1], plane, half_width)
+                or crosses_within(plane, planes[at], half_width)
+            ):
+                continue
+            stations.append(index)
+            indices.insert(at, index)
+            planes.insert(at, plane)
+            facing = direction
+    return stations
 
 
 def build_frames(

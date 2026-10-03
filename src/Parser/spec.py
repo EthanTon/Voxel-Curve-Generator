@@ -10,6 +10,7 @@ from ..Core.CrossSection.turns import JOIN_DEGREES
 from ..Core.Domain import ConnectivityRules, PlacementRules, ReplacementRules, TerrainRules
 from ..Core.block.connectivity_options import ConnectionOverride
 from ..Core.modes import ElevationMode, PlacementMode, StepMode
+from ..Core.Feature.dependent_path import PathProjection
 from ..Stamping import Heading
 from ..Terraform.plan import Plan as TerraformPlan
 from ..Terraform.surface_mask import SurfaceMaskSpec
@@ -29,6 +30,20 @@ class Measure(Enum):
     # Spacing counted in blocks along the path or in path points.
     DISTANCE = "distance"
     INDEX = "index"
+
+
+@dataclass(frozen=True, slots=True)
+class FeaturePathSpec:
+    # A reusable selection from an existing feature's world path.
+    name: str
+    source: str
+    spacing: float = 0.0
+    angle: float = 0.0
+    measure: Measure = Measure.DISTANCE
+    include_end: bool = True
+    projection: PathProjection | None = None
+    min_distance: float = 0.0
+    sections: tuple[str, ...] = ()
 
 
 class WireGeometry(Enum):
@@ -58,8 +73,24 @@ class SpanSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class StationSpanSpec:
+    # Inclusive indices in the authored path, before padding is added.
+    start: int
+    stop: int
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(i, int) or isinstance(i, bool) for i in (self.start, self.stop))
+                or not 0 <= self.start <= self.stop):
+            raise ValueError("assignment stations need nonnegative inclusive start <= stop indices")
+
+    def __str__(self) -> str:
+        return f"stations {self.start}..{self.stop}"
+
+
+@dataclass(frozen=True, slots=True)
 class SectionSpec:
-    # `step` applies to every column unless `steps` overrides it by "x,z".
+    # `step` applies to every column unless `steps` overrides it by "x,z",
+    # or at one height of a column by "x,y,z".
     # MANHATTAN keeps a column face-connected along the path (rails, fences).
     name: str
     domain: str
@@ -69,18 +100,33 @@ class SectionSpec:
     depth: int = 0
     elevation: SectionElevation = SectionElevation.FOLLOW
     step: StepMode = StepMode.CHEBYSHEV
-    steps: Mapping[tuple[int, int], StepMode] = field(default_factory=dict)
+    steps: Mapping[tuple[int, ...], StepMode] = field(default_factory=dict)
     # Optional domains for raised blocks on the left and right of the deck.
     edge_domains: tuple[str, str] | None = None
     # Columns this far from the centre also belong to the edge at deck level.
     edge_from: int | None = None
     surface_mask: SurfaceMaskSpec | None = None
+    # The local height the ground is shaped to meet; the lowest block if unset.
+    formation: int | None = None
+    # Blocks of the section the earthworks may cover: left out of the track
+    # the ground is shaped round, and replaced wherever it fills.
+    terrain_overrides: frozenset[str] = frozenset()
+    # Optional local lateral columns; everything else, including the bed,
+    # remains structural even when it uses one of the same block names.
+    terrain_overrides_columns: frozenset[int] | None = None
+    # Rotate authored assets in memory; composite halves share one layout.
+    schematic_turns: int = 0
+    left_schematic: Path | None = None
+    right_schematic: Path | None = None
+    half_schematic_turns: int = 0
+    surface_mask_min_y: int | None = None
+    surface_mask_columns: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class AssignmentSpec:
     # The sections swept over one stretch of the path.
-    span: SpanSpec
+    span: SpanSpec | StationSpanSpec
     sections: tuple[str, ...]
 
 
@@ -131,6 +177,14 @@ class StructureSpec:
     # columns.
     turn: str = "heading"
     surface_mask: SurfaceMaskSpec | None = None
+    # Use this wire's feature path, including each run's boundary anchors.
+    wire: str | None = None
+    min_distance: float = 0.0
+    # Structures naming the same feature path are spaced as one, across all
+    # their sections, each laying the anchors on its own. A declared
+    # [[feature_path]] instead supplies shared world placement points.
+    feature_path: str | None = None
+    schematic_turns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +205,9 @@ class WireSpec:
     step: StepMode = StepMode.MANHATTAN
     placement_mode: PlacementMode | None = None
     surface_mask: SurfaceMaskSpec | None = None
+    min_distance: float = 0.0
+    # A declared dependent path supplies the wire's world placement points.
+    feature_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +235,10 @@ class SplitSpec:
     max_blocks: int = 4_000_000
     max_span: int = 128
     terrain: bool = False
+    terrain_depth: int = 16
+    # Skip the duplicate, full bounding-box schematic when only pieces
+    # are needed; write() then returns their manifest.
+    combined: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +265,8 @@ class BuildSpec:
     lanes: tuple[LaneSpec, ...] = ()
     terraform: TerraformPlan | None = None
     surface_world: Path | None = None
+    surface_dimension: str | None = None
+    feature_paths: tuple[FeaturePathSpec, ...] = ()
 
     def marker(self, name: str) -> ColumnPos:
         if name not in self.markers:
@@ -225,6 +288,9 @@ class BuildSpec:
 
     def lane(self, name: str) -> LaneSpec:
         return _named(self.lanes, name, "lane")
+
+    def feature_path(self, name: str) -> FeaturePathSpec:
+        return _named(self.feature_paths, name, "feature path")
 
 
 def _where(column: ColumnPos, marker: str | None) -> str:

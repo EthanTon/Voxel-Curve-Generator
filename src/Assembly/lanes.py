@@ -61,3 +61,44 @@ def lane_support(
         )
         for point in run.path
     )
+
+
+def support_rail_joints(world, track_domains: set[int]) -> None:
+    """Close shallow sleeper gaps left by a clipped diagonal join."""
+    from ..Core.Field.block_field import BlockField
+    from ..Core.block.info import SolidFace
+    from ..Core.constants import AIR_NAMES
+    from ..Core.modes import PlacementMode
+
+    rail_names = {"minecraft:rail", "minecraft:powered_rail",
+                  "minecraft:detector_rail", "minecraft:activator_rail"}
+    positions = tuple(world.iter_source_positions())
+    rails = {p for p in positions
+             if world.registry.get_state(world.source_at(p).block_id).name in rail_names}
+    additions = {}
+    for rail in rails:
+        under = rail + (0, -1, 0)
+        present = world.get_block(under, resolved=False)
+        if present is not None and present.name not in AIR_NAMES:
+            continue
+        deck = world.source_at(rail + (0, -2, 0))
+        if (deck is None or deck.domain not in track_domains
+                or not world.registry.get_info(deck.block_id).solid_faces):
+            continue
+        # Extend a supported neighboring sleeper over an existing deck.
+        # A rail outside the deck still needs the normal formation/support
+        # rules; this must not invent a pillar down from a floating track.
+        for step in ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)):
+            if rail + step not in rails:
+                continue
+            source = world.source_at(under + step)
+            if source is None or source.domain not in track_domains:
+                continue
+            if not world.registry.get_info(source.block_id).solid_faces & SolidFace.UP:
+                continue
+            field = additions.setdefault(source.domain, BlockField(world.registry.palette))
+            field.set_block(under, world.registry.get_state(source.block_id))
+            break
+    for domain, field in additions.items():
+        world.add_field(field, placement_mode=PlacementMode.REPLACE_AIR_ONLY,
+                        connectivity_domain=domain)

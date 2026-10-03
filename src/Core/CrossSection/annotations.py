@@ -22,6 +22,13 @@ class FeatureAnnotation:
     section: str | None = None
     # Stop at the span boundary instead of filling small gaps at a swap.
     clip_to_span: bool = False
+    # The profile column a piece belongs to when a column steps by height;
+    # its pieces share the world columns the column is given.
+    column: str | None = None
+
+    @property
+    def column_name(self) -> str:
+        return self.column or self.name
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "position", BlockPos.coerce(self.position))

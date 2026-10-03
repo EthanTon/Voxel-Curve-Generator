@@ -245,7 +245,7 @@ class SplitTests(unittest.TestCase):
 
         self.assertEqual(
             [piece.name for piece in pieces],
-            ["curve_000", "curve_001", "curve_002"],
+            ["curve_0", "curve_1", "curve_2"],
         )
         self.assertEqual([piece.origin.x for piece in pieces], [0, 4, 8])
 

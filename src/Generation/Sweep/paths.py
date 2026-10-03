@@ -109,7 +109,11 @@ def deliver_paths(
                         continue
                     if (
                         frame.path_start > owned.path_stop
-                        or frame.path_stop <= owned.path_start
+                        or frame.path_stop < owned.path_start
+                        # Interior frames end before their boundary station;
+                        # the final frame includes the path's last station.
+                        or (frame.path_stop == owned.path_start
+                            and frame.path_stop < path.last_index)
                     ):
                         continue
                     run = runs.get((delivery.annotation.name, span))
