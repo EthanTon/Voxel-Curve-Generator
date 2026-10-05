@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from ..Core.block.states import BlockState
+from ..Core.block.vanilla import vanilla_catalog
 from .region import RegionEntity
 
 # amulet-nbt is `amulet_nbt` before 5.x and `amulet.nbt` from 5.x.
@@ -46,7 +47,7 @@ def _array_tag(tag_id: int, payload: bytes, count: int):
 
 
 def block_state_tag(state: BlockState) -> CompoundTag:
-    # The {Name, Properties} form anvil sections and litematica regions use.
+    # The legacy {Name, Properties} form used by schematic palettes.
     entry = {"Name": StringTag(state.name)}
     if state.properties:
         entry["Properties"] = CompoundTag(
@@ -55,12 +56,31 @@ def block_state_tag(state: BlockState) -> CompoundTag:
     return CompoundTag(entry)
 
 
-def block_state_from_tag(tag: CompoundTag) -> BlockState:
-    properties = tag.get("Properties")
-    return BlockState.create(
-        tag["Name"].py_str,
-        {} if properties is None else {name: value.py_str for name, value in properties.items()},
-    )
+def block_state_from_tag(tag: CompoundTag | StringTag) -> BlockState:
+    # Mixed NBT lists wrap non-compound entries under an empty name.
+    if isinstance(tag, CompoundTag) and len(tag) == 1 and "" in tag:
+        tag = tag[""]
+    if isinstance(tag, StringTag):
+        name, properties = tag.py_str, None
+    elif "Name" in tag:
+        # Preserve the older saved-world and schematic representation.
+        properties = tag.get("Properties")
+        return BlockState.create(
+            tag["Name"].py_str,
+            {} if properties is None else {key: value.py_str for key, value in properties.items()},
+        )
+    else:
+        name, properties = tag["id"].py_str, tag.get("properties")
+
+    # 26.3's string form represents the block's default state, including
+    # properties such as a log's axis. New compounds may override defaults.
+    if ":" not in name:
+        name = f"minecraft:{name}"
+    catalog = vanilla_catalog()
+    defaults = dict(catalog.default_state(name).properties) if name in catalog else {}
+    if properties is not None:
+        defaults.update({key: value.py_str for key, value in properties.items()})
+    return BlockState.create(name, defaults)
 
 
 def entity_tag(entity: RegionEntity, origin, *, nested: bool) -> CompoundTag:

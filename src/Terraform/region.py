@@ -129,7 +129,8 @@ class RegionTerrain:
             if self.saved_chunks is not None:
                 self.saved_chunks[key] = chunk
         for section_y, palette, indices in _sections(chunk):
-            solid = np.array([each["Name"].py_str != "minecraft:air" for each in palette])
+            palette = [block_state_from_tag(each) for each in palette]
+            solid = np.array([each.name != "minecraft:air" for each in palette])
             if solid.any():
                 layers.append((section_y * SECTION_SIZE, palette, indices.reshape(16, 16, 16), solid))
         if not layers:
@@ -153,11 +154,11 @@ class RegionTerrain:
 
         order = np.lexsort((level, x, z))
         level, z, x = level[order], z[order], x[order]
-        palette = [tag for _, tags, _, _ in layers for tag in tags]
+        palette = [state for _, states, _, _ in layers for state in states]
         offsets = np.cumsum([0] + [len(tags) for _, tags, _, _ in layers[:-1]])
         ids = np.concatenate([indices for _, _, indices, _ in layers])[level, z, x]
         ids = (ids + offsets[level // SECTION_SIZE]).tolist()
-        states = {each: block_state_from_tag(palette[each]) for each in set(ids)}
+        states = {each: palette[each] for each in set(ids)}
         heights = levels[level].tolist()
         found = [states[each] for each in ids]
         xs, zs = x.tolist(), z.tolist()
