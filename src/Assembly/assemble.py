@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path as FilePath
 
 from ..Core.CrossSection.cross_section import CrossSection
 from ..Core.CrossSection.schedule import SectionSchedule
@@ -62,32 +63,63 @@ class Built:
     terraforming: Terraforming | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedBuild:
+    spec: BuildSpec
+    world: BlockWorld
+    domains: DomainRegistry
+    path: Path
+    spans: Mapping[str, tuple[tuple[int, int], ...]]
+    silhouette: PathSilhouette
+    layings: tuple[Laying, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlacedBuild:
+    components: tuple[PreparedBuild, ...]
+    fitting_ids: tuple[dict[str, list[int]], ...]
+
+
 def assemble(spec: BuildSpec) -> BlockWorld:
     return build(spec).world
 
 
 def build(spec: BuildSpec, *, progress: Progress | None = None) -> Built:
     """Build without UI; optionally report progress within each assembly stage."""
+    prepared = prepare_build(spec, progress=progress)
+    placed = place_features(prepared, progress=progress)
+    return finalize_build(placed, progress=progress)
+
+
+def prepare_build(
+    spec: BuildSpec,
+    *,
+    shared: PreparedBuild | None = None,
+    progress: Progress | None = None,
+) -> PreparedBuild:
+    """Prepare placements without emitting blocks; shared reuses a world and its domains."""
     report(progress, "Preparing build", 0)
-    registry = BlockRegistry.for_vanilla_26_2()
-    domains = build_domains(spec)
+    if shared is not None:
+        if (spec.domains, spec.interactions) != (shared.spec.domains, shared.spec.interactions):
+            raise ValueError("shared builds need identical domain and interaction definitions")
+        if _surface_source(spec) != _surface_source(shared.spec):
+            raise ValueError("shared builds need the same surface world and dimension")
+    domains = build_domains(spec) if shared is None else shared.domains
     masked = _surface_masks(spec)
     designed = any(mask.reference == "designed" for mask in masked)
-    surface_world = spec.surface_world or (
-        None if spec.terraform is None else spec.terraform.terrain_world
-    )
+    surface_world, surface_dimension = _surface_source(spec)
     if masked and surface_world is None:
         raise ValueError(
             "surface_mask needs [surface].world or a terraform plan with a world"
         )
     if spec.terraform is None and designed:
         raise ValueError("surface_mask.reference = 'designed' needs a terraform plan")
-    surface_dimension = spec.surface_dimension or (
-        spec.terraform.dimension if spec.surface_world is None and spec.terraform else None
-    )
-    surface = SurfaceReference(load_terrain(surface_world, surface_dimension)) if masked else None
-    world = BlockWorld(registry, surface_reference=surface)
-    domains.bind(world)
+    world = BlockWorld(BlockRegistry.for_vanilla_26_2()) if shared is None else shared.world
+    registry = world.registry
+    if masked and world.surface_reference is None:
+        world.surface_reference = SurfaceReference(load_terrain(surface_world, surface_dimension))
+    if shared is None:
+        domains.bind(world)
     report(progress, "Preparing build", 1)
 
     report(progress, "Preparing path", 0)
@@ -102,34 +134,61 @@ def build(spec: BuildSpec, *, progress: Progress | None = None) -> Built:
 
     report(progress, "Preparing placements", 0)
     runs = sweep(spec, schedules, path, frames, silhouette)
-    fittings: dict[str, list[BlockPos]] = {}
-    fitting_ids: dict[str, list[int]] = {}
-    layings = in_build_order(
-        spec, all_layings(
+    layings = tuple(
+        all_layings(
             spec, runs, sections, world, registry, domains, frames, clip,
             schedules, silhouette,
         )
     )
     report(progress, "Preparing placements", 1)
+    return PreparedBuild(spec, world, domains, path, spans, silhouette, layings)
+
+
+def place_features(
+    prepared: PreparedBuild,
+    *additional: PreparedBuild,
+    progress: Progress | None = None,
+) -> PlacedBuild:
+    """Place all components in domain order without shaping terrain or resolving blocks."""
+    components = (prepared, *additional)
+    if any(
+        each.world is not prepared.world or each.domains is not prepared.domains
+        for each in additional
+    ):
+        raise ValueError("prepare additional components with shared=first_prepared_build")
+    if additional and any(each.spec.terraform is not None for each in components):
+        raise ValueError("shared terrain shaping needs a composition layer; combined builds must omit terraform")
+    # Sort across components so a later component's foundation cannot cover an earlier fitting.
+    layings = sorted(
+        ((index, laying) for index, each in enumerate(components) for laying in each.layings),
+        key=lambda item: prepared.spec.domain(item[1].domain).order,
+    )
+    fitting_ids: tuple[dict[str, list[int]], ...] = tuple({} for _ in components)
     report(progress, "Placing features", 0, len(layings))
-    for number, laying in enumerate(layings, 1):
+    for number, (index, laying) in enumerate(layings, 1):
         placed = laying.lay()
         if laying.fitting:
-            fitting_ids.setdefault(laying.fitting, []).extend(placed or ())
-            fittings.setdefault(laying.fitting, []).extend(
-                feet_of(world, placed or ())
-            )
+            fitting_ids[index].setdefault(laying.fitting, []).extend(placed or ())
         report(progress, "Placing features", number, len(layings))
+    return PlacedBuild(components, fitting_ids)
+
+
+def finalize_build(placed: PlacedBuild, *, progress: Progress | None = None) -> Built:
+    """Support joints, shape a single build's terrain, and resolve the shared world once."""
+    prepared = placed.components[0]
+    spec, world, domains = prepared.spec, prepared.world, prepared.domains
+    path, spans, silhouette = prepared.path, prepared.spans, prepared.silhouette
+    registry, surface = world.registry, world.surface_reference
+    fitting_ids = placed.fitting_ids[0]
+    fittings = {name: list(feet_of(world, ids)) for name, ids in fitting_ids.items()}
     report(progress, "Supporting rail joints", 0)
     support_rail_joints(world, {domains.profile(section.domain).domain_id
-                                for section in spec.sections})
+                              for each in placed.components for section in each.spec.sections})
     report(progress, "Supporting rail joints", 1)
     report(progress, "Shaping terrain", 0)
-    designed_masks = surface is not None and designed
+    designed_masks = surface is not None and any(mask.reference == "designed" for mask in _surface_masks(spec))
     if designed_masks:
-        # Features masked by the designed surface and the earthworks depend
-        # on each other: preview the earthworks, re-mask, and repeat until
-        # the masked footprints settle.
+        # Re-mask against previewed earthworks until the dependent footprints settle.
         previous: tuple[tuple[int, tuple[BlockPos, ...]], ...] | None = None
         for _ in range(4):
             preview = reshape(
@@ -165,6 +224,14 @@ def build(spec: BuildSpec, *, progress: Progress | None = None) -> Built:
     return Built(world, shaped)
 
 
+def _surface_source(spec: BuildSpec) -> tuple[FilePath | None, str | None]:
+    world = spec.surface_world or (None if spec.terraform is None else spec.terraform.terrain_world)
+    dimension = spec.surface_dimension or (
+        spec.terraform.dimension if spec.surface_world is None and spec.terraform else None
+    )
+    return (None if world is None else world.resolve()), dimension
+
+
 def _surface_masks(spec: BuildSpec) -> tuple:
     return tuple(
         each.surface_mask
@@ -198,11 +265,6 @@ class Laying:
     domain: str
     lay: Callable[[], object]
     fitting: str | None = None
-
-
-def in_build_order(spec: BuildSpec, layings: Iterable[Laying]) -> list[Laying]:
-    # By domain order; a later domain covers an earlier one. Stable.
-    return sorted(layings, key=lambda laying: spec.domain(laying.domain).order)
 
 
 def all_layings(
