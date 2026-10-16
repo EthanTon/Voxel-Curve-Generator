@@ -59,8 +59,8 @@ def test_mrtsurface_water_cuts_do_not_select_or_fold_back_to_bridges():
     cut = choose(rules, Facts(59, 63, 62, 2, 30, False,
                              edge_ground=60, left_ground=63, right_ground=61), 1099)
     assert cut.section == "trench_water"
-    bridge = choose(rules, Facts(65, 58, 62, 2, 30, False,
-                                edge_ground=58, left_ground=58, right_ground=58), 0)
+    bridge = choose(rules, Facts(70, 61, 62, 2, 30, False,
+                                edge_ground=61, left_ground=61, right_ground=61), 0)
     assert bridge.section == "bridge_thin"
     # Water exactly at the formation also needs retaining walls.
     assert choose(rules, Facts(65, 58, 64, 2, 30, False,
@@ -70,6 +70,37 @@ def test_mrtsurface_water_cuts_do_not_select_or_fold_back_to_bridges():
                               edge_ground=64, left_ground=73, right_ground=64), 0).section == "tunnel"
     route = [bridge] * 20 + [cut] + [bridge] * 20
     assert settle(route) == route
+
+
+@pytest.mark.parametrize("water,ground,expected", [
+    (63, 58, "embankment"),  # One block below the formation.
+    (62, 58, "embankment"),
+    (60, 58, "embankment"),
+    (59, 56, "embankment"),  # Five blocks below; exactly eight blocks of fill.
+    (58, 58, "bridge_thin"),  # Six blocks below.
+    (62, 55, "bridge_thick"),  # Low clearance, but nine blocks of fill.
+    (64, 58, "trench_water"),
+    (65, 58, "trench_water"),
+    (78, 58, "tunnel"),
+    (None, 58, "embankment"),
+])
+def test_mrtsurface_low_clearance_water_uses_feasible_banks(water, ground, expected):
+    build = SAMPLE.parent / "mrtsurfacemap_bpath/build.toml"
+    settings = Settings.read(tomllib.loads(build.read_text()), build.parent)
+    facts = Facts(65, ground, water, int(water is not None), 30, False,
+                  edge_ground=ground, left_ground=ground, right_ground=ground)
+    choice = choose(settings.rules, facts, 0)
+    assert choice.section == expected
+    if expected == "embankment" and water is not None:
+        bridge = choose(settings.rules, Facts(65, 58, 58, 1, 30, False), 0)
+        route = [bridge] * 20 + [choice] + [bridge] * 20
+        assert settle(route) == route
+        # A retaining half must preserve the bank's short-run protection too.
+        mixed = settings.mixed["embankment"].apply(choice, Facts(
+            65, ground, water, 1, 30, False, left_ground=72, right_ground=ground,
+        ))
+        assert mixed.section == "embankment_trench_left"
+        assert fold([bridge] * 20 + [mixed] + [bridge] * 20)[20] == mixed
 
 
 @pytest.mark.parametrize("pool_ground", [60, 75])
@@ -361,10 +392,10 @@ def test_terminal_switch_places_new_profile_at_final_world_point(tmp_path):
 [selection]
 auto = false
 [[selection.control_point]]
-point = [0, 70, 0]
+station = 0
 sections = ["plain"]
 [[selection.control_point]]
-point = [6, 70, 0]
+station = -1
 sections = ["enclosed"]
 ''', auto=False, lead=1)
     for name, block in (("plain", "minecraft:stone"), ("enclosed", "minecraft:gold_block")):
@@ -377,6 +408,63 @@ sections = ["enclosed"]
     assert built.world.get_block(BlockPos(6, 70, 0)).name == "minecraft:gold_block"
 
 
+def test_index_switches_distinguish_repeated_columns_and_mix_with_points(tmp_path):
+    selector = make_selector(tmp_path, '''
+[selection]
+auto = false
+[[selection.control_point]]
+station = -1
+sections = ["enclosed"]
+[[selection.control_point]]
+point = [0, 70, 0]
+sections = ["plain"]
+[[selection.control_point]]
+station = 1
+sections = ["raised"]
+''', auto=False, points=[[0, 70, 0], [1, 70, 0], [0, 70, 0]])
+    assert [s.selected for s in selector.stations] == ["plain", "raised", "enclosed"]
+    controls = selector.summary()["control_points"]
+    assert [c["station"] for c in controls] == [0, 1, 2]
+    assert controls[-1]["point"] == [0, 70, 0]
+    assert controls[-1]["distance"] == 0
+    assert_resolution(selector)
+
+
+def test_index_switch_can_resume_auto(tmp_path, monkeypatch):
+    selector = make_selector(tmp_path, '''
+[[selection.control_point]]
+station = 0
+sections = ["raised"]
+[[selection.control_point]]
+station = -1
+auto = true
+''')
+    monkeypatch.setattr(Selector, "sample", lambda self, i: (70, None, 0, False))
+    assert [s.selected for s in selector.stations] == ["raised"] * 6 + ["plain"]
+    assert_resolution(selector)
+
+
+@pytest.mark.parametrize("stations,expected", [
+    ([0, -1], (0, 6)), ([4, -1], (4, 6)), ([-1, -1], (6, 6)), ([-1, 6], (6, 6)),
+])
+def test_manual_last_station_ranges(tmp_path, stations, expected):
+    selector = make_selector(tmp_path, f'''
+[selection]
+auto = false
+[[selection.control_point]]
+station = 0
+sections = ["plain"]
+[[selection.manual]]
+stations = {stations}
+sections = ["raised"]
+''', auto=False, lead=2)
+    start, stop = expected
+    assert [s.selected for s in selector.stations] == [
+        "raised" if start <= i <= stop else "plain" for i in range(7)
+    ]
+    assert_resolution(selector)
+
+
 @pytest.mark.parametrize(("selection", "message"), [
     ({"auto": "false"}, "true or false"),
     ({"unknown": 1}, "unknown selection"),
@@ -384,8 +472,19 @@ sections = ["enclosed"]
     ({"manual": [{"stations": [2, 1], "sections": ["plain"]}]}, "inclusive indices"),
     ({"manual": [{"stations": [0, 7], "sections": ["plain"]}]}, "inclusive indices"),
     ({"manual": [{"stations": [False, 1], "sections": ["plain"]}]}, "inclusive indices"),
+    ({"manual": [{"stations": [-2, -1], "sections": ["plain"]}]}, "inclusive indices"),
+    ({"manual": [{"stations": [0, -2], "sections": ["plain"]}]}, "inclusive indices"),
+    ({"manual": [{"stations": [-1, 2], "sections": ["plain"]}]}, "inclusive indices"),
     ({"manual": [{"stations": [0, 1], "from": [0, 0], "sections": ["plain"]}]}, "not both"),
     ({"control_point": [{"point": [1, float("nan"), 0], "sections": ["plain"]}]}, "finite"),
+    ({"control_point": [{"station": -2, "sections": ["plain"]}]}, "nonnegative integer or -1"),
+    ({"control_point": [{"station": 7, "sections": ["plain"]}]}, "from 0 to 6"),
+    ({"control_point": [{"station": True, "sections": ["plain"]}]}, "nonnegative integer or -1"),
+    ({"control_point": [{"station": 1.5, "sections": ["plain"]}]}, "nonnegative integer or -1"),
+    ({"control_point": [{"station": "1", "sections": ["plain"]}]}, "nonnegative integer or -1"),
+    ({"control_point": [{"station": 1, "point": [1, 0], "sections": ["plain"]}]}, "not both"),
+    ({"control_point": [{"station": -1, "sections": ["plain"]},
+                        {"point": [6, 0], "sections": ["raised"]}]}, "same station"),
     ({"control_point": [{"point": [1, 0], "sections": ["plain"], "auto": True}]}, "either"),
     ({"auto": False, "control_point": [{"point": [1, 0], "auto": True}]}, "cannot resume"),
     ({"control_point": [{"point": [1, 0], "sections": ["plain"]},
@@ -417,12 +516,28 @@ def test_auto_reports_missing_rules_or_world(tmp_path):
 AUTHORED = 'path_assignments = "assignments.toml"\n'
 
 
-@pytest.mark.parametrize("stations", [[-1, 2], [2, 1], [False, 2], [1], [1, "2"]])
+@pytest.mark.parametrize("stations", [[-1, 2], [-2, 2], [0, -2], [2, 1], [False, 2], [1], [1, "2"]])
 def test_generated_assignment_station_validation(tmp_path, stations):
     write_build(tmp_path, table=AUTHORED)
     (tmp_path / "assignments.toml").write_text(f'[[assignment]]\nstations = {stations}\nsections = ["plain"]\n'.replace("False", "false"))
     with pytest.raises((ValueError, tomllib.TOMLDecodeError)):
-        load(tmp_path / "build.toml")
+        spec = load(tmp_path / "build.toml")
+        resolve_spans(spec, build_path(spec))
+
+
+@pytest.mark.parametrize("lead", [0, 2])
+@pytest.mark.parametrize("stations,expected", [
+    ([0, -1], (0, 6)), ([4, -1], (4, 6)), ([-1, -1], (6, 6)), ([-1, 6], (6, 6)),
+])
+def test_authored_last_station_ranges_exclude_padding(tmp_path, lead, stations, expected):
+    write_build(tmp_path, table=AUTHORED, lead=lead)
+    (tmp_path / "assignments.toml").write_text(
+        f'[[assignment]]\nstations = {stations}\nsections = ["plain"]\n'
+    )
+    spec = load(tmp_path / "build.toml")
+    assert resolve_spans(spec, build_path(spec))["plain"] == (
+        tuple(index + lead for index in expected),
+    )
 
 
 def test_generated_assignment_rejects_station_beyond_route(tmp_path):

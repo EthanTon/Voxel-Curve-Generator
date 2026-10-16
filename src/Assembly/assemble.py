@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path as FilePath
 
@@ -14,7 +14,7 @@ from ..Core.Path.path_frame import PathFrame
 from ..Core.World.block_world import BlockWorld
 from ..Core.block.registry import BlockRegistry
 from ..Core.coordinates import BlockPos
-from ..Core.Feature.dependent_path import DependentFeaturePath
+from ..Core.Feature.dependent_path import DependentFeaturePath, PathRuns
 from ..Core.modes import StepMode
 from ..Core.line import line
 from ..Generation.Geometry.frames import level_near
@@ -28,6 +28,7 @@ from ..Generation.Geometry.silhouette import (
     annotation_column_owners,
     section_column_owners,
 )
+from ..Generation.Sweep.corners import settle_corners
 from ..Generation.Sweep.delivery import nearby_frames
 from ..Generation.Sweep.paths import DeliveredPath, deliver_paths
 from ..Terraform import Terraforming, load_terrain
@@ -48,8 +49,10 @@ from .structure import (
     resolve_spans,
 )
 from .wires import WIRE_LINES, dependent_strand, lay_wire, line_strand, strand_of
-from .dependencies import build_feature_paths, dependent_intervals
+from .dependencies import build_feature_paths, dependent_intervals, feature_path_graph
 from .progress import Progress, report
+from .fittings import retain_assemblies
+from .formation_paths import formation_paths
 
 
 # How many path points from its own a fitting may land in a frame of: past
@@ -71,7 +74,10 @@ class PreparedBuild:
     path: Path
     spans: Mapping[str, tuple[tuple[int, int], ...]]
     silhouette: PathSilhouette
-    layings: tuple[Laying, ...]
+    layings: Sequence[Laying] | Iterator[Laying]
+    feature_paths: dict[str, PathRuns] = field(default_factory=dict)
+    dependencies: dict[str, DependentFeaturePath] = field(default_factory=dict)
+    formations: dict[str, dict[str, set[BlockPos]]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +92,10 @@ def assemble(spec: BuildSpec) -> BlockWorld:
 
 def build(spec: BuildSpec, *, progress: Progress | None = None) -> Built:
     """Build without UI; optionally report progress within each assembly stage."""
+    if spec.composition is not None:
+        from ..Extensions.Composition.rooted import compose
+        from ..Extensions.Composition.run import build as build_composition
+        return build_composition(compose(spec), progress=progress)
     prepared = prepare_build(spec, progress=progress)
     placed = place_features(prepared, progress=progress)
     return finalize_build(placed, progress=progress)
@@ -95,6 +105,8 @@ def prepare_build(
     spec: BuildSpec,
     *,
     shared: PreparedBuild | None = None,
+    world: BlockWorld | None = None,
+    defer_features: bool = False,
     progress: Progress | None = None,
 ) -> PreparedBuild:
     """Prepare placements without emitting blocks; shared reuses a world and its domains."""
@@ -114,7 +126,12 @@ def prepare_build(
         )
     if spec.terraform is None and designed:
         raise ValueError("surface_mask.reference = 'designed' needs a terraform plan")
-    world = BlockWorld(BlockRegistry.for_vanilla_26_2()) if shared is None else shared.world
+    if shared is not None:
+        if world is not None and world is not shared.world:
+            raise ValueError("world must match the shared build's world")
+        world = shared.world
+    elif world is None:
+        world = BlockWorld(BlockRegistry.for_vanilla_26_2())
     registry = world.registry
     if masked and world.surface_reference is None:
         world.surface_reference = SurfaceReference(load_terrain(surface_world, surface_dimension))
@@ -128,25 +145,35 @@ def prepare_build(
     sections = build_sections(spec, registry, domains, spans)
     schedules = build_schedules(sections, spans, len(path.path_points))
     frames = build_path_frames(spec, schedules, path)
-    silhouette = PathSilhouette.for_sections(path, sections.values(), frames)
+    silhouette = PathSilhouette.for_sections(path, sections.values(), frames, (
+        fitting.offset.y for fitting in (*spec.lanes, *spec.wires, *spec.structures)
+    ))
     clip = silhouette.clip
     report(progress, "Preparing path", 1)
 
     report(progress, "Preparing placements", 0)
     runs = sweep(spec, schedules, path, frames, silhouette)
-    layings = tuple(
-        all_layings(
-            spec, runs, sections, world, registry, domains, frames, clip,
-            schedules, silhouette,
+    paths, dependencies = {}, {}
+    if defer_features:
+        paths, dependencies = feature_path_graph(
+            spec, runs, sections, path, level_near(frames),
+            fitting_clip(spec, frames, schedules, silhouette),
         )
-    )
+    layings = all_layings(spec, runs, sections, world, registry, domains, frames, clip,
+                          schedules, silhouette, paths if defer_features else None)
+    if not defer_features:
+        layings = tuple(layings)
     report(progress, "Preparing placements", 1)
-    return PreparedBuild(spec, world, domains, path, spans, silhouette, layings)
+    formations = formation_paths(spec, runs, sections, level_near(frames), path) if spec.formations else {}
+    return PreparedBuild(spec, world, domains, path, spans, silhouette, layings, paths, dependencies, formations)
 
 
 def place_features(
     prepared: PreparedBuild,
     *additional: PreparedBuild,
+    before_place: Callable[[PreparedBuild], None] | None = None,
+    priority: Callable[[PreparedBuild], tuple] | None = None,
+    defer_terrain: bool = False,
     progress: Progress | None = None,
 ) -> PlacedBuild:
     """Place all components in domain order without shaping terrain or resolving blocks."""
@@ -156,36 +183,57 @@ def place_features(
         for each in additional
     ):
         raise ValueError("prepare additional components with shared=first_prepared_build")
-    if additional and any(each.spec.terraform is not None for each in components):
+    if additional and not defer_terrain and any(each.spec.terraform is not None for each in components):
         raise ValueError("shared terrain shaping needs a composition layer; combined builds must omit terraform")
     # Sort across components so a later component's foundation cannot cover an earlier fitting.
     layings = sorted(
         ((index, laying) for index, each in enumerate(components) for laying in each.layings),
-        key=lambda item: prepared.spec.domain(item[1].domain).order,
+        key=lambda item: (prepared.spec.domain(item[1].domain).order,
+                          () if priority is None else priority(components[item[0]])),
     )
     fitting_ids: tuple[dict[str, list[int]], ...] = tuple({} for _ in components)
     report(progress, "Placing features", 0, len(layings))
     for number, (index, laying) in enumerate(layings, 1):
+        if before_place is not None:
+            before_place(components[index])
         placed = laying.lay()
         if laying.fitting:
             fitting_ids[index].setdefault(laying.fitting, []).extend(placed or ())
         report(progress, "Placing features", number, len(layings))
-    return PlacedBuild(components, fitting_ids)
+    placed = PlacedBuild(components, fitting_ids)
+    retain_assemblies(placed)
+    return placed
 
 
-def finalize_build(placed: PlacedBuild, *, progress: Progress | None = None) -> Built:
-    """Support joints, shape a single build's terrain, and resolve the shared world once."""
+def finalize_build(
+    placed: PlacedBuild,
+    *,
+    terrain_builder: Callable[[PlacedBuild], Terraforming | None] | None = None,
+    progress: Progress | None = None,
+) -> Built:
+    """Support joints, shape terrain through the selected builder, and resolve once."""
     prepared = placed.components[0]
     spec, world, domains = prepared.spec, prepared.world, prepared.domains
-    path, spans, silhouette = prepared.path, prepared.spans, prepared.silhouette
-    registry, surface = world.registry, world.surface_reference
-    fitting_ids = placed.fitting_ids[0]
-    fittings = {name: list(feet_of(world, ids)) for name, ids in fitting_ids.items()}
+    if terrain_builder is None and len(placed.components) > 1 and any(each.spec.terraform for each in placed.components):
+        raise ValueError("deferred shared terrain needs a terrain_builder")
     report(progress, "Supporting rail joints", 0)
     support_rail_joints(world, {domains.profile(section.domain).domain_id
                               for each in placed.components for section in each.spec.sections})
     report(progress, "Supporting rail joints", 1)
     report(progress, "Shaping terrain", 0)
+    shaped = _shape_terrain(prepared, placed.fitting_ids[0]) if terrain_builder is None else terrain_builder(placed)
+    report(progress, "Shaping terrain", 1)
+    report(progress, "Resolving blocks", 0)
+    resolve(world, world.registry, domains)
+    report(progress, "Resolving blocks", 1)
+    return Built(world, shaped)
+
+
+def _shape_terrain(prepared: PreparedBuild, fitting_ids: Mapping[str, Sequence[int]]) -> Terraforming | None:
+    spec, world, domains = prepared.spec, prepared.world, prepared.domains
+    path, spans, silhouette = prepared.path, prepared.spans, prepared.silhouette
+    registry, surface = world.registry, world.surface_reference
+    fittings = {name: list(feet_of(world, ids)) for name, ids in fitting_ids.items()}
     designed_masks = surface is not None and any(mask.reference == "designed" for mask in _surface_masks(spec))
     if designed_masks:
         # Re-mask against previewed earthworks until the dependent footprints settle.
@@ -217,11 +265,7 @@ def finalize_build(placed: PlacedBuild, *, progress: Progress | None = None) -> 
     if designed_masks and shaped is not None:
         surface.update(shaped)
         world.refresh_surface_masks()
-    report(progress, "Shaping terrain", 1)
-    report(progress, "Resolving blocks", 0)
-    resolve(world, registry, domains)
-    report(progress, "Resolving blocks", 1)
-    return Built(world, shaped)
+    return shaped
 
 
 def _surface_source(spec: BuildSpec) -> tuple[FilePath | None, str | None]:
@@ -255,7 +299,7 @@ def sweep(
         for schedule in schedules.values()
         for run in deliver_paths(
             schedule, path, frames, turns, spec.path.lead, spec.path.lead,
-            silhouette=silhouette,
+            silhouette=silhouette, solve_corners=True,
         )
     )
 
@@ -265,6 +309,40 @@ class Laying:
     domain: str
     lay: Callable[[], object]
     fitting: str | None = None
+    feature: str | None = None
+
+
+def fitting_clip(spec, frames, schedules, silhouette):
+    fitted = nearby_frames(frames, max(spec.path.lead, FITTING_REACH))
+
+    def kept_to(fitting):
+        riding = fitted_sections(spec, fitting)
+        if isinstance(fitting, WireSpec) and not fitting.between:
+            riding = tuple(dict.fromkeys(
+                name for wire in spec.wires
+                if not wire.between
+                and (wire.domain, wire.offset, wire.schematic) ==
+                    (fitting.domain, fitting.offset, fitting.schematic)
+                and strand_source(spec, wire) == strand_source(spec, fitting)
+                for name in wire.sections
+            ))
+        ridden = [span for name, schedule in schedules.items() if name in riding for span in schedule.spans]
+        others = tuple(
+            silhouette.for_span(span)
+            for name, schedule in schedules.items() if name not in riding
+            for span in schedule.spans
+            if not any(min(each.path_stop, span.path_stop) - max(each.path_start, span.path_start) > 1
+                       for each in ridden)
+        )
+        if not others:
+            return fitted
+        return lambda point: IntersectMask(fitted(point), OutsideMask(others))
+
+    return kept_to
+
+
+def _column_on(silhouette: PathSilhouette, station: int, x: int, z: int) -> tuple[int, ...]:
+    return silhouette.column(x, z, station)
 
 
 def all_layings(
@@ -278,24 +356,36 @@ def all_layings(
     clip: ClipRule,
     schedules: Mapping[str, SectionSchedule],
     silhouette: PathSilhouette,
+    feature_paths: dict[str, PathRuns] | None = None,
 ) -> Iterator[Laying]:
     # Every placement of the build, lazily. Sections are clipped to their own
     # frames, and a world column two of a span's columns reach goes to one
     # of them; fittings may land in frames near their point.
-    owners = section_column_owners(runs, schedules)
-    columns = annotation_column_owners(runs, silhouette.path)
+    owners = section_column_owners(runs, schedules, silhouette)
+    columns = annotation_column_owners(runs, silhouette.path, silhouette)
+    settle_corners(columns, runs, silhouette.path, silhouette)
+    # Slices of a deep section overlap along travel; the slice furthest from
+    # the path is laid last, so it shows wherever it has a block.
     for run in sorted(
         runs,
-        key=lambda run: (run.start, run.annotation.step_mode is StepMode.MANHATTAN),
+        key=lambda run: (
+            run.start,
+            run.annotation.step_mode is StepMode.MANHATTAN,
+            abs(run.annotation.position.z),
+            run.annotation.position.z,
+        ),
     ):
         span_mask = silhouette.for_span(schedules[run.section_name].spans[run.span])
-        stack_mask = SectionColumnMask(owners, run.section_name, run.span)
         held = columns.get((run.section_name, run.span))
-        if held is not None:
-            stack_mask = IntersectMask(stack_mask, AnnotationColumnMask(held, run.annotation.column_name))
-        section_clip = lambda point, mask=span_mask, stack=stack_mask: IntersectMask(
-            IntersectMask(clip(point), mask), stack
-        )
+
+        def section_clip(point, mask=span_mask, run=run, held=held):
+            # Each point reads the tables as its own pass of the path sees them.
+            key = partial(_column_on, silhouette, point.path_index)
+            stack = SectionColumnMask(owners, run.section_name, run.span, key)
+            if held is not None:
+                stack = IntersectMask(stack, AnnotationColumnMask(held, run.annotation.column_name, key))
+            return IntersectMask(IntersectMask(clip(point), mask), stack)
+
         feature = run.annotation.feature
         yield Laying(
             feature.domain.name,
@@ -304,51 +394,17 @@ def all_layings(
                 clip=section_clip,
             ),
         )
-    fitted = nearby_frames(frames, max(spec.path.lead, FITTING_REACH))
     level = level_near(frames)
-
-    def kept_to(fitting) -> ClipRule:
-        # Near its point, and off the spans of sections it doesn't ride, so
-        # a rail ending at a handover doesn't step onto the next section.
-        riding = fitted_sections(spec, fitting)
-        if isinstance(fitting, WireSpec) and not fitting.between:
-            # Straight and followed parts of the same strand may continue
-            # across a section handover. Do not clip their connecting cells
-            # against each other; an unwired stretch still excludes them.
-            riding = tuple(dict.fromkeys(
-                name for wire in spec.wires
-                if not wire.between
-                and (wire.domain, wire.offset, wire.schematic) ==
-                    (fitting.domain, fitting.offset, fitting.schematic)
-                and strand_source(spec, wire) == strand_source(spec, fitting)
-                for name in wire.sections
-            ))
-        ridden = [
-            span for name, schedule in schedules.items() if name in riding
-            for span in schedule.spans
-        ]
-        # A section laid over one it rides, such as an edge, doesn't count;
-        # neighbours sharing only the point they meet at do.
-        others = tuple(
-            silhouette.for_span(span)
-            for name, schedule in schedules.items() if name not in riding
-            for span in schedule.spans
-            if not any(
-                min(each.path_stop, span.path_stop) - max(each.path_start, span.path_start) > 1
-                for each in ridden
-            )
-        )
-        if not others:
-            return fitted
-        outside = OutsideMask(others)
-        return lambda point: IntersectMask(fitted(point), outside)
+    kept_to = fitting_clip(spec, frames, schedules, silhouette)
 
     wire_paths = {
         wire.name: wire_routes(wire, runs_under(spec, wire, runs))
         for wire in spec.wires if wire.geometry is WireGeometry.LINE and not wire.between and wire.feature_path is None
     }
     named_paths = {each.name for each in spec.feature_paths}
-    dependent_paths = build_feature_paths(spec, runs, sections, silhouette.path, level, kept_to) if named_paths else {}
+    dependent_paths = feature_paths if feature_paths is not None else (
+        build_feature_paths(spec, runs, sections, silhouette.path, level, kept_to) if named_paths else {}
+    )
     for structure in spec.structures:
         structure_clip = kept_to(structure)
         dependent = structure.feature_path in named_paths or (
@@ -358,7 +414,8 @@ def all_layings(
             stamp = build_structure(replace(structure, offset=BlockPos(0, 0, 0)), registry, domains,
                                     DependentFeaturePath(f"structure:{structure.name}", rules=()))
             for points in dependent_paths[f"structure:{structure.name}"]:
-                yield Laying(structure.domain, partial(stamp_along, stamp, world, points, clip=structure_clip), structure.name)
+                yield Laying(structure.domain, partial(stamp_along, stamp, world, points, clip=structure_clip),
+                             structure.name, f"structure:{structure.name}")
             continue
         stamp = build_structure(structure, registry, domains)
         for run, anchors in structure_runs(spec, structure, runs, wire_paths.get(structure.wire)):
@@ -369,6 +426,7 @@ def all_layings(
                 structure.domain,
                 partial(stamp_along, stamp, world, points, clip=structure_clip),
                 structure.name,
+                f"structure:{structure.name}",
             )
     continuations = {}
 
@@ -386,7 +444,8 @@ def all_layings(
                 start, stop = next(((first, last) for first, last in intervals
                                     if first <= start <= stop <= last), (start, stop))
                 remember(wire, start, stop, strand)
-                yield Laying(wire.domain, partial(lay_wire, wire, strand, world, registry, domains, frames))
+                yield Laying(wire.domain, partial(lay_wire, wire, strand, world, registry, domains, frames),
+                             feature=f"wire:{wire.name}")
             continue
         if wire.geometry is WireGeometry.LINE and not wire.between:
             for route in wire_paths[wire.name]:
@@ -395,6 +454,7 @@ def all_layings(
                 yield Laying(
                     wire.domain,
                     partial(lay_wire, wire, strand, world, registry, domains, frames),
+                    feature=f"wire:{wire.name}",
                 )
             continue
         for run in runs_under(spec, wire, runs):
@@ -408,6 +468,7 @@ def all_layings(
             yield Laying(
                 wire.domain,
                 partial(lay_wire, wire, strand, world, registry, domains, frames),
+                feature=f"wire:{wire.name}",
             )
     for pieces in continuations.values():
         pieces.sort(key=lambda piece: piece[:2])
@@ -421,6 +482,7 @@ def all_layings(
             yield Laying(
                 wire.domain,
                 partial(lay_wire, wire, strand, world, registry, domains, frames),
+                feature=f"wire:{wire.name}",
             )
     for lane in spec.lanes:
         stamp = TurnStamp(build_lane(lane, registry, domains), domains)

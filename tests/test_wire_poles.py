@@ -215,7 +215,7 @@ class WirePoleTests(unittest.TestCase):
                 stamped = []
                 for run, anchors in structure_runs(spec, structure, runs, (route,)):
                     for point in structure_points(structure, anchors, sections[run.section_name], level):
-                        placed = point.position + laid_offset(structure.offset, point.laid_at, point.mirrored)
+                        placed = point.position + laid_offset(structure.offset, point.laid_at)
                         stamped.append(placed + (0, point.y_offset + 7, 0))
                 self.assertEqual(len(stamped), sum(len(anchors) for _, anchors in route))
                 self.assertEqual(len(set(stamped)), len(stamped))

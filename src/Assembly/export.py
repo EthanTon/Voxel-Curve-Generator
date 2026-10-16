@@ -5,6 +5,7 @@ from __future__ import annotations
 # blocks, air where it clears ground, and the save's own blocks elsewhere --
 # so pasting it with air changes exactly what the build changes.
 
+import math
 import re
 from dataclasses import dataclass
 from functools import cache
@@ -69,10 +70,13 @@ def write_pieces(
     terraforming: Terraforming | None,
     *,
     progress: Progress | None = None,
+    origin: BlockPos | None = None,
 ) -> list[Piece]:
     split = spec.output.split
     if split is None:
         return []
+    if split.terrain and not split.count_air:
+        raise ValueError("split.count_air = false requires terrain = false")
     report(progress, "Preparing pieces", 0)
     ground = split.terrain and terraforming is not None and spec.terraform is not None
     if split.terrain and not ground:
@@ -88,7 +92,11 @@ def write_pieces(
         if ground and spec.terraform.terrain_world is not None else None
     )
     extent = _terrain_extent(positions, terraforming, split.terrain_depth) if ground else positions
-    boxes = list(_boxes(extent, split.max_span, split.max_blocks))
+    if split.count_air:
+        boxes = list(_boxes(extent, split.max_span, split.max_blocks))
+    else:
+        non_air = np.array([state.name not in AIR_NAMES for state in states])[codes]
+        boxes = list(_non_air_boxes(positions, non_air, split.max_span, split.max_blocks))
     # Check availability before replacing an older complete export.
     if source is not None:
         chunks = {
@@ -106,7 +114,7 @@ def write_pieces(
     for stale in directory.iterdir():
         if numbered.fullmatch(stale.name):
             stale.unlink()
-    first = BlockPos.coerce(spec.path.points[0])
+    first = BlockPos.coerce(spec.path.points[0] if origin is None else origin)
     pieces: list[Piece] = []
     report(progress, "Preparing pieces", 1)
     report(progress, "Writing pieces", 0, len(boxes))
@@ -128,7 +136,7 @@ def write_pieces(
         pieces.append(Piece(name, path, region.origin, region.size, placed, cleared, copied))
         report(progress, "Writing pieces", number + 1, len(boxes))
     report(progress, "Writing placement manifest", 0)
-    _manifest(directory / f"{spec.output.name}.toml", spec, pieces, source is not None)
+    _manifest(directory / f"{spec.output.name}.toml", spec, pieces, source is not None, origin=first)
     report(progress, "Writing placement manifest", 1)
     return pieces
 
@@ -189,8 +197,7 @@ def _in_track_space(position: BlockPos, terraforming: Terraforming | None, *, fl
     if clearance is None or not terraforming.grid.holds(position.x, position.z):
         return False
     row, cell = terraforming.grid.at(position.x, position.z)
-    low, high = clearance.floor.item(row, cell), clearance.ceiling.item(row, cell)
-    return low <= high and low - int(floor) <= position.y <= high
+    return clearance.holds(row, cell, position.y) or (floor and clearance.holds(row, cell, position.y + 1))
 
 
 def _in_water(state: BlockState, position: BlockPos, terraforming: Terraforming | None, *, waterlog: bool = True) -> BlockState:
@@ -256,21 +263,45 @@ def _terrain_extent(positions, terraforming, depth):
 
 
 def _boxes(positions: np.ndarray, span: int, budget: int):
-    # A trimmed box per occupied `span` x `span` tile, layered to fit `budget`.
-    tiles = np.stack([positions[:, 0] // span, positions[:, 2] // span], axis=1)
+    # A trimmed box per occupied tile, layered so no side passes `span` and
+    # no box passes `budget` cells; the tile narrows when one layer would.
+    side = min(span, max(1, math.isqrt(budget)))
+    tiles = np.stack([positions[:, 0] // side, positions[:, 2] // side], axis=1)
     order = np.lexsort((tiles[:, 1], tiles[:, 0]))
     tiles, sorted_positions = tiles[order], positions[order]
     breaks = np.flatnonzero(np.any(np.diff(tiles, axis=0) != 0, axis=1)) + 1
     for group in np.split(sorted_positions, breaks):
         low, high = group.min(axis=0), group.max(axis=0)
         width, depth = high[0] - low[0] + 1, high[2] - low[2] + 1
-        layers = max(1, int(budget // max(1, width * depth)))
+        layers = max(1, min(span, int(budget // max(1, width * depth))))
         for bottom in range(int(low[1]), int(high[1]) + 1, layers):
             top = min(int(high[1]), bottom + layers - 1)
             yield (
                 BlockPos(int(low[0]), bottom, int(low[2])),
                 BlockPos(int(high[0]), top, int(high[2])),
             )
+
+
+def _non_air_boxes(positions, non_air, span, budget):
+    """Partition changes spatially, counting only their non-air states.
+
+    Explicit air changes remain in the pieces so cuts still paste correctly.
+    Implicit air inside the bounding boxes never consumes the block budget.
+    """
+    if not len(positions):
+        return
+    low, high = positions.min(axis=0), positions.max(axis=0)
+    sizes = high - low + 1
+    if non_air.sum() <= budget and sizes.max() <= span:
+        yield _native_position(BlockPos.coerce(low)), _native_position(BlockPos.coerce(high))
+        return
+    axis = int(sizes.argmax())
+    # A coordinate cut ensures the output boxes cannot overlap, including
+    # when many changes share a plane or the route crosses itself.
+    cut = (int(low[axis]) + int(high[axis])) // 2
+    left = positions[:, axis] <= cut
+    yield from _non_air_boxes(positions[left], non_air[left], span, budget)
+    yield from _non_air_boxes(positions[~left], non_air[~left], span, budget)
 
 
 def _build_piece(name, low, high, states, positions, codes, soft, source, terraforming):
@@ -361,8 +392,8 @@ def _clearance_box(terraforming: Terraforming, low: BlockPos, size: BlockPos):
     return floor, ceiling
 
 
-def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool) -> None:
-    first = _native_position(BlockPos.coerce(spec.path.points[0]))
+def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool, *, origin: BlockPos | None = None) -> None:
+    first = _native_position(BlockPos.coerce(spec.path.points[0] if origin is None else origin))
     how = (
         "Each piece is the world as the build leaves it: paste it as it is, air\n"
         "# and all -- //schem load <file>, then //paste -o -- and it changes what the\n"
@@ -374,7 +405,7 @@ def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool
     lines = [
         f"# {spec.output.name}: {len(pieces)} pieces, {'with' if ground else 'without'} terrain.",
         f"# {how}",
-        f"# Coordinates are absolute; the paste origin is the first path point {list(first.as_tuple())}.",
+        f"# Coordinates are absolute; the paste origin is {list(first.as_tuple())}.",
         "",
         tomli_w.dumps({"name": spec.output.name}).rstrip(),
         f"terrain = {'true' if ground else 'false'}",
@@ -401,15 +432,15 @@ def _manifest(path: FilePath, spec: BuildSpec, pieces: list[Piece], ground: bool
 
 def write(
     world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None,
-    *, progress: Progress | None = None,
+    *, progress: Progress | None = None, origin: BlockPos | None = None,
 ) -> FilePath:
     """Write a build, returning the absolute path to its primary output."""
-    return write_outputs(world, spec, terraforming, progress=progress).primary
+    return write_outputs(world, spec, terraforming, progress=progress, origin=origin).primary
 
 
 def write_outputs(
     world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None = None,
-    *, progress: Progress | None = None,
+    *, progress: Progress | None = None, origin: BlockPos | None = None,
 ) -> Written:
     """Write once and collect actual output paths, without scanning directories."""
     # The output suffix picks .schem or .litematic; a split writes pieces,
@@ -417,7 +448,7 @@ def write_outputs(
     split = spec.output.split
     outputs: list[FilePath] = []
     if split is not None:
-        pieces = write_pieces(world, spec, terraforming, progress=progress)
+        pieces = write_pieces(world, spec, terraforming, progress=progress, origin=origin)
         outputs.extend(piece.path for piece in pieces)
         outputs.append(FilePath(split.directory).resolve() / f"{spec.output.name}.toml")
     if split is not None and not split.combined:
@@ -425,13 +456,14 @@ def write_outputs(
         spec.output.path.unlink(missing_ok=True)
         return Written(outputs[-1], tuple(outputs))
     report(progress, "Writing combined output", 0)
-    primary = _write_combined(world, spec, terraforming).resolve()
+    primary = _write_combined(world, spec, terraforming, origin=origin).resolve()
     report(progress, "Writing combined output", 1)
     return Written(primary, (primary, *outputs))
 
 
 def _write_combined(
     world: BlockWorld, spec: BuildSpec, terraforming: Terraforming | None,
+    *, origin: BlockPos | None = None,
 ) -> FilePath:
     split = spec.output.split
     if split is not None and split.terrain and terraforming is not None:
@@ -454,7 +486,7 @@ def _write_combined(
                 wet = _in_water(state, position, terraforming, waterlog=waterlog)
                 if wet != state:
                     region.set_state(position, wet)
-    first_point = spec.path.points[0]
+    first_point = spec.path.points[0] if origin is None else origin
     if spec.output.path.suffix == SCHEM_SUFFIX:
         # Offset is the minimum corner; relative mode rebases it on the first
         # path point so a plain //paste puts that point under the player.

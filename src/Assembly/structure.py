@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path as FilePath
+from types import MappingProxyType
 
 from ..Core.CrossSection.annotations import FeatureAnnotation
-from ..Core.CrossSection.cross_section import CrossSection, PointField
+from ..Core.CrossSection.cross_section import Beside, CrossSection, PointField
 from ..Core.CrossSection.schedule import SectionSchedule, SectionSpan
 from ..Core.Domain import DomainRegistry
 from ..Core.Feature.feature import (
@@ -130,11 +132,16 @@ def span_indices(
     starts: set[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
     if isinstance(span, StationSpanSpec):
-        start, stop = span.start + path.first_index, span.stop + path.first_index
-        if stop > path.last_index:
+        start = path.last_index if span.start == -1 else span.start + path.first_index
+        stop = path.last_index if span.stop == -1 else span.stop + path.first_index
+        if max(start, stop) > path.last_index:
             raise ValueError(
                 f"section {section.name!r} sweeps {span}, past the last authored path station "
                 f"({path.last_index - path.first_index})"
+            )
+        if stop < start:
+            raise ValueError(
+                f"section {section.name!r} sweeps {span}, which runs backwards along the path"
             )
         return start, stop
     start = marker_index(section, span, span.start, path)
@@ -170,13 +177,42 @@ def build_sections(
     spec: BuildSpec,
     registry: BlockRegistry,
     domains: DomainRegistry,
-    spans: Mapping[str, object],
+    spans: Mapping[str, Sequence[tuple[int, int]]],
 ) -> dict[str, CrossSection]:
     # Only the sections some assignment uses.
-    return {
-        name: build_section(spec.section(name), registry, domains)
-        for name in spans
-    }
+    return laid_beside(
+        {name: build_section(spec.section(name), registry, domains) for name in spans},
+        spans,
+    )
+
+
+def laid_beside(
+    sections: Mapping[str, CrossSection],
+    spans: Mapping[str, Sequence[tuple[int, int]]],
+) -> dict[str, CrossSection]:
+    # Sections sharing a stretch push each other's columns as one section's
+    # stepping columns would, so a neighbour's corner never lands on them.
+    given = {name: section.alongside() for name, section in sections.items()}
+    laid = {}
+    for name, section in sections.items():
+        pushes: dict[int, int] = {}
+        heights: dict[int, frozenset[int]] = {}
+        for other, alongside in given.items():
+            if other == name or not any(
+                min(stop, other_stop) - max(start, other_start) > 1
+                for start, stop in spans.get(name, ())
+                for other_start, other_stop in spans.get(other, ())
+            ):
+                continue
+            for column, push in alongside.pushes.items():
+                if abs(push) > abs(pushes.get(column, 0)):
+                    pushes[column] = push
+            for column, found in alongside.heights.items():
+                heights[column] = heights.get(column, frozenset()) | found
+        laid[name] = replace(
+            section, beside=Beside(MappingProxyType(pushes), MappingProxyType(heights))
+        ) if heights else section
+    return laid
 
 
 def build_section(
@@ -215,7 +251,10 @@ def build_section(
                 f"section {spec.name!r} has a raised edge on its centreline"
             )
         position = BlockPos(column[0], 0, column[1])
-        step = spec.steps.get(column, spec.step)
+        # The centreline is kept for fittings even when it has no blocks; it
+        # steps only where it is keyed, or it would push one side alone.
+        empty = stack.bounds is None
+        step = spec.steps.get(column, StepMode.CHEBYSHEV if empty else spec.step)
         pieces = pieces_by_step(stack, column, spec.steps, step, registry)
         placed_domain = (
             domains.get(spec.edge_domains[column[0] > 0])

@@ -4,6 +4,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import dist, isfinite
 
+from ..Parser.stations import resolve_station
+
 
 def section_names(raw: object, defined: set[str], where: str) -> tuple[str, ...]:
     if (not isinstance(raw, list) or not raw
@@ -14,11 +16,17 @@ def section_names(raw: object, defined: set[str], where: str) -> tuple[str, ...]
 
 
 def station_range(raw: object, count: int, where: str) -> tuple[int, int]:
-    if (not isinstance(raw, list) or len(raw) != 2
-            or any(not isinstance(i, int) or isinstance(i, bool) for i in raw)
-            or not 0 <= raw[0] <= raw[1] < count):
-        raise ValueError(f"{where}.stations needs inclusive indices 0 <= start <= stop < {count}")
-    return tuple(raw)
+    message = (f"{where}.stations needs inclusive indices 0 <= start <= stop < {count}; "
+               "-1 means the last station")
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise ValueError(message)
+    try:
+        start, stop = (resolve_station(index, count, f"{where}.stations") for index in raw)
+    except ValueError:
+        raise ValueError(message) from None
+    if stop < start:
+        raise ValueError(message)
+    return start, stop
 
 
 def endpoint_index(raw: object, points: Sequence, markers: Mapping, where: str) -> int:
@@ -89,10 +97,16 @@ class Composition:
         controls = []
         for number, raw in enumerate(tables(data, "control_point"), 1):
             label = f"control_point[{number}]"
-            if set(raw) - {"point", "sections", "auto"}:
-                raise ValueError(f"{label} accepts point and either sections or auto = true")
-            point = world_point(raw.get("point"), f"{label}.point")
-            index, distance = nearest_station(points, point)
+            if set(raw) - {"point", "station", "sections", "auto"}:
+                raise ValueError(f"{label} accepts point or station and either sections or auto = true")
+            if "station" in raw:
+                if "point" in raw:
+                    raise ValueError(f"{label} must use point or station, not both")
+                index = resolve_station(raw["station"], len(points), f"{label}.station")
+                point, distance = tuple(points[index]), 0.0
+            else:
+                point = world_point(raw.get("point"), f"{label}.point")
+                index, distance = nearest_station(points, point)
             if "sections" in raw:
                 if "auto" in raw:
                     raise ValueError(f"{label} must set either sections or auto = true")

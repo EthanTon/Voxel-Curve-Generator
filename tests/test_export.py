@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.Assembly.export import _boxes, _changed_cells, write, write_pieces
+from src.Assembly.export import _boxes, _changed_cells, _non_air_boxes, write, write_pieces
 from src.Core.Field.block_field import BlockField
 from src.Core.World.block_world import BlockWorld
 from src.Core.block.registry import BlockRegistry
@@ -532,6 +532,58 @@ def test_pieces_tile_the_build_and_layer_a_tall_tile():
         ((0, 100, 0), (10, 100, 10)),
         ((70, 5, 3), (70, 5, 3)),
     ]
+
+
+@pytest.mark.parametrize("budget,span", ((4_000_000, 16), (4096, 128), (100, 8)))
+def test_pieces_keep_every_side_within_the_span_and_the_budget(budget, span):
+    x, y, z = np.indices((40, 40, 40))
+    positions = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    covered = np.zeros(len(positions), dtype=int)
+    for low, high in _boxes(positions, span, budget):
+        sides = [high[axis] - low[axis] + 1 for axis in range(3)]
+        assert max(sides) <= span
+        assert sides[0] * sides[1] * sides[2] <= budget
+        covered += np.all((positions >= low.as_tuple()) & (positions <= high.as_tuple()), axis=1)
+    assert np.all(covered == 1)
+
+
+@pytest.mark.parametrize("budget,span", ((150000, 32767), (150000, 128)))
+def test_non_air_pieces_cover_each_change_once_within_the_limits(budget, span):
+    x, z = np.indices((450, 450))
+    positions = np.column_stack((x.ravel(), np.zeros(x.size, dtype=int), z.ravel()))
+    # The 202,500-cell footprint contains 150,001 non-air blocks.
+    non_air = np.arange(len(positions)) < 150001
+    boxes = list(_non_air_boxes(positions, non_air, span, budget))
+    assert len(boxes) > 1
+    covered = np.zeros(len(positions), dtype=int)
+    for low, high in boxes:
+        inside = np.all((positions >= low.as_tuple()) & (positions <= high.as_tuple()), axis=1)
+        assert non_air[inside].sum() <= budget
+        assert max(high[axis] - low[axis] + 1 for axis in range(3)) <= span
+        covered += inside
+    assert np.all(covered == 1)
+
+
+def test_non_air_budget_ignores_sparse_air_and_preserves_explicit_cuts(tmp_path):
+    spec = spec_for(tmp_path, terrain=False)
+    spec.output.split = SplitSpec(tmp_path / "pieces", max_blocks=2, max_span=64, count_air=False)
+    world = bricks_at(BlockPos(0, 0, 0))
+    field = BlockField(world.registry.palette)
+    field.set_block(BlockPos(9, 9, 9), BRICKS)
+    world.add_field(field)
+    cut = terraforming_with(cut={BlockPos(5, 5, 5)})
+    piece, = write_pieces(world, spec, cut)
+    assert piece.placed == 2
+    assert piece.cleared == 1
+    region, _ = load_schematic(piece.path)
+    assert region.size == BlockPos(10, 10, 10)
+    assert region.state_at(BlockPos(0, 0, 0)) == BRICKS
+    assert region.state_at(BlockPos(9, 9, 9)) == BRICKS
+    assert region.state_at(BlockPos(5, 5, 5)).name == AIR
+
+
+def test_non_air_budget_handles_an_empty_build():
+    assert list(_non_air_boxes(np.empty((0, 3), dtype=int), np.array([], dtype=bool), 64, 2)) == []
 
 
 def test_a_rerun_leaves_none_of_the_last_runs_pieces_behind(tmp_path):

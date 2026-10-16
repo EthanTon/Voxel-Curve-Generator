@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Hashable, Iterable, Sequence, Set
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence, Set
 from itertools import groupby
 from math import hypot
 from typing import NamedTuple, TypeVar
@@ -9,7 +9,7 @@ from typing import NamedTuple, TypeVar
 from ...Core.CrossSection.annotations import FeatureAnnotation
 from ...Core.CrossSection.schedule import SectionSchedule
 from ...Core.CrossSection.cross_section import lean_of
-from ...Core.CrossSection.turns import SectionTurn, forward, is_quarter, quarter_of
+from ...Core.CrossSection.turns import SectionTurn, forward, is_quarter, place_along, quarter_of, step_along
 from ...Core.coordinates import Vec3
 from ...Core.Feature.feature_path import (
     FeaturePathPoint,
@@ -25,7 +25,8 @@ from ...Core.modes import LineMode
 from ...Core.coordinates import BlockPos
 from ...Core.Path.path_frame import PathFrame
 from ..Geometry.silhouette import PathSilhouette
-from .delivery import deliver
+from .corners import Flip, Laid, _push, corners_of, fill_corner, fill_flip, flips_of
+from .delivery import Delivery, deliver
 from .schedule import walk_schedule
 
 Level = Callable[[float, float, int], int]
@@ -57,13 +58,19 @@ def deliver_paths(
     lead_out: int = 0,
     rules: Iterable[FeaturePathRule] = DEFAULT_RULES,
     silhouette: PathSilhouette | None = None,
+    solve_corners: bool = False,
 ) -> tuple[DeliveredPath, ...]:
     # Sweeps the schedule into one run per annotation per span. A point is
     # delivered into every frame its lead reaches, clipped to that frame and
     # taking its level. Where a quarter's lean flips between neighbouring
     # points, both points are laid with both leans so the column level with
-    # the flip is covered.
-    runs: dict[tuple[str, int], DeliveredPath] = {}
+    # the flip is covered. With `solve_corners`, a turn through a diagonal
+    # hands over between quarters where neither sees a step sideways to it,
+    # and each column is carried across the wedge between them (see
+    # `corners`) instead of a join; a turn whose quarters lay a column on
+    # different diagonals keeps its join. Likewise a staircase turning over is
+    # moved into a straight run and changes lean at one cut (see `flips_of`).
+    rules = tuple(rules)
     if silhouette is None:
         silhouette = PathSilhouette.for_sections(
             path, (span.section for span in schedule.spans), frames
@@ -72,27 +79,109 @@ def deliver_paths(
     steps = list(walk_schedule(
         schedule, path, frames, lead_in, lead_out, extend_spans=True
     ))
-    leans = _leans(steps, turns)
+    # Handovers are found along the whole path, so spans meeting at a corner
+    # agree on the quarter each station is laid in; a span keeps those that
+    # reach its stations or its lead.
+    corners = {
+        (number, corner.index): corner
+        for number, span in enumerate(schedule.spans) if solve_corners
+        for corner in corners_of(turns, path, span.section, path.first_index, path.last_index)
+        if min(corner.turns) <= span.path_stop + lead_out
+        and max(corner.turns) >= span.path_start - lead_in
+    }
+    laying = list(turns)
+    for corner in corners.values():
+        for index, turn in corner.turns.items():
+            laying[index] = turn
+    leans = _leans(steps, laying)
+    flips = {}
+    if solve_corners:
+        for number, span in enumerate(schedule.spans):
+            held = {step.index: lean for step, lean in zip(steps, leans) if step.span == number}
+            for flip in flips_of(held, laying, path, span.section, span.path_start, span.path_stop):
+                flips[number, flip.window.start] = flip
+        moved = {(span, k): lean for (span, _), flip in flips.items() for k, lean in flip.leans.items()}
+        leans = [moved.get((step.span, step.index), lean) for step, lean in zip(steps, leans)]
+    windows = {(span, k): flip for (span, _), flip in flips.items() for k in flip.window}
+    laid, annotations = _lay(schedule, path, steps, laying, leans, span_masks, silhouette, windows)
+    for (span, _), flip in flips.items():
+        owned = schedule.spans[span]
+        filled = fill_flip(
+            flip, path, {key: positions for key, positions in laid.items() if key[1] == span},
+            _push(owned.section),
+            lambda x, z, at, span=span, owned=owned: _placeable(
+                silhouette, span_masks[span], owned, path, x, z, at
+            ),
+            lambda x, z, at: silhouette.frame_at(x, z, at).y_offset if silhouette.frames else 0,
+        )
+        for key, positions in filled.items():
+            laid[key].extend(positions)
+    for (span, _), corner in corners.items():
+        owned = schedule.spans[span]
+        filled = fill_corner(
+            corner, owned.section, path,
+            lambda x, z, at, span=span, owned=owned: _placeable(
+                silhouette, span_masks[span], owned, path, x, z, at
+            ),
+            lambda x, z, at: silhouette.frame_at(x, z, at).y_offset if silhouette.frames else 0,
+        )
+        for name, positions in filled.items():
+            key = (name, span)
+            annotations.setdefault(key, owned.section.points.get(name))
+            laid.setdefault(key, []).extend(positions)
+    runs = []
+    for key, positions in laid.items():
+        run = DeliveredPath(
+            annotations[key], key[1], FeaturePath(rules),
+            schedule.spans[key[1]].path_start,
+        )
+        for each in sorted(positions, key=lambda each: each.path_index):
+            run.path.add(*each)
+        if len(run.path):
+            runs.append(run)
+    return tuple(runs)
+
+
+def _lay(
+    schedule: SectionSchedule,
+    path: Path,
+    steps: Sequence,
+    turns: Sequence[SectionTurn],
+    leans: Sequence[int | None],
+    span_masks: Sequence,
+    silhouette: PathSilhouette,
+    windows: Mapping[tuple[int, int], Flip] = {},
+) -> tuple[dict[tuple[str, int], list[Laid]], dict[tuple[str, int], FeatureAnnotation]]:
+    # Every walked point's rows, by annotation and span. A station in a
+    # flip's window lays both leans, each clipped to its side of the cut.
+    annotations: dict[tuple[str, int], FeatureAnnotation] = {}
+    laid: dict[tuple[str, int], list[Laid]] = {}
     for number, step in enumerate(steps):
         span = step.span
         owned = schedule.spans[span]
         span_mask = span_masks[span]
         layout = turns[step.index]
-        laid = [leans[number]]
+        flip = windows.get((span, step.index))
+        both = [leans[number]] if flip is None else [flip.before, flip.after]
         for near in (number - 1, number + 1):
             if (
-                0 <= near < len(steps)
+                flip is None
+                and 0 <= near < len(steps)
                 and steps[near].span == span
                 and abs(steps[near].index - step.index) == 1
                 and turns[steps[near].index].absolute == layout.absolute
-                and leans[near] not in laid
+                and leans[near] not in both
             ):
-                laid.append(leans[near])
-        for oriented in (
-            step.section.orient(layout.turn, layout.direction, lean) for lean in laid
+                both.append(leans[near])
+        for lean, oriented in (
+            (lean, step.section.orient(layout.turn, layout.direction, lean)) for lean in both
         ):
+            delivered = tuple(
+                _along_path(delivery, path, step.index, step.section.origin.z)
+                for delivery in deliver(step.point, oriented)
+            )
             for frame in step.frames:
-                for delivery in deliver(step.point, oriented, frame):
+                for delivery in delivered:
                     # Points beyond the span's own (extended lead) carry only
                     # section material: never the centreline that fittings
                     # anchor to, and clip-to-span details only for three
@@ -116,21 +205,21 @@ def deliver_paths(
                             and frame.path_stop < path.last_index)
                     ):
                         continue
-                    run = runs.get((delivery.annotation.name, span))
-                    if run is None:
-                        run = DeliveredPath(
-                            delivery.annotation, span, FeaturePath(rules),
-                            owned.path_start,
-                        )
-                        runs[delivery.annotation.name, span] = run
+                    key = (delivery.annotation.name, span)
+                    annotations.setdefault(key, delivery.annotation)
+                    positions = laid.setdefault(key, [])
                     for position in delivery.positions:
+                        if not frame.contains(position.x, position.z):
+                            continue
                         if not span_mask.contains(position.x, position.z):
                             continue
                         if silhouette.frames and silhouette.frame_at(
-                            position.x, position.z
+                            position.x, position.z, step.index
                         ) != frame:
                             continue
-                        run.path.add(
+                        if flip is not None and not flip.keeps(lean, position.x, position.z):
+                            continue
+                        positions.append(Laid(
                             position,
                             step.point.gradient,
                             layout.turn,
@@ -139,8 +228,49 @@ def deliver_paths(
                             layout.direction,
                             delivery.layout,
                             delivery.mirrored,
-                        )
-    return tuple(run for run in runs.values() if len(run.path))
+                        ))
+    return laid, annotations
+
+
+def _along_path(delivery: Delivery, path: Path, index: int, origin_z: int) -> Delivery:
+    # A deep slice is laid where the point that many stations along lays its
+    # column, as authored whatever the lean, so off the quarters it stays on
+    # its own column's diagonal rather than its layout's forward axis.
+    depth = delivery.annotation.position.z - origin_z
+    if not depth:
+        return delivery
+    laid_x, laid_z = place_along(delivery.layout, 0, -depth if delivery.mirrored else depth)
+    authored_x, authored_z = place_along(delivery.layout, 0, depth)
+    forward_x, forward_z = step_along(delivery.layout)
+    stations = round(
+        (authored_x * forward_x + authored_z * forward_z) / (forward_x**2 + forward_z**2)
+    )
+    target = index + stations
+    if not 0 <= target < len(path.path_points):
+        return delivery
+    here = path.path_points[index].position
+    there = path.path_points[target].position
+    shift_x = there.x - here.x - laid_x
+    shift_z = there.z - here.z - laid_z
+    return delivery._replace(positions=tuple(
+        BlockPos(p.x + shift_x, p.y, p.z + shift_z) for p in delivery.positions
+    ))
+
+
+def _placeable(
+    silhouette, span_mask, owned, path: Path, x: int, z: int, station: int | None = None
+) -> bool:
+    # Whether a span may lay a column the search chose, as a delivery may.
+    if not span_mask.contains(x, z):
+        return False
+    if not silhouette.frames:
+        return True
+    frame = silhouette.frame_at(x, z, station)
+    return frame is not None and not (
+        frame.path_start > owned.path_stop
+        or frame.path_stop < owned.path_start
+        or (frame.path_stop == owned.path_start and frame.path_stop < path.last_index)
+    )
 
 
 def _leans(steps, turns: Sequence[SectionTurn]) -> list[int | None]:

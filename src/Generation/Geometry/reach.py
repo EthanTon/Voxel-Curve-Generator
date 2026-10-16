@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 
 from ...Core.CrossSection.cross_section import CrossSection
-from ...Core.CrossSection.turns import Turn, heading
+from ...Core.CrossSection.turns import Turn, heading, place_along
 from ...Core.Feature.feature import Feature
 from ...Core.Path.path import Path
 from ...Core.coordinates import BlockPos, Vec2
@@ -18,7 +18,7 @@ def lateral_reach(
     # How far the sections' oriented positions, widened by their features'
     # blocks, reach left and right of travel at `turn` or at every turn.
     left = right = 0.0
-    for forward, feature, position in _oriented(sections, turn):
+    for forward, feature, position in _oriented(sections, turn, across=True):
         low, high = feature_lateral_span(feature)
         lateral = position.x * -forward.z + position.z * forward.x
         right = max(right, lateral + high)
@@ -41,16 +41,25 @@ def longitudinal_reach(
 
 
 def _oriented(
-    sections: Iterable[CrossSection], turn: Turn | None
+    sections: Iterable[CrossSection], turn: Turn | None, across: bool = False
 ) -> Iterator[tuple[Vec2, Feature, BlockPos]]:
-    # (heading, feature, position) for every position of every layout.
+    # (heading, feature, position) for every position of every layout. Across
+    # travel, a deep slice stands where its column does, since it is laid
+    # along the path.
     turns = range(0, 360, 45) if turn is None else (turn,)
     for section in sections:
         for each in turns:
             forward = heading(each)
             for offset in (o for laid in section.layouts(each) for o in laid):
+                depth = offset.annotation.position.z - section.origin.z
+                dx, dz = (
+                    place_along(offset.layout, 0, -depth if offset.mirrored else depth)
+                    if across and depth else (0, 0)
+                )
                 for position in offset.offsets:
-                    yield forward, offset.annotation.feature, position
+                    yield forward, offset.annotation.feature, BlockPos(
+                        position.x - dx, position.y, position.z - dz
+                    )
 
 
 def feature_lateral_span(feature: Feature) -> tuple[int, int]:

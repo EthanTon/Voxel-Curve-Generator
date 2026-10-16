@@ -14,6 +14,7 @@ from ..Core.Feature.dependent_path import PathProjection
 from ..Stamping import Heading
 from ..Terraform.plan import Plan as TerraformPlan
 from ..Terraform.surface_mask import SurfaceMaskSpec
+from .stations import validate_station
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,14 +75,15 @@ class SpanSpec:
 
 @dataclass(frozen=True, slots=True)
 class StationSpanSpec:
-    # Inclusive indices in the authored path, before padding is added.
+    # Inclusive indices in the authored path; -1 is its last point, before padding.
     start: int
     stop: int
 
     def __post_init__(self) -> None:
-        if (any(not isinstance(i, int) or isinstance(i, bool) for i in (self.start, self.stop))
-                or not 0 <= self.start <= self.stop):
-            raise ValueError("assignment stations need nonnegative inclusive start <= stop indices")
+        for index in (self.start, self.stop):
+            validate_station(index, "assignment stations")
+        if -1 not in (self.start, self.stop) and self.stop < self.start:
+            raise ValueError("assignment stations need inclusive start <= stop indices")
 
     def __str__(self) -> str:
         return f"stations {self.start}..{self.stop}"
@@ -185,6 +187,7 @@ class StructureSpec:
     # [[feature_path]] instead supplies shared world placement points.
     feature_path: str | None = None
     schematic_turns: int = 0
+    assembly: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +233,7 @@ class LaneSpec:
 @dataclass(frozen=True, slots=True)
 class SplitSpec:
     # Export pieces of at most `max_span` per axis and `max_blocks` cells.
+    # Set count_air=False to budget only non-air changes (without terrain).
     # With `terrain`, pieces also carry the surrounding ground (see export.py).
     directory: Path
     max_blocks: int = 4_000_000
@@ -239,6 +243,7 @@ class SplitSpec:
     # Skip the duplicate, full bounding-box schematic when only pieces
     # are needed; write() then returns their manifest.
     combined: bool = True
+    count_air: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +254,21 @@ class OutputSpec:
     # "absolute", "relative", or None for each format's default.
     mode: str | None = None
     split: SplitSpec | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FormationSpec:
+    name: str
+    domain: str
+    rail_domains: tuple[str, ...]
+    replace_domains: tuple[str, ...]
+    foundation_blocks: tuple[str, ...]
+    support: str
+    flank: str
+    shoulder: str
+    edge: str
+    clearance: int = 2
+    edge_height: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +287,8 @@ class BuildSpec:
     surface_world: Path | None = None
     surface_dimension: str | None = None
     feature_paths: tuple[FeaturePathSpec, ...] = ()
+    composition: Path | None = None
+    formations: tuple[FormationSpec, ...] = ()
 
     def marker(self, name: str) -> ColumnPos:
         if name not in self.markers:
@@ -291,6 +313,9 @@ class BuildSpec:
 
     def feature_path(self, name: str) -> FeaturePathSpec:
         return _named(self.feature_paths, name, "feature path")
+
+    def formation(self, name: str) -> FormationSpec:
+        return _named(self.formations, name, "formation")
 
 
 def _where(column: ColumnPos, marker: str | None) -> str:

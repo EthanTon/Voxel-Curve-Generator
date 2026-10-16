@@ -7,6 +7,7 @@ from pathlib import Path
 from .assignments import read_assignments
 from .domains import read_domain, read_interaction
 from .fittings import read_lane, read_structure, read_wire
+from .formations import read_formation
 from .feature_paths import check_feature_paths, read_feature_path
 from .paths import read_markers, read_output, read_path
 from .sections import read_sections
@@ -15,6 +16,7 @@ from .spec import (
     BuildSpec,
     DomainSpec,
     FeaturePathSpec,
+    FormationSpec,
     InteractionSpec,
     LaneSpec,
     Measure,
@@ -37,6 +39,7 @@ __all__ = [
     "BuildSpec",
     "DomainSpec",
     "FeaturePathSpec",
+    "FormationSpec",
     "InteractionSpec",
     "LaneSpec",
     "Measure",
@@ -83,9 +86,20 @@ def parse(data: Mapping, base: Path = Path(".")) -> BuildSpec:
         terraform=read_terraform(data, base),
         surface_world=read_surface_world(data.get("surface"), base),
         surface_dimension=read_surface_dimension(data.get("surface")),
+        composition=read_composition(data, base),
+        formations=tuple(read_formation(each) for each in data.get("formation", ())),
     )
     check_references(spec)
     return spec
+
+
+def read_composition(data: Mapping, base: Path) -> Path | None:
+    named = data.get("composition")
+    if named is None:
+        return None
+    if not isinstance(named, str) or not named:
+        raise ValueError('composition must name a file: composition = "composition.toml"')
+    return (base / named).resolve()
 
 
 def read_terraform(data: Mapping, base: Path):
@@ -123,6 +137,11 @@ def read_surface_dimension(data: Mapping | None) -> str | None:
 
 def check_references(spec: BuildSpec) -> None:
     check_feature_paths(spec)
+    if len({each.name for each in spec.formations}) != len(spec.formations):
+        raise ValueError("formation names must be unique")
+    for formation in spec.formations:
+        for name in (formation.domain, *formation.rail_domains, *formation.replace_domains):
+            spec.domain(name)
     for interaction in spec.interactions:
         spec.domain(interaction.source)
         spec.domain(interaction.target)

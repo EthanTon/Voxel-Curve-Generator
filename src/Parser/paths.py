@@ -20,9 +20,9 @@ def read_path(data: Mapping, base: Path = Path(".")) -> PathSpec:
     lead = source.get("lead", 0)
     if lead < 0:
         raise ValueError(f"lead must be non-negative, got {lead}")
-    if lead and lead * 2 >= len(points):
+    if lead and len(points) < 2:
         raise ValueError(
-            f"a lead of {lead} at each end needs more than {lead * 2} points, "
+            f"a lead of {lead} needs at least two authored points to extend, "
             f"and the path has {len(points)}"
         )
     return PathSpec(points, gradients, lead, read_diagonal(source))
@@ -75,6 +75,7 @@ def read_split(data: Mapping | None, path: Path) -> SplitSpec | None:
         terrain=data.get("terrain", False),
         terrain_depth=data.get("terrain_depth", 16),
         combined=data.get("combined", True),
+        count_air=data.get("count_air", True),
     )
     if split.max_blocks <= 0 or split.max_span <= 0:
         raise ValueError("a split needs a positive max_blocks and max_span")
@@ -82,4 +83,8 @@ def read_split(data: Mapping | None, path: Path) -> SplitSpec | None:
         raise ValueError("split.terrain_depth must be a nonnegative integer")
     if type(split.combined) is not bool:
         raise ValueError("split.combined must be true or false")
+    if type(split.count_air) is not bool:
+        raise ValueError("split.count_air must be true or false")
+    if split.terrain and not split.count_air:
+        raise ValueError("split.count_air = false requires terrain = false")
     return split

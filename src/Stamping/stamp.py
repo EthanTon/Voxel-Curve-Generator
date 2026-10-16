@@ -169,7 +169,6 @@ class TurnStamp:
                 clip=clip,
                 quarter_turns=lateral_turns(quarter_of(self.layout(point))),
                 offset_layout=self.layout(point),
-                mirror="z" if point.mirrored else None,
                 domains=self.domains,
                 y_offset=y_offset,
                 sequence_index=sequence_index,
@@ -191,6 +190,7 @@ class HeadingStamp:
         self.domains = domains
         self._features = by_authored(features, resolution)
         self._turns: dict[tuple[int, bool], tuple[Feature, int, bool]] = {}
+        self.mirror = _mirror_axis(self._features[0])
 
     @property
     def headings(self) -> tuple[Heading, ...]:
@@ -240,9 +240,7 @@ class HeadingStamp:
                 point,
                 clip=clip,
                 quarter_turns=laid_out(quarter_turns + (DIAGONAL_TURN if mirrored else 0)),
-                # Mirrored along travel, as the offset is: a reflection
-                # across it would carry the left of travel to the right.
-                mirror="z" if mirrored else None,
+                mirror=self.mirror if mirrored else None,
                 # The offset follows the section's layout, not the heading.
                 offset_layout=point.layout,
                 domains=self.domains,
@@ -250,6 +248,23 @@ class HeadingStamp:
                 sequence_index=sequence_index,
             ),
         )
+
+
+def _mirror_axis(feature: Feature) -> str:
+    # A variant past the diagonal is a reflection of one before it, which
+    # swaps either the sides of travel ("z", along it) or the front and back
+    # ("x", across it). Keep the structure's sides unless only its front and
+    # back differ.
+    blocks = getattr(feature, "blocks", None)
+    if blocks is None:
+        return "z"
+    cells = {
+        (local.x, local.y, local.z): blocks.palette.get_state(block_id).name
+        for local, block_id in blocks.iter_block_ids()
+    }
+    across = {(-x, y, z): name for (x, y, z), name in cells.items()} == cells
+    along = {(x, y, -z): name for (x, y, z), name in cells.items()} == cells
+    return "x" if across and not along else "z"
 
 
 def place(
@@ -272,7 +287,7 @@ def place(
     origin = BlockPos.coerce(point.position) + (
         turned_offset(feature.offset, quarter_turns)
         if offset_layout is None
-        else laid_offset(feature.offset, offset_layout, point.mirrored)
+        else laid_offset(feature.offset, offset_layout)
     )
     transform = BlockTransform(
         origin + BlockPos(0, point.y_offset, 0) if rigid else origin,
@@ -333,11 +348,12 @@ def turned_offset(offset: BlockPos, quarter_turns: int) -> BlockPos:
     return BlockPos(round(x), offset.y, round(z))
 
 
-def laid_offset(offset: BlockPos, layout: int, mirrored: bool = False) -> BlockPos:
+def laid_offset(offset: BlockPos, layout: int) -> BlockPos:
     # Where the section places its own column at this local offset in the
     # given layout, so offsets stay on the deck's columns (rotating and
-    # rounding would shorten them on diagonals).
-    x, z = placed_column(layout, offset.x, -offset.z if mirrored else offset.z)
+    # rounding would shorten them on diagonals). The lean never turns an
+    # offset ahead into one behind.
+    x, z = placed_column(layout, offset.x, offset.z)
     return BlockPos(x, offset.y, z)
 
 

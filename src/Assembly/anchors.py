@@ -75,8 +75,8 @@ def anchor_path(spec: StructureSpec | WireSpec, path: FeaturePath) -> FeaturePat
         return rewalk(path, rules)
 
     def distance(first, second):
-        a = first.position + laid_offset(spec.offset, first.laid_at, first.mirrored)
-        b = second.position + laid_offset(spec.offset, second.laid_at, second.mirrored)
+        a = first.position + laid_offset(spec.offset, first.laid_at)
+        b = second.position + laid_offset(spec.offset, second.laid_at)
         return hypot(a.x - b.x, a.z - b.z)
 
     chosen = FeaturePath(rules)
@@ -230,7 +230,7 @@ def structure_points(
 
 
 def as_laid(offset: BlockPos) -> Callable[[FeaturePathPoint], BlockPos]:
-    return lambda point: laid_offset(offset, point.laid_at, point.mirrored)
+    return lambda point: laid_offset(offset, point.laid_at)
 
 
 def column_cells(

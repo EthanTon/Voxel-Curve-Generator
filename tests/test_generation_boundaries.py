@@ -58,9 +58,13 @@ class PathBoundsBuilderTests(unittest.TestCase):
         self.path = straight(12, lead_in=2, lead_out=3)
         self.bounds = path_bounds(self.path)
 
-    def test_the_start_plane_sits_on_the_first_path_point(self) -> None:
+    def test_the_start_plane_sits_half_a_block_before_the_first_point(self) -> None:
+        # Every column the plane through the first point passes through is
+        # kept, so a slanted start is not notched where it just misses one.
         self.assertEqual(self.bounds.start.path_index, 2)
-        self.assertEqual(self.bounds.start.origin, Vec2(0, 2))
+        self.assertEqual(self.bounds.start.origin, Vec2(0, 1.5))
+        self.assertTrue(self.bounds.contains(0, 2))
+        self.assertFalse(self.bounds.contains(0, 1))
 
     def test_the_end_plane_sits_a_block_past_the_last(self) -> None:
         # A frame holds the columns at or after its start and before its end,

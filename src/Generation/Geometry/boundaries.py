@@ -47,15 +47,22 @@ def boundary_at(
 
 
 def path_bounds(path: Path, orientation: Orientation = orthogonal) -> PathBounds:
-    # From the plane at the first point to one a block past the last point,
-    # so both end points are inside and padding is outside. The end plane has
-    # no path index, so frame checks take it as given.
+    # From half a block before the first point to a block past the last
+    # point, so both end points are inside and padding is outside. The start
+    # keeps every column its plane passes through: one through the point
+    # itself drops a column a fraction behind it, notching a slanted end.
+    # The end plane has no path index, so frame checks take it as given.
     if not path.path_points:
         raise ValueError("An empty path has no bounds")
+    first = path.path_points[path.first_index].position
+    starting = orientation(path, path.first_index)
     last = path.path_points[path.last_index].position
     facing = orientation(path, path.last_index)
     return PathBounds(
-        boundary_at(path, path.first_index, orientation),
+        Boundary.from_direction(
+            (first.x - starting.x / 2, first.z - starting.z / 2), starting,
+            path_index=path.first_index,
+        ),
         Boundary.from_direction((last.x + facing.x, last.z + facing.z), facing),
     )
 
@@ -110,10 +117,12 @@ def validate_frames(
     path: Path,
     frames: Sequence[PathFrame],
     half_width: float | LateralReach | None = None,
+    holding: bool = False,
 ) -> None:
     # Frames must be numbered in order, non-empty, tile the path proper and
     # share boundaries with their neighbours; with `half_width`, neighbouring
-    # boundaries must not cross within it.
+    # boundaries must not cross within it; when `holding`, each must hold its
+    # own first point.
     if not frames:
         raise ValueError("A path needs at least one frame")
 
@@ -133,6 +142,13 @@ def validate_frames(
             )
         _check_boundary(frame, frame.start_boundary, frame.path_start, "starts")
         _check_boundary(frame, frame.end_boundary, frame.path_stop, "stops")
+        first = path.path_points[frame.path_start].position
+        if holding and not frame.contains(first.x, first.z):
+            raise ValueError(
+                f"Frame {frame.index} does not hold its own first point "
+                f"{frame.path_start}: the path turns back on itself before point "
+                f"{frame.path_stop}, so its plane cuts off the stretch before it"
+            )
 
     if frames[0].path_start != path.first_index:
         raise ValueError(

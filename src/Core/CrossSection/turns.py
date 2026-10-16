@@ -209,7 +209,10 @@ def turn_from(
     initial: Rotation = CLOCKWISE,
     tolerance: float = DIAGONAL_TOLERANCE,
 ) -> SectionTurn:
-    return turn_at(float(initial * snap(gradient, tolerance)), tolerance)
+    # Laid out at the snapped turn, but carrying the heading's own angle so
+    # later bends are not measured from the snap.
+    snapped = snap(gradient, tolerance)
+    return turn_at(initial * snapped + angle_between(heading(snapped), gradient), tolerance)
 
 
 def turn_of(

@@ -53,8 +53,11 @@ class Boundary:
 
 
 def spans_nothing(start: Boundary, end: Boundary) -> bool:
-    # Parallel planes with `end` at or behind `start` enclose no column.
+    # Planes facing the same way with `end` at or behind `start` enclose no
+    # column; planes facing opposite ways always enclose some.
     if not start.is_parallel_to(end):
+        return False
+    if start.normal.x * end.normal.x + start.normal.z * end.normal.z < 0.0:
         return False
     return end.side(start.origin.x, start.origin.z) >= 0.0
 

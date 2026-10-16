@@ -69,7 +69,7 @@ class CurveRailRegressionTests(unittest.TestCase):
                         lane, centre, sections["trackbed"], level, support
                     )
                     for offset in (
-                        laid_offset(lane.offset, point.laid_at, point.mirrored),
+                        laid_offset(lane.offset, point.laid_at),
                     )
                     if mask.contains(point.position.x + offset.x,
                                      point.position.z + offset.z)

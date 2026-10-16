@@ -218,7 +218,7 @@ def build_section_frames(
         )
         for index in range(len(indices) - 1)
     ]
-    validate_frames(path, frames, _half_width(half_width, reach))
+    validate_frames(path, frames, _half_width(half_width, reach), holding=True)
     return frames
 
 

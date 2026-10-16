@@ -76,6 +76,19 @@ class VanillaCatalogTests(unittest.TestCase):
 
         self.assertEqual(registry.get_info(block_id).solid_faces, SolidFace.ALL)
 
+    def test_a_resolved_variant_has_its_own_states_metadata(self) -> None:
+        # A wall drawn with arms and resolved to a bare post covers only the
+        # post, so the wall below it stays low on every side.
+        registry = BlockRegistry.for_vanilla_26_2()
+        sides = {"north": "tall", "east": "tall", "south": "tall", "west": "none"}
+        drawn = registry.register(BlockState.create(
+            "minecraft:andesite_wall", {**sides, "up": "true", "waterlogged": "false"}))
+        post = registry.get_or_add_variant(drawn, BlockState.create(
+            "minecraft:andesite_wall", {**dict.fromkeys(sides, "none"), "up": "true", "waterlogged": "false"}))
+
+        self.assertEqual(registry.get_info(drawn).wall_cover, 15)
+        self.assertEqual(registry.get_info(post).wall_cover, 1)
+
     def test_solid_faces_come_from_the_official_state_shapes(self) -> None:
         catalog = vanilla_catalog()
 

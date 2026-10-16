@@ -8,7 +8,7 @@ from typing import NamedTuple
 from ..coordinates import BlockPos, Vec2
 from ..modes import StepMode
 from .annotations import FeatureAnnotation
-from .steps import STEP_RULES, StepRule, column_pushes, lead
+from .steps import STEP_RULES, StepRule, column_pushes, lead, step_direction
 from .turns import (
     CLOCKWISE,
     COUNTER_CLOCKWISE,
@@ -123,6 +123,14 @@ def orient_annotation(
     )
 
 
+class Beside(NamedTuple):
+    # The sections laid alongside on the same stretch: how far their stepping
+    # columns push, and each of their columns' heights, so all of them step
+    # together as one section would.
+    pushes: Mapping[int, int] = MappingProxyType({})
+    heights: Mapping[int, frozenset[int]] = MappingProxyType({})
+
+
 class _Profile(NamedTuple):
     # Per-revision summary of a section's points. `entries` is (annotation,
     # steps, lead); `pushes` is how far each column moves those outboard of it.
@@ -138,6 +146,7 @@ def _profile(
     points: PointField,
     origin: LocalPoint,
     rules: Mapping[StepMode, StepRule],
+    beside: Beside = Beside(),
 ) -> _Profile:
     annotations = tuple(points)
     if not annotations:
@@ -154,9 +163,39 @@ def _profile(
         min_x, max_x = min(min_x, left), max(max_x, right_)
         min_z, max_z = min(min_z, back), max(max_z, front)
     pushes = column_pushes((column, steps) for _, column, steps in stepped)
+    for column, push in beside.pushes.items():
+        if abs(push) > abs(pushes.get(column, 0)):
+            pushes[column] = push
+    heights = {annotation.name: _heights(annotation) for annotation, _, _ in stepped}
+    # A pushing column holds a corner at the heights of the columns it
+    # pushes, and at the heights of its own stepping slices in its other
+    # slices, which overlap them along travel.
+    outboard: dict[int, set[int]] = {}
+    slices: dict[int, set[tuple[int, int]]] = {}
+    for annotation, column, steps in stepped:
+        for pushing in pushes:
+            if (column - pushing) * step_direction(pushing) < 0:
+                outboard.setdefault(pushing, set()).update(heights[annotation.name])
+        if len(steps) > 1:
+            slices.setdefault(column, set()).update(
+                (annotation.position.z, height) for height in heights[annotation.name]
+            )
+    for column, shared in beside.heights.items():
+        for pushing in pushes:
+            if (column - pushing) * step_direction(pushing) < 0:
+                outboard.setdefault(pushing, set()).update(shared)
+
+    def corner(annotation: FeatureAnnotation, column: int, steps: tuple[int, ...]) -> tuple[int, ...]:
+        own = heights[annotation.name]
+        if column in pushes and (own & outboard.get(column, set()) or any(
+            z != annotation.position.z and height in own for z, height in slices.get(column, ())
+        )):
+            return _cornered(steps, pushes[column])
+        return steps
+
     return _Profile(
         entries=tuple(
-            (annotation, steps, lead(column, pushes))
+            (annotation, corner(annotation, column, steps), lead(column, pushes))
             for annotation, column, steps in stepped
         ),
         right=max_x - origin.x,
@@ -165,6 +204,19 @@ def _profile(
         depth=max_z - min_z + 1,
         pushes=MappingProxyType(pushes),
     )
+
+
+def _cornered(steps: tuple[int, ...], push: int) -> tuple[int, ...]:
+    # A column that pushes those outboard of it is their corner at every
+    # height they share, including heights that do not step themselves.
+    if not push or push in steps:
+        return steps
+    return (*steps, push)
+
+
+def _heights(annotation: FeatureAnnotation) -> set[int]:
+    blocks = getattr(annotation.feature, "blocks", None)
+    return set() if blocks is None else {local.y for local, _ in blocks.iter_block_ids()}
 
 
 def _covered(annotation: FeatureAnnotation) -> tuple[int, int, int, int]:
@@ -200,16 +252,28 @@ def _in_travel_order(
     )
 
 
-def _centred(section: OrientedSection) -> OrientedSection:
-    # Shifts a join so the path point is at its middle.
-    places = [(p.x, p.z) for offset in section for p in offset.offsets]
+def _centred(
+    section: OrientedSection,
+    reference: Sequence[tuple[int, int]] | None = None,
+    origin_z: int = 0,
+) -> OrientedSection:
+    # Shifts a join so the path point is at the middle of its row level with
+    # the path; deeper slices are laid along the path, not across it.
+    level = [offset for offset in section if offset.annotation.position.z == origin_z] or section
+    places = ([(p.x, p.z) for offset in level for p in offset.offsets]
+              if reference is None else reference)
     if not places:
         return section
-    middle_x = (max(x for x, _ in places) + min(x for x, _ in places)) // 2
-    middle_z = (max(z for _, z in places) + min(z for _, z in places)) // 2
+    middle_x = _halved(max(x for x, _ in places) + min(x for x, _ in places))
+    middle_z = _halved(max(z for _, z in places) + min(z for _, z in places))
     if not (middle_x or middle_z):
         return section
     return _repeated(section, ((-middle_x, -middle_z),))
+
+
+def _halved(total: int) -> int:
+    # Half toward zero, so a join and its mirror image shift alike.
+    return total // 2 if total >= 0 else -(-total // 2)
 
 
 def _repeated(section: OrientedSection, shifts: Sequence[tuple[int, int]]) -> OrientedSection:
@@ -242,10 +306,15 @@ def _onto(
 
 
 def _column(section: OrientedSection, origin: LocalPoint, edge: int) -> BlockPos:
-    for offset in section:
-        if offset.annotation.position.x - origin.x == edge:
-            return offset.offsets[0]
-    raise ValueError(f"The section has no point in column {edge}")
+    # The column's slice nearest the origin's, so a deep section lines up the
+    # same whichever way it turns.
+    found = [
+        offset for offset in section
+        if offset.annotation.position.x - origin.x == edge
+    ]
+    if not found:
+        raise ValueError(f"The section has no point in column {edge}")
+    return min(found, key=lambda offset: abs(offset.annotation.position.z - origin.z)).offsets[0]
 
 
 class _OrientationCache:
@@ -266,6 +335,7 @@ class CrossSection:
     # The local point on the path centreline.
     origin: LocalPoint = BlockPos(0, 0, 0)
     step_rules: Mapping[StepMode, StepRule] = field(default_factory=lambda: STEP_RULES)
+    beside: Beside = field(default=Beside(), compare=False)
     _orientations: _OrientationCache = field(
         default_factory=_OrientationCache,
         init=False,
@@ -304,6 +374,17 @@ class CrossSection:
         carried = lead(column, profile.pushes)
         return tuple(
             sorted(carried + step for step in self.step_rules[step_mode](column))
+        )
+
+    def alongside(self) -> Beside:
+        # What this section gives the sections laid beside it: its own
+        # stepping columns' pushes and its columns' heights.
+        heights: dict[int, set[int]] = {}
+        for annotation in self.points:
+            heights.setdefault(annotation.position.x - self.origin.x, set()).update(_heights(annotation))
+        return Beside(
+            MappingProxyType(_profile(self.points, self.origin, self.step_rules).pushes),
+            MappingProxyType({column: frozenset(found) for column, found in heights.items()}),
         )
 
     def reach(self, turn: Turn | None = None) -> float:
@@ -346,7 +427,7 @@ class CrossSection:
         cache = self._orientations
         if cache.profile is None or cache.revision != self.points.revision:
             cache.layouts.clear()
-            cache.profile = _profile(self.points, self.origin, self.step_rules)
+            cache.profile = _profile(self.points, self.origin, self.step_rules, self.beside)
             cache.revision = self.points.revision
         return cache
 
@@ -397,14 +478,24 @@ class CrossSection:
             return _repeated(being_left, ahead) + _repeated(taking_up, behind)
 
         arms = carried(half)
-        if outside in profile.pushes:
-            # A stepping outside edge is a staircase, and the two arms' halves
-            # of it stop a cell apart; one more carry closes it.
+        if outside in profile.pushes or profile.right - profile.left >= 2 * half:
+            # An odd-width outside edge can stop one diagonal cell short,
+            # even without Manhattan steps. Carry it once more to meet the
+            # other arm; stepping edges also need that extra carry.
             arms = tuple(
                 longer if offset.annotation.position.x - self.origin.x == outside else offset
                 for offset, longer in zip(arms, carried(half + 1))
             )
-        return _centred(_in_travel_order(arms, (forward_x, forward_z)))
+        reference = None
+        if profile.left + profile.right:
+            # Unequal sides must stay offset from the route. Centre the
+            # virtual origin's two arms, even if the origin has no material,
+            # rather than moving the whole profile's bounding box onto it.
+            reference = tuple((forward_x * k, forward_z * k) for k in range(half)) + tuple(
+                (shift[0] - forward_x * k, shift[1] - forward_z * k)
+                for k in reversed(range(half))
+            )
+        return _centred(_in_travel_order(arms, (forward_x, forward_z)), reference, self.origin.z)
 
     def _layout(
         self,

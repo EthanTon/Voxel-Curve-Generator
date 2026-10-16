@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import ceil, hypot
 from typing import TYPE_CHECKING
@@ -24,24 +24,32 @@ if TYPE_CHECKING:
 class PathSilhouette:
     """Columns within `radius` of the path proper, each owned by its nearest
     station. One radius for every section keeps handovers consistent.
+
+    Where the path passes over itself further apart than `height` (the
+    sections' own height), each pass owns the column for itself: a station
+    competes only with the stations of its own pass, those near it along the
+    path or level with it.
     """
 
     def __init__(
         self, path: Path, radius: int,
         frames: Iterable[PathFrame] = (),
+        height: int | None = None,
     ) -> None:
         if radius < 0 or not path.bounded_points:
             raise ValueError("a silhouette needs a path and a non-negative radius")
         self.path = path
         self.radius = radius
         self.frames = tuple(frames)
+        self.height = height
         self._nearest = NearestInPlan(
             (point.position.x, point.position.z, index)
             for index, point in enumerate(path.path_points)
             if path.first_index <= index <= path.last_index
         )
-        self._owners: dict[tuple[float, float], int | None] = {}
-        self._frame_owners: dict[tuple[float, float], PathFrame | None] = {}
+        self._owners: dict[tuple[float, ...], int | None] = {}
+        self._layers: dict[tuple[float, float], tuple[int, ...]] = {}
+        self._frame_owners: dict[tuple[float, ...], PathFrame | None] = {}
         self._frame_candidates: dict[int, tuple[PathFrame, ...]] = {}
         self._span_masks: dict[tuple[int, int], SectionSilhouette] = {}
         self._frame_masks: dict[int, FrameSilhouette] = {}
@@ -51,23 +59,64 @@ class PathSilhouette:
     def for_sections(
         cls, path: Path, sections: Iterable[CrossSection],
         frames: Iterable[PathFrame] = (),
+        fittings: Iterable[int] = (),
     ) -> PathSilhouette:
+        # `fittings`: the heights above the path of what rides the sections,
+        # which a pass over another must clear as well.
         # Deferred: reach imports the sweep, which imports this module.
         from .reach import lateral_reach, longitudinal_reach
 
         sections = tuple(sections)
         lateral = lateral_reach(sections).half_width
         longitudinal = longitudinal_reach(sections)
-        return cls(path, ceil(hypot(lateral, longitudinal)) + 1, frames)
+        return cls(path, ceil(hypot(lateral, longitudinal)) + 1, frames, _height(sections, fittings))
 
-    def owner(self, x: float, z: float) -> int | None:
+    def owner(self, x: float, z: float, station: int | None = None) -> int | None:
+        # The nearest station, or with `station` the nearest of its pass.
         column = (x, z)
         if column not in self._owners:
             index = self._nearest.nearest(x, z)
             point = self.path.path_points[index].position
             distance = (x - point.x) ** 2 + (z - point.z) ** 2
             self._owners[column] = index if distance <= self.radius ** 2 else None
-        return self._owners[column]
+        nearest = self._owners[column]
+        if station is None or nearest is None or self.same_pass(nearest, station):
+            return nearest
+        key = (x, z, station)
+        if key not in self._owners:
+            self._owners[key] = self._nearest.nearest(
+                x, z, lambda index: self.same_pass(index, station), self.radius ** 2
+            )
+        return self._owners[key]
+
+    def same_pass(self, first: int, second: int) -> bool:
+        # Near each other along the path, or close enough in height that
+        # their sections would meet.
+        if self.height is None or abs(first - second) <= 2 * self.radius + 2:
+            return True
+        points = self.path.path_points
+        return abs(points[first].position.y - points[second].position.y) < self.height
+
+    def layers(self, x: float, z: float) -> tuple[int, ...]:
+        # The owner of each pass over the column, the nearest pass first.
+        column = (x, z)
+        if column not in self._layers:
+            owners = []
+            found = self.owner(x, z)
+            while found is not None:
+                owners.append(found)
+                found = self._nearest.nearest(
+                    x, z, lambda index: not any(self.same_pass(index, each) for each in owners),
+                    self.radius ** 2,
+                )
+            self._layers[column] = tuple(owners)
+        return self._layers[column]
+
+    def column(self, x: int, z: int, station: int) -> tuple[int, ...]:
+        # A column's key in per-column tables as `station`'s pass sees it:
+        # the column itself on the nearest pass, else with its pass's owner.
+        owner = self.owner(x, z, station)
+        return (x, z) if owner == self.owner(x, z) else (x, z, owner)
 
     def for_span(self, span: SectionSpan) -> SectionSilhouette:
         key = (span.path_start, span.path_stop)
@@ -81,20 +130,22 @@ class PathSilhouette:
         return self._frame_masks[frame.index]
 
     def clip(self, point: FeaturePathPoint) -> ColumnMask:
-        frame = self.frame_at(point.position.x, point.position.z)
+        frame = self.frame_at(point.position.x, point.position.z, point.path_index)
         if frame is None:
             raise ValueError(
                 f"{tuple(point.position)} is outside the path's framed silhouette"
             )
         return self.for_frame(frame)
 
-    def frame_at(self, x: float, z: float) -> PathFrame | None:
+    def frame_at(self, x: float, z: float, station: int | None = None) -> PathFrame | None:
         """The frame owning a column: the nearest frame to the column's station
         whose planes contain it, so a far turn of the path cannot claim it.
+        With `station`, the frame owning it on that station's pass.
         """
-        column = (x, z)
+        owner = self.owner(x, z, station)
+        column = (x, z) if owner == self.owner(x, z) else (x, z, owner)
         if column not in self._frame_owners:
-            station = self.owner(x, z)
+            station = owner
             chosen = None
             if station is not None:
                 if station not in self._frame_candidates:
@@ -119,6 +170,21 @@ class PathSilhouette:
         return self._boundaries[station]
 
 
+def _height(sections: Sequence[CrossSection], fittings: Iterable[int] = ()) -> int | None:
+    # How tall the sections and their fittings stand, bottom block to top.
+    heights = [
+        local.y + annotation.position.y - section.origin.y
+        for section in sections
+        for annotation in section.points
+        if getattr(annotation.feature, "blocks", None) is not None
+        for local, _ in annotation.feature.blocks.iter_block_ids()
+    ]
+    if not heights:
+        return None
+    heights.extend(fittings)
+    return max(heights) - min(heights) + 1
+
+
 @dataclass(frozen=True, slots=True)
 class SectionSilhouette:
     path: PathSilhouette
@@ -133,11 +199,12 @@ class SectionSilhouette:
         return self._cache[column]
 
     def _contains(self, x: float, z: float) -> bool:
-        nearest = self.path.owner(x, z)
-        if nearest is None:
-            return False
+        # On any pass over the column.
+        return any(self._on(x, z, owner) for owner in self.path.layers(x, z))
+
+    def _on(self, x: float, z: float, nearest: int) -> bool:
         if self.path.frames:
-            frame = self.path.frame_at(x, z)
+            frame = self.path.frame_at(x, z, nearest)
             if frame is None:
                 return False
             if frame.path_start > self.stop or frame.path_stop < self.start:
@@ -177,7 +244,7 @@ class FrameSilhouette:
     frame: PathFrame
 
     def contains(self, x: float, z: float) -> bool:
-        return self.path.frame_at(x, z) == self.frame
+        return self.path.frame_at(x, z, self.frame.path_start) == self.frame
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,28 +267,33 @@ class OutsideMask:
 
 @dataclass(frozen=True, slots=True)
 class SectionColumnMask:
-    # Only the columns owned by (section, span).
-    owners: Mapping[tuple[int, int], tuple[str, int]]
+    # Only the columns owned by (section, span); `key` reads a column as one
+    # pass of the path sees it (see `PathSilhouette.column`).
+    owners: Mapping[tuple[int, ...], tuple[str, int]]
     section: str
     span: int
+    key: Callable[[int, int], tuple[int, ...]] | None = None
 
     def contains(self, x: float, z: float) -> bool:
-        return self.owners.get((x, z)) == (self.section, self.span)
+        column = (x, z) if self.key is None else self.key(x, z)
+        return self.owners.get(column) == (self.section, self.span)
 
 
 @dataclass(frozen=True, slots=True)
 class AnnotationColumnMask:
     # Only the world columns `annotation` owns among its section's columns.
-    owners: Mapping[tuple[int, int], str]
+    owners: Mapping[tuple[int, ...], str]
     annotation: str
+    key: Callable[[int, int], tuple[int, ...]] | None = None
 
     def contains(self, x: float, z: float) -> bool:
-        return self.owners.get((x, z), self.annotation) == self.annotation
+        column = (x, z) if self.key is None else self.key(x, z)
+        return self.owners.get(column, self.annotation) == self.annotation
 
 
 def annotation_column_owners(
-    runs: Sequence[DeliveredPath], path: Path
-) -> dict[tuple[str, int], dict[tuple[int, int], str]]:
+    runs: Sequence[DeliveredPath], path: Path, silhouette: PathSilhouette | None = None,
+) -> dict[tuple[str, int], dict[tuple[int, ...], str]]:
     # Where a span's columns deliver to one world column -- a join's arms
     # laid through each other, or over the rows of the points beside it --
     # it goes to a column laid in the layout of the path point nearest it;
@@ -250,9 +322,13 @@ def annotation_column_owners(
         column = run.annotation.position.x
         for point in run.path:
             cell = (point.position.x, point.position.z)
+            if silhouette is not None:
+                # A pass over another keeps its own columns.
+                cell = silhouette.column(*cell, point.path_index)
             wanted = preferred.get(cell)
             if wanted is None:
-                wanted = preferred[cell] = layouts.get(nearest.nearest(*cell), set())
+                home = cell[2] if len(cell) > 2 else nearest.nearest(*cell)
+                wanted = preferred[cell] = layouts.get(home, set())
             travel = (point.gradient.x, point.gradient.z)
             length = hypot(*travel) or 1.0
             tx, tz = travel[0] / length, travel[1] / length
@@ -278,7 +354,8 @@ def _layout(point: FeaturePathPoint):
 def section_column_owners(
     runs: Sequence[DeliveredPath],
     schedules: Mapping[str, SectionSchedule],
-) -> dict[tuple[int, int], tuple[str, int]]:
+    silhouette: PathSilhouette | None = None,
+) -> dict[tuple[int, ...], tuple[str, int]]:
     # One section per world column: the later span wins a handover, and
     # among simultaneous sections the first declared.
     declared = {name: index for index, name in enumerate(schedules)}
@@ -292,6 +369,8 @@ def section_column_owners(
         rank = (schedules[section].spans[run.span].path_start, -declared[section])
         for point in run.path:
             column = (point.position.x, point.position.z)
+            if silhouette is not None:
+                column = silhouette.column(*column, point.path_index)
             if column not in ranks or rank > ranks[column]:
                 owners[column] = key
                 ranks[column] = rank

@@ -93,7 +93,11 @@ class BlockRegistry:
             return self._palette.get_id(state)
         except KeyError:
             block_id = self._palette.add(state)
-        if self._info_provider is not None and state.name != source_state.name:
+        # A variant's info is its own state's (a wall's cover follows its
+        # arms), unless the block's info was given by hand.
+        if self._info_provider is not None and (
+            state.name != source_state.name or source_info == self._provided(source_state)
+        ):
             self.set_info(block_id, self._info_provider(state))
         else:
             self.set_info(block_id, source_info)

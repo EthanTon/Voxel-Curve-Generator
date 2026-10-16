@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -64,18 +64,28 @@ class NearestInPlan(Generic[Value]):
         dz = max(node.least_z - z, 0, z - node.most_z)
         return dx * dx + dz * dz
 
-    def nearest(self, x: int, z: int) -> Value:
+    def nearest(
+        self,
+        x: int,
+        z: int,
+        keep: Callable[[Value], bool] | None = None,
+        within: float = float("inf"),
+    ) -> Value | None:
+        # Only values `keep` accepts, and none further than `within` (squared
+        # distance); None when there is none.
         best: _Node[Value] | None = None
-        best_distance = float("inf")
+        best_distance = within
         stack = [self._root]
         while stack:
             node = stack.pop()
             if self._lower_bound(node, x, z) > best_distance:
                 continue
             distance = (node.x - x) ** 2 + (node.z - z) ** 2
-            if (
+            if keep is not None and not keep(node.value):
+                pass
+            elif (
                 distance < best_distance
-                or (distance == best_distance and best is not None and node.index < best.index)
+                or (distance == best_distance and (best is None or node.index < best.index))
             ):
                 best = node
                 best_distance = distance
@@ -91,5 +101,4 @@ class NearestInPlan(Generic[Value]):
                 stack.append(left)
             elif right is not None:
                 stack.append(right)
-        assert best is not None
-        return best.value
+        return None if best is None else best.value

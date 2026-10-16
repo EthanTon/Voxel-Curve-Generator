@@ -35,6 +35,7 @@ def reshape(
     *,
     apply: bool = True,
     terrain=None,
+    positions: Sequence[BlockPos] | None = None,
 ) -> Terraforming | None:
     if spec.terraform is None:
         return None
@@ -46,6 +47,7 @@ def reshape(
     alignment = alignment_of(
         world, path, track, silhouette, formation_of(spec, silhouette, section_spans),
         include_rails=spec.terraform.include_rails,
+        positions=positions,
     )
     if not alignment.columns:
         raise ValueError(
@@ -65,9 +67,9 @@ def reshape(
         registry.palette,
         locate=marker_locator(spec, path),
         fittings=fittings,
-        envelope=envelope_of(world),
+        envelope=envelope_of(world, positions),
         section_spans=section_spans,
-        running=running_of(world, alignment),
+        running=running_of(world, alignment, positions),
     )
     if not apply:
         return shaped
@@ -86,14 +88,14 @@ def reshape(
     return shaped
 
 
-def running_of(world: BlockWorld, alignment: Alignment) -> dict[tuple[int, int], int]:
+def running_of(world: BlockWorld, alignment: Alignment, positions: Sequence[BlockPos] | None = None) -> dict[tuple[int, int], int]:
     """Carry actual rail level across the section's occupied track columns.
 
     Clearance over just the rails leaves soil between lanes and in curved
     joints. Restrict the corridor to the section footprint; enclosing then
     clips each interval against that column's actual wall or roof blocks.
     """
-    rails = [position for position in world.iter_source_positions()
+    rails = [position for position in (world.iter_source_positions() if positions is None else positions)
              if (state := world.get_block(position, resolved=False)) is not None
              and state.name in RAILS]
     if not rails:
@@ -145,11 +147,11 @@ def marker_locator(spec: BuildSpec, path: Path) -> Callable[[object], int]:
     return locate
 
 
-def envelope_of(world: BlockWorld) -> dict[tuple[int, int], list[int]]:
+def envelope_of(world: BlockWorld, positions: Sequence[BlockPos] | None = None) -> dict[tuple[int, int], list[int]]:
     # The heights of every block the build lays, by column, but those the
     # earthworks may cover.
     heights: dict[tuple[int, int], list[int]] = {}
-    for position in world.iter_source_positions():
+    for position in (world.iter_source_positions() if positions is None else positions):
         if world.yields(world.source_at(position)):
             continue
         heights.setdefault((position.x, position.z), []).append(position.y)
@@ -164,6 +166,7 @@ def alignment_of(
     formation: Callable[[int, int, int], int | None] | None = None,
     *,
     include_rails: bool = False,
+    positions: Sequence[BlockPos] | None = None,
 ) -> Alignment:
     # The firm blocks of `domains` (all if None), each at the station of its
     # nearest path point, held to the points of the frame owning its column
@@ -174,16 +177,17 @@ def alignment_of(
         (point.position.x, point.position.z): index
         for index, point in enumerate(path.path_points)
     }
+    source_positions = world.iter_source_positions if positions is None else lambda: iter(positions)
     laid = tuple(
         position
-        for position in world.iter_source_positions()
+        for position in source_positions()
         if ((source := world.source_at(position)) is not None
             and (domains is None or source.domain in domains)
             and not world.yields(source))
     )
     section_columns = {(position.x, position.z) for position in laid}
     rails = tuple(
-        position for position in world.iter_source_positions()
+        position for position in source_positions()
         if (state := world.get_block(position, resolved=False)) is not None
         and state.name in RAILS
         and ((position.x, position.z) not in section_columns

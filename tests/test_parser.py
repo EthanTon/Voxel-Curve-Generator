@@ -119,6 +119,14 @@ class ConfigTests(unittest.TestCase):
     def test_an_output_is_not_split_unless_asked(self) -> None:
         self.assertIsNone(parse(config()).output.split)
 
+    def test_a_split_can_count_only_non_air_changes(self) -> None:
+        data = config(output={"path": "out.schem", "split": {"count_air": False}})
+        self.assertFalse(parse(data).output.split.count_air)
+        self.assertTrue(parse(config(output={"path": "out.schem", "split": {}})).output.split.count_air)
+        for options in ({"count_air": "false"}, {"count_air": False, "terrain": True}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "count_air"):
+                parse(config(output={"path": "out.schem", "split": options}))
+
     def test_a_split_needs_a_positive_budget(self) -> None:
         data = config(output={"path": "out.schem", "split": {"max_span": 0}})
 
@@ -390,9 +398,18 @@ class PathTests(unittest.TestCase):
     def test_a_lead_needs_points_to_lead_from(self) -> None:
         data = config()
         data["path"]["lead"] = 2
+        data["path"]["points"] = data["path"]["points"][:1]
+        data["path"]["gradients"] = data["path"]["gradients"][:1]
 
-        with self.assertRaisesRegex(ValueError, "needs more than 4 points"):
+        with self.assertRaisesRegex(ValueError, "needs at least two authored points"):
             parse(data)
+
+    def test_padding_may_be_longer_than_the_authored_path(self) -> None:
+        data = config()
+        data["path"]["lead"] = 8
+        path = build_path(parse(data))
+        self.assertEqual(len(path.path_points), len(data["path"]["points"]) + 16)
+        self.assertEqual(len(path.bounded_points), len(data["path"]["points"]))
 
     def test_a_lead_extends_the_ends(self) -> None:
         data = config()

@@ -355,9 +355,7 @@ def attachment(
     spec: WireSpec, point, level: Level
 ) -> BlockPos:
     # An anchor at the track's level in the column it lands in.
-    local = BlockPos.coerce(point.position) + laid_offset(
-        spec.offset, point.laid_at, point.mirrored
-    )
+    local = BlockPos.coerce(point.position) + laid_offset(spec.offset, point.laid_at)
     return BlockPos(
         local.x, local.y + level(local.x, local.z, point.path_index), local.z
     )

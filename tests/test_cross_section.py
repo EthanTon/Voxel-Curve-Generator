@@ -20,6 +20,8 @@ from src.Core.CrossSection.steps import (
 from src.Core.CrossSection.turns import (
     CLOCKWISE,
     COUNTER_CLOCKWISE,
+    DIAGONAL_TOLERANCE,
+    JOIN_TOLERANCE,
     angle_between,
     heading,
     neighbors,
@@ -179,16 +181,17 @@ class DiagonalLayoutTests(unittest.TestCase):
                 self.assertEqual(set(arms(row(), turn)), set(neighbors(turn)))
 
     def test_each_arm_is_its_quarter_carried_a_step_at_a_time(self) -> None:
-        # Half the row's width of copies, each one diagonal step on from the
-        # one before. Where the piece sits as a whole is a separate question
+        # Half the row's width of copies, with one extra on its outside edge
+        # to close an odd-width join, each a diagonal step on from the one
+        # before. Where the piece sits as a whole is a separate question
         # -- it is centred on the path point -- so this asks only about the
         # shape, which a translation does not change.
         for turn in (45, 135, 225, 315):
             with self.subTest(turn=turn):
                 step = step_along(turn)
                 for laid in arms(row(), turn).values():
-                    for positions in laid.values():
-                        self.assertEqual(len(positions), 3)
+                    for name, positions in laid.items():
+                        self.assertEqual(len(positions), 4 if name == "a" else 3)
                         for before, after in zip(positions, positions[1:]):
                             self.assertEqual(
                                 (after[0] - before[0], after[1] - before[1]), step
@@ -268,6 +271,43 @@ class DiagonalLayoutTests(unittest.TestCase):
                                     reached.add(near)
                                     stack.append(near)
                         self.assertEqual(reached, cells)
+
+    def test_an_odd_width_plain_outside_edge_closes_round_the_corner(self) -> None:
+        for width in (3, 7, 9, 19):
+            half = width // 2
+            section = CrossSection(PointField(
+                annotation((x, 0, 0), name=str(x)) for x in range(-half, half + 1)
+            ))
+            for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+                outside = -half if direction == CLOCKWISE else half
+                for turn in (45, 135, 225, 315):
+                    with self.subTest(width=width, direction=direction, turn=turn):
+                        cells = {(p.x, p.z) for offset in section.orient(turn, direction)
+                                 if offset.annotation.position.x == outside for p in offset.offsets}
+                        reached, stack = set(), [next(iter(cells))]
+                        while stack:
+                            cell = stack.pop()
+                            if cell in reached:
+                                continue
+                            reached.add(cell)
+                            x, z = cell
+                            stack.extend((x + dx, z + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1)
+                                         if (x + dx, z + dz) in cells - reached)
+                        self.assertEqual(reached, cells)
+
+    def test_unequal_sides_keep_the_route_origin_at_the_join_centre(self) -> None:
+        for lo, hi in ((-6, 2), (-2, 6), (-3, 4)):
+            section = CrossSection(PointField(
+                annotation((x, 0, 0), name=str(x)) for x in range(lo, hi + 1)
+            ))
+            for direction in (CLOCKWISE, COUNTER_CLOCKWISE):
+                for turn in (45, 135, 225, 315):
+                    with self.subTest(lo=lo, hi=hi, direction=direction, turn=turn):
+                        cells = [p for offset in section.orient(turn, direction)
+                                 if offset.annotation.position.x == 0 for p in offset.offsets]
+                        # Within half a block: an even join centres either way.
+                        self.assertLessEqual(abs(min(p.x for p in cells) + max(p.x for p in cells)), 1)
+                        self.assertLessEqual(abs(min(p.z for p in cells) + max(p.z for p in cells)), 1)
 
     def test_each_arm_keeps_its_own_quarter(self) -> None:
         # A mirror across the long edge moves nothing sideways, so the arm
@@ -515,6 +555,26 @@ class TurnsAlongTests(unittest.TestCase):
                 22.5 + 1e-9,
                 f"a heading of {angle} degrees was laid out at {laid}",
             )
+
+    def test_a_curve_setting_off_between_layouts_keeps_its_own_angle(self) -> None:
+        # The first heading snaps to a layout, but the angle carried on is the
+        # heading's own. Carrying the snapped one held a curve that set off 39
+        # degrees past south in the south layout until it pointed almost west.
+        angles = [-51 + quarter / 4 for quarter in range(4 * 146 + 1)]
+        for tolerance, limit in ((DIAGONAL_TOLERANCE, 22.5), (JOIN_TOLERANCE, 45.0)):
+            walk = list(turns_along((toward(angle) for angle in angles), tolerance=tolerance))
+            self.assertEqual(
+                (walk[0].turn, walk[0].direction),
+                (turn_from(toward(-51), tolerance=tolerance).turn, CLOCKWISE),
+            )
+            for turn, angle in zip(walk, angles):
+                laid = turn.turn * turn.direction
+                with self.subTest(tolerance=tolerance, angle=angle):
+                    self.assertLessEqual(
+                        min(abs(angle - laid), abs(abs(angle - laid) - 360)),
+                        limit + 1e-9,
+                        f"a heading of {angle} degrees was laid out at {laid}",
+                    )
 
     def test_a_path_can_turn_past_a_full_circle(self) -> None:
         loop = [toward(-45 * step) for step in range(10)]

@@ -220,11 +220,20 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Sandbox experiments are ignored except for the assignment selector sample.
+# Keep reusable sandbox examples; ignore their generated builds.
 sandbox/*
 !sandbox/auto_assign/
+!sandbox/flying_junction/
+!sandbox/mrt_junction_network/
+sandbox/mrt_junction_network/out/
+sandbox/mrt_junction_network/assets/
+sandbox/flying_junction/*/
+sandbox/flying_junction/*.log
+sandbox/flying_junction/*.png
 sandbox/auto_assign/__pycache__/
 sandbox/auto_assign/*.tmp
 sandbox/auto_assign/out/
 
 .DS_Store
+examples/composition/out/
+examples/junction_network/out/

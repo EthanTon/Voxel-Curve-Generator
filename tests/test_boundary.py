@@ -47,6 +47,11 @@ class BoundaryTests(unittest.TestCase):
         self.assertFalse(spans_nothing(start, boundary(origin=(0.0, 11.0))))
         self.assertFalse(spans_nothing(start, boundary(direction=(1.0, 1.0))))
 
+    def test_planes_facing_each_other_or_away_always_enclose_columns(self) -> None:
+        start = boundary(origin=(0.0, 0.0))
+        self.assertFalse(spans_nothing(start, boundary(origin=(0.0, 20.0), direction=(0.0, -1.0))))
+        self.assertFalse(spans_nothing(start, boundary(origin=(0.0, -20.0), direction=(0.0, -1.0))))
+
 
 class PathBoundsTests(unittest.TestCase):
     def setUp(self) -> None:

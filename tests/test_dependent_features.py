@@ -179,6 +179,14 @@ class ProjectionTests(unittest.TestCase):
         selected, = DependentFeaturePath('rail', spacing_rules(3, 0), PathProjection('edge')).derive({'rail': (source,), 'edge': targets})
         self.assertEqual([p.path_index for p in selected], [3, 6])
 
+    def test_projection_gaps_split_runs_and_midpoints_keep_interpolated_height(self):
+        source = feature_path([(n, 64, 0) for n in range(7)])
+        targets = (feature_path([(0, 70, 4), (1, 70, 4)]), feature_path([(5, 70, 4), (6, 70, 4)]))
+        selected = DependentFeaturePath('rail', rules=(), projection=PathProjection('edge', angle=90, placement='midpoint')).derive(
+            {'rail': (source,), 'edge': targets})
+        self.assertEqual([[p.path_index for p in run] for run in selected], [[0, 1], [5, 6]])
+        self.assertEqual(positions(selected[0]), [(0, 67, 2), (1, 67, 2)])
+
     def test_invalid_projection_settings_and_vertical_heading_are_errors(self):
         for options in ({'max_distance': 0}, {'angle': float('nan')}, {'min_distance': -1},
                         {'height_tolerance': -1}, {'max_distance': True}):

@@ -36,30 +36,16 @@ from src.Stamping.variants import authored_for
 
 class LaidOffsetTests(unittest.TestCase):
     # An offset lands where the section puts its own column at that local x,
-    # in the layout that placed the position -- and mirrored the same way
-    # that layout is.
+    # in the layout that placed the position, whichever way it leans.
 
     def test_local_x_is_placed_by_the_layout(self) -> None:
         # Two to the right of travel, travelling north, is two east.
         self.assertEqual(laid_offset(BlockPos(2, 1, 0), 90), BlockPos(2, 1, 0))
         self.assertEqual(laid_offset(BlockPos(2, 1, 0), 0), BlockPos(0, 1, -2))
 
-    def test_the_mirror_leaves_local_x_alone(self) -> None:
-        # A mirror across the long edge moves nothing sideways, so a fitting
-        # authored flat is in the same place either way.
-        for layout in (0, 90, 180, 270):
-            with self.subTest(layout=layout):
-                self.assertEqual(
-                    laid_offset(BlockPos(2, 1, 0), layout, mirrored=True),
-                    laid_offset(BlockPos(2, 1, 0), layout),
-                )
-
-    def test_the_mirror_turns_local_depth_over(self) -> None:
-        # One ahead of the path at 90 is one north; mirrored, one south.
+    def test_local_depth_stays_ahead(self) -> None:
+        # One ahead of the path at 90 is one north.
         self.assertEqual(laid_offset(BlockPos(0, 0, -1), 90), BlockPos(0, 0, -1))
-        self.assertEqual(
-            laid_offset(BlockPos(0, 0, -1), 90, mirrored=True), BlockPos(0, 0, 1)
-        )
 
 
 class HeadingTests(unittest.TestCase):
@@ -254,6 +240,31 @@ class HeadingStampTests(StampingTestCase):
             laid[heading] = {(p.x, p.z) for p in world.iter_source_positions()}
 
         self.assertEqual(laid[67.5], {(-z, -x) for x, z in laid[22.5]})
+
+    def test_a_structure_alike_either_side_keeps_its_front_ahead(self) -> None:
+        # A beam across travel with a gold front row: the same either side,
+        # so 67.5 mirrors it across the diagonal and the front stays ahead.
+        pillar = self.feature()
+        for x in range(-2, 3):
+            pillar.blocks.set_block(BlockPos(x, 0, 0), BlockState.create("minecraft:stone"))
+            pillar.blocks.set_block(BlockPos(x, 0, -1), BlockState.create("minecraft:gold_block"))
+        stamp = HeadingStamp({h: pillar for h in (0.0, 22.5, 45.0)}, 22.5, self.domains)
+        self.assertEqual(stamp.mirror, "x")
+
+        laid = {}
+        for heading, gradient in ((22.5, (-1, 0, -0.414)), (67.5, (-0.414, 0, -1))):
+            world = BlockWorld(BlockRegistry())
+            self.domains.bind(world)
+            point = self.point(gradient=gradient)
+            stamp.stamp(world, stamp.rule(point), point, clip=UNCLIPPED)
+            cells = {(p.x, p.z): world.get_block(p).name for p in world.iter_source_positions()}
+            laid[heading] = set(cells)
+            along = lambda name: [x * gradient[0] + z * gradient[2] for (x, z), n in cells.items() if n == name]
+            with self.subTest(heading=heading):
+                self.assertGreater(min(along("minecraft:gold_block")), max(along("minecraft:stone")) - 1)
+                self.assertGreater(sum(along("minecraft:gold_block")) / 5, sum(along("minecraft:stone")) / 5)
+
+        self.assertEqual(laid[67.5], {(z, x) for x, z in laid[22.5]})
 
     def test_a_diagonal_leans_with_the_quarter_it_is_laid_in(self) -> None:
         # A 4-block arm staircased across a north-east diagonal: laid north it

@@ -20,7 +20,7 @@ def world_path(path: FeaturePath, offset: BlockPos = BlockPos(0, 0, 0)) -> Featu
     # Dependencies use world heights, encoded as local y=0 plus y_offset.
     result = FeaturePath(rules=())
     for point in path:
-        moved = laid_offset(offset, point.laid_at, point.mirrored)
+        moved = laid_offset(offset, point.laid_at)
         result.add_point(point, position=BlockPos(point.position.x + moved.x, 0, point.position.z + moved.z),
                          y_offset=point.position.y + point.y_offset + moved.y)
     return result
@@ -120,11 +120,10 @@ def dependent_intervals(spec: BuildSpec, wire: WireSpec, runs: Sequence[Delivere
                  for group in _groups(carried))
 
 
-def build_feature_paths(
+def feature_path_graph(
     spec: BuildSpec, runs: Sequence[DeliveredPath], sections: Mapping[str, CrossSection],
     path: Path, level: Level, clip_for: Callable | None = None,
-) -> dict[str, PathRuns]:
-    """Expose source geometry and resolve the core dependency graph once."""
+):
     initial: dict[str, PathRuns] = {}
     dependencies = {}
     named = {each.name for each in spec.feature_paths}
@@ -214,4 +213,8 @@ def build_feature_paths(
                 )
             ),
         )
-    return resolve_feature_paths(initial, dependencies)
+    return initial, dependencies
+
+
+def build_feature_paths(*args, **kwargs) -> dict[str, PathRuns]:
+    return resolve_feature_paths(*feature_path_graph(*args, **kwargs))

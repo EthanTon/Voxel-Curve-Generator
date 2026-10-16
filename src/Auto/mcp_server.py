@@ -10,7 +10,7 @@ def server_for(selector: Selector):
     try:
         from mcp.server.mcpserver import MCPServer
     except ImportError as exc:
-        raise RuntimeError("install the optional MCP dependency with: pip install 'mcp>=2,<3'") from exc
+        raise RuntimeError("install the optional MCP dependency with: uv sync --group mcp") from exc
 
     server = MCPServer("Voxel world inspector")
 

@@ -85,8 +85,8 @@ class PathProjection:
             raise ValueError("projection requires 0 <= min_distance <= max_distance and max_distance > 0")
         if self.height_tolerance is not None and self.height_tolerance < 0:
             raise ValueError("projection height_tolerance must be nonnegative")
-        if self.placement not in ("intersection", "source"):
-            raise ValueError("projection placement must be intersection or source")
+        if self.placement not in ("intersection", "source", "midpoint"):
+            raise ValueError("projection placement must be intersection, source, or midpoint")
 
     def intersect(
         self, point: FeaturePathPoint, targets: Sequence[FeaturePath],
@@ -128,6 +128,9 @@ class PathProjection:
         if self.placement == "source":
             return point
         distance, height = nearest
+        if self.placement == "midpoint":
+            distance /= 2
+            height = (point.position.y + point.y_offset + height) / 2
         return replace(
             point,
             position=BlockPos(round(point.position.x + dx * distance), 0,
@@ -245,19 +248,23 @@ class DependentFeaturePath:
                     points.add_point(point)
                 points.add_point(source[-1])
                 selected = points
+            selections = (selected,)
             if project is not None:
+                selections = []
                 projected = FeaturePath(rules=())
                 for point in selected:
                     hit = project(point)
                     if hit is not None:
                         projected.add_point(hit)
-                selected = projected
-            if self.transform is not None:
-                transformed = self.transform(selected)
+                    elif len(projected):
+                        selections.append(projected)
+                        projected = FeaturePath(rules=())
+                if len(projected):
+                    selections.append(projected)
+            for selected in selections:
+                transformed = selected if self.transform is None else self.transform(selected)
                 results = (transformed,) if isinstance(transformed, FeaturePath) else transformed
-            else:
-                results = (selected,)
-            derived.extend(result for result in results if len(result))
+                derived.extend(result for result in results if len(result))
         return tuple(derived)
 
 

@@ -73,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if error.name != "tqdm":
                 raise
             print(
-                "Progress unavailable: install tqdm with 'python -m pip install tqdm'.",
+                "Progress unavailable: install tqdm with 'uv sync --group progress'.",
                 file=sys.stderr,
             )
     try:

@@ -15,6 +15,9 @@ from ..Terraform.surface_mask import read_surface_mask
 
 def read_structure(data: Mapping, base: Path = Path("."), named_paths: frozenset[str] = frozenset()) -> StructureSpec:
     name = require(data, "name")
+    assembly = data.get("assembly")
+    if assembly is not None and (not isinstance(assembly, str) or not assembly):
+        raise ValueError(f"structure {name!r} assembly must name a complete fitting")
     turn = data.get("turn", "heading")
     if turn not in ("heading", "layout"):
         raise ValueError(
@@ -68,6 +71,7 @@ def read_structure(data: Mapping, base: Path = Path("."), named_paths: frozenset
         min_distance=read_min_distance(data, f"structure {name!r}"),
         feature_path=feature_path,
         schematic_turns=read_local_height(data.get("schematic_turns", 0), "schematic_turns"),
+        assembly=assembly,
     )
 
 
